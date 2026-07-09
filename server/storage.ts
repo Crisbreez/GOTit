@@ -109,25 +109,11 @@ export const storage: IStorage = {
     }
 
     const league = rows[0].league;
-    // Purge ALL existing props for this league before writing fresh pull.
-    // Use direct fetch (same pattern as getProps) — the db wrapper delete
-    // silently fails due to missing Prefer header for PostgREST DELETE.
-    {
-      const delUrl = `${process.env.SUPABASE_URL}/rest/v1/props?league=eq.${league}`;
-      const delResp = await fetch(delUrl, {
-        method: 'DELETE',
-        headers: {
-          'apikey': process.env.SUPABASE_ANON_KEY ?? '',
-          'Authorization': `Bearer ${process.env.SUPABASE_ANON_KEY ?? ''}`,
-          'Content-Type': 'application/json',
-          'Prefer': 'return=minimal',
-        },
-      });
-      if (!delResp.ok) {
-        const txt = await delResp.text();
-        console.error(`[storage] wipe props failed (${delResp.status}):`, txt);
-      }
-    }
+    // Stamp every prop in this pull with the same pulledAt timestamp.
+    // After writing succeeds, delete any props with an older timestamp.
+    // Write-first, delete-second: slate is never left empty if write fails.
+    const pullTimestamp = new Date().toISOString();
+    rows.forEach(r => { r.pulledAt = pullTimestamp; });
 
     const dbRows = rows.map(r => ({
       id: r.id,
@@ -160,6 +146,22 @@ export const storage: IStorage = {
       const chunk = dbRows.slice(i, i + CHUNK);
       const { error } = await db.from('props').upsert(chunk, { onConflict: 'id' });
       if (error) throw new Error(`[storage] upsertProps failed: ${error}`);
+    }
+
+    // Write succeeded — delete any props for this league older than this pull.
+    const delUrl = `${process.env.SUPABASE_URL}/rest/v1/props?league=eq.${league}&pulled_at=lt.${encodeURIComponent(pullTimestamp)}`;
+    const delResp = await fetch(delUrl, {
+      method: 'DELETE',
+      headers: {
+        'apikey': process.env.SUPABASE_ANON_KEY ?? '',
+        'Authorization': `Bearer ${process.env.SUPABASE_ANON_KEY ?? ''}`,
+        'Content-Type': 'application/json',
+        'Prefer': 'return=minimal',
+      },
+    });
+    if (!delResp.ok) {
+      const txt = await delResp.text();
+      console.error(`[storage] delete stale props failed (${delResp.status}):`, txt);
     }
   },
 
