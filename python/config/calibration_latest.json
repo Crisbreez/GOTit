@@ -1,0 +1,88 @@
+{
+  "delta_goblin": {
+    "Points": 0.5,
+    "Rebounds": 0.3,
+    "Assists": 0.3,
+    "Hits": 0.3,
+    "Strikeouts": 0.5,
+    "Total Bases": 0.5,
+    "Passing Yards": 15.0,
+    "Rushing Yards": 10.0,
+    "Receiving Yards": 10.0
+  },
+  "delta_demon": {
+    "Points": 1.0,
+    "Rebounds": 0.6,
+    "Assists": 0.6,
+    "Hits": 0.5,
+    "Strikeouts": 1.0,
+    "Total Bases": 0.8,
+    "Passing Yards": 25.0,
+    "Rushing Yards": 15.0,
+    "Receiving Yards": 15.0
+  },
+  "margin_beta": {
+    "intercept": 0.02,
+    "hours_to_lock": -0.001,
+    "tier": 0.005,
+    "vol": 0.01,
+    "public_over": 0.008
+  },
+  "probe_prob": 0.15,
+  "probe_magnitude": 0.5,
+  "corr_guard_rho": 0.35,
+  "void_premium": {
+    "Points": 0.5,
+    "Rebounds": 0.5,
+    "Assists": 0.5,
+    "Hits": 0.5,
+    "Strikeouts": 0.5,
+    "Total Bases": 0.5
+  },
+  "dist_params": {
+    "Points": {
+      "a": 12.0
+    },
+    "Total Bases": {
+      "a": 4.5
+    },
+    "Hits+Runs+RBIs": {
+      "a": 5.0
+    },
+    "Fantasy Score": {
+      "a": 6.0
+    },
+    "Hitter Fantasy Score": {
+      "a": 5.5
+    },
+    "Passing Yards": {
+      "a": 15.0
+    },
+    "Rushing Yards": {
+      "a": 5.0
+    },
+    "Receiving Yards": {
+      "a": 5.0
+    },
+    "Rebounds": {
+      "r": 4.0
+    },
+    "Assists": {
+      "r": 3.5
+    },
+    "Receptions": {
+      "r": 3.0
+    },
+    "Hits": {},
+    "Strikeouts": {},
+    "Home Runs": {},
+    "Walks": {},
+    "Stolen Bases": {},
+    "Blocks": {},
+    "Steals": {},
+    "Turnovers": {}
+  },
+  "version": "20260709-v2",
+  "trained_on": "2026-06-25 to 2026-07-09",
+  "sha256": "a0e490dc6e5b5b363e1deb001a4ebf20505842596e07b2868ca4a7b540d58a0f"
+}

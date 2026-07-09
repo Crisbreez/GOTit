@@ -1,0 +1,30 @@
+[project]
+name = "gotit"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "typer==0.12.*",
+    "httpx==0.27.*",
+    "tenacity==8.2.*",
+    "numpy==1.26.*",
+    "scipy==1.13.*",
+    "ortools==9.10.*",
+    "sqlalchemy==2.0.*",
+    "aiosqlite==0.20.*",
+    "feedparser==6.0.*",
+    "pydantic==2.8.*",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==8.2.*", "ruff==0.5.*"]
+
+[project.scripts]
+gotit = "apps.cli.gotit_cli:app"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["gotit*", "apps*"]

@@ -1,4 +1,4 @@
-import { useState, useRef } from 'react';
+import { useState, useRef, useEffect, useMemo } from 'react';
 import { useQuery, useMutation } from '@tanstack/react-query';
 import { useLocation } from 'wouter';
 import { apiRequest, queryClient } from '@/lib/queryClient';
@@ -41,6 +41,31 @@ interface Prop {
   fragility?: number;
   directionConfidence?: 'high' | 'medium' | 'low';
   gamesFound?: number;
+  // Optimizer-enriched fields
+  pWin?: number;
+  evMarginal?: number;
+  evCorrAdj?: number;
+  optimizerTier?: 'demon' | 'standard';
+}
+
+interface OptimizerLeg {
+  prop_id: string;
+  player_name: string;
+  stat_type: string;
+  line: number;
+  direction: string;
+  tier: string;
+  p_win: number;
+  ev_marginal: number;
+  ev_corr_adj: number;
+}
+
+interface OptimizerResult {
+  [gameId: string]: {
+    six_legs: OptimizerLeg[];
+    two_demons: OptimizerLeg[];
+    meta: Record<string, unknown>;
+  };
 }
 
 interface GameCard {
@@ -308,6 +333,12 @@ function PropRow({ prop, isSelected, onToggle, onFlip, disabled }: {
             {confidencePct}%
           </div>
         )}
+        {/* p_win from MILP optimizer */}
+        {prop.pWin != null && (
+          <div style={{ fontSize: '0.55rem', fontWeight: 800, letterSpacing: '0.04em', color: 'hsl(42 96% 56%)', fontFamily: 'Space Mono, monospace' }}>
+            {Math.round(prop.pWin * 100)}% WIN
+          </div>
+        )}
       </div>
     </div>
   );
@@ -571,6 +602,8 @@ function SlateEmptyState({ reason, onPull, isPulling }: { reason: FallbackReason
 export default function SlatePage() {
   const [, setLocation] = useLocation();
   const [league, setLeague] = useState('MLB');
+  // Reset optimizer when league changes
+  const prevLeague = useRef(league);
   // Global prop basket — tracks which props the user has selected across all cards
   const [selectedPropIds, setSelectedPropIds] = useState<Set<string>>(new Set());
   const [selectedPropMap, setSelectedPropMap] = useState<Record<string, any>>({});
@@ -710,6 +743,106 @@ export default function SlatePage() {
 
   const games: GameCard[] = data?.games || [];
   const pulledAt = data?.pulledAt;
+
+  // ── Optimizer integration ─────────────────────────────────────────────────
+  const [optimizerResult, setOptimizerResult] = useState<OptimizerResult | null>(null);
+  const [isOptimizing, setIsOptimizing] = useState(false);
+
+  // Clear optimizer result on league change
+  useEffect(() => {
+    if (prevLeague.current !== league) {
+      prevLeague.current = league;
+      setOptimizerResult(null);
+    }
+  }, [league]);
+
+  // Fire optimizer whenever we get fresh game data
+  useEffect(() => {
+    if (games.length === 0) return;
+    // Collect all props across all games
+    const allProps: any[] = [];
+    for (const g of games) {
+      const gProps = [...(g.demons || []), ...(g.standards || []), ...(g.goblins || [])];
+      for (const p of gProps) {
+        allProps.push({
+          propId: p.id,
+          gameId: g.gameId,
+          playerName: p.playerName,
+          teamAbbr: p.teamAbbr || '',
+          statType: p.statType,
+          lineScore: p.lineScore,
+          isDemon: p.isDemon || false,
+          isGoblin: p.isGoblin || false,
+          direction: p.direction || 'over',
+          gameMatchup: p.gameMatchup || g.matchup || '',
+          gameStartTime: p.gameStartTime || g.startTime || '',
+        });
+      }
+    }
+    if (allProps.length === 0) return;
+
+    setIsOptimizing(true);
+    apiRequest('POST', '/api/optimize', allProps)
+      .then(r => r.json())
+      .then((result: OptimizerResult) => {
+        if (result && !result.error) {
+          setOptimizerResult(result);
+        }
+      })
+      .catch((e: any) => {
+        console.warn('[GOTit] Optimizer unavailable, using default ordering:', e.message);
+      })
+      .finally(() => setIsOptimizing(false));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [data?.pulledAt, league]);
+
+  // Merge optimizer results into games: re-rank standards by p_win, replace demons
+  const optimizedGames: GameCard[] = useMemo(() => {
+    if (!optimizerResult) return games;
+    return games.map(g => {
+      const opt = optimizerResult[g.gameId];
+      if (!opt) return g;
+
+      // Build p_win lookup by player_name+stat_type (prop_id may differ)
+      const legLookup = new Map<string, OptimizerLeg>();
+      for (const leg of [...(opt.six_legs || []), ...(opt.two_demons || [])]) {
+        const key = `${leg.player_name}|${leg.stat_type}`;
+        legLookup.set(key, leg);
+        if (leg.prop_id) legLookup.set(leg.prop_id, leg);
+      }
+
+      function enrichProp(p: Prop): Prop {
+        const key = `${p.playerName}|${p.statType}`;
+        const leg = legLookup.get(p.id || '') || legLookup.get(key);
+        if (!leg) return p;
+        return { ...p, pWin: leg.p_win, evMarginal: leg.ev_marginal, evCorrAdj: leg.ev_corr_adj };
+      }
+
+      // Re-rank standards+goblins by p_win descending
+      const enrichedStandards = g.standards.map(enrichProp)
+        .sort((a, b) => (b.pWin ?? b.propScore ?? 0) - (a.pWin ?? a.propScore ?? 0));
+      const enrichedGoblins = g.goblins.map(enrichProp)
+        .sort((a, b) => (b.pWin ?? b.propScore ?? 0) - (a.pWin ?? a.propScore ?? 0));
+
+      // Replace demons with optimizer's two_demons (find matching props by name+stat)
+      let enrichedDemons = g.demons.map(enrichProp);
+      if (opt.two_demons && opt.two_demons.length > 0) {
+        const demonProps: Prop[] = [];
+        for (const dLeg of opt.two_demons.slice(0, 2)) {
+          // Try to find the matching prop in the game's existing props
+          const key = `${dLeg.player_name}|${dLeg.stat_type}`;
+          const found = [...g.demons, ...g.standards, ...g.goblins]
+            .find(p => p.id === dLeg.prop_id || `${p.playerName}|${p.statType}` === key);
+          if (found) {
+            demonProps.push({ ...found, pWin: dLeg.p_win, evMarginal: dLeg.ev_marginal, isDemon: true });
+          }
+        }
+        if (demonProps.length > 0) enrichedDemons = demonProps;
+      }
+
+      return { ...g, standards: enrichedStandards, goblins: enrichedGoblins, demons: enrichedDemons };
+    });
+  }, [games, optimizerResult]);
 
   // Determine fallback reason
   function getFallbackReason(): FallbackReason {
@@ -890,10 +1023,16 @@ export default function SlatePage() {
       {/* Slate label */}
       <div className="section-title" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
         <span>{league} Slate</span>
-        {games.length > 0 && (
+        {optimizedGames.length > 0 && (
           <span style={{ fontSize: '0.6875rem', fontWeight: 600, color: 'hsl(var(--g-gold))', fontFamily: 'Space Mono, monospace' }}>
-            {games.length} game{games.length !== 1 ? 's' : ''}
+            {optimizedGames.length} game{optimizedGames.length !== 1 ? 's' : ''}
           </span>
+        )}
+        {isOptimizing && (
+          <span style={{ fontSize: '0.58rem', fontWeight: 800, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'hsl(270 60% 70%)', background: 'hsl(270 60% 60% / 0.12)', border: '1px solid hsl(270 60% 60% / 0.3)', borderRadius: 4, padding: '1px 6px' }}>AI</span>
+        )}
+        {optimizerResult && !isOptimizing && (
+          <span style={{ fontSize: '0.58rem', fontWeight: 800, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'hsl(142 72% 50%)', background: 'hsl(142 72% 46% / 0.12)', border: '1px solid hsl(142 72% 46% / 0.3)', borderRadius: 4, padding: '1px 6px' }}>MATH</span>
         )}
       </div>
 
@@ -914,7 +1053,7 @@ export default function SlatePage() {
         />
       ) : (
         <div style={{ paddingBottom: '0.5rem' }}>
-          {games.map((game, i) => (
+          {optimizedGames.map((game, i) => (
             <div key={game.gameId} style={{ animationDelay: `${i * 60}ms` }}>
               <GameCard
                 game={game}

@@ -1,5 +1,7 @@
 import type { Express } from 'express';
 import type { Server } from 'http';
+import { spawn } from 'child_process';
+import path from 'path';
 import { storage } from './storage';
 import { orchestratePull, getProviderState, updateProviderState, resetAllCooldowns } from './providers/orchestrator';
 import { startSlipTracker, runTrackingCycle } from './slipTracker';
@@ -314,6 +316,54 @@ export function registerRoutes(httpServer: Server, app: Express) {
     } catch (e: any) {
       res.json({ error: e.message });
     }
+  });
+
+  // ── Optimizer ───────────────────────────────────────────────────────────────
+  app.post('/api/optimize', async (req, res) => {
+    const props = req.body;
+    if (!Array.isArray(props) || props.length === 0) {
+      return res.status(400).json({ error: 'props array required' });
+    }
+
+    const scriptPath = path.resolve(process.cwd(), 'python', 'optimize.py');
+    const python = process.env.PYTHON_BIN || 'python3';
+
+    let output = '';
+    let errorOut = '';
+    const timeout = 60_000; // 60 s max
+
+    const child = spawn(python, [scriptPath], {
+      timeout,
+      cwd: process.cwd(),
+    });
+
+    child.stdin.write(JSON.stringify(props));
+    child.stdin.end();
+
+    child.stdout.on('data', (d: Buffer) => { output += d.toString(); });
+    child.stderr.on('data', (d: Buffer) => { errorOut += d.toString(); });
+
+    child.on('close', (code: number | null) => {
+      if (code !== 0) {
+        console.error('[optimize] python exited', code, errorOut.slice(0, 500));
+        return res.status(500).json({ error: 'optimizer failed', detail: errorOut.slice(0, 200) });
+      }
+      try {
+        const result = JSON.parse(output);
+        if (result.error) {
+          return res.status(422).json(result);
+        }
+        res.json(result);
+      } catch (e) {
+        console.error('[optimize] bad JSON output:', output.slice(0, 200));
+        res.status(500).json({ error: 'optimizer output not JSON' });
+      }
+    });
+
+    child.on('error', (err: Error) => {
+      console.error('[optimize] spawn error:', err.message);
+      res.status(500).json({ error: `spawn error: ${err.message}` });
+    });
   });
 
   // ── Startup ────────────────────────────────────────────────────────────────

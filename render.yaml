@@ -2,7 +2,7 @@ services:
   - type: web
     name: gotit
     runtime: node
-    buildCommand: npm ci && npm run build
+    buildCommand: pip3 install -r python/requirements.txt && npm ci && npm run build
     startCommand: node dist/index.cjs
     envVars:
       - key: NODE_ENV
