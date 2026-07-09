@@ -95,7 +95,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
       })
       .map(g => ({
         ...g,
-        demons: (g.props as any[]).filter((p: any) => p.isDemon),
+        demons: (g.props as any[]).filter((p: any) => p.isDemon).slice(0, 2),
         goblins: (g.props as any[]).filter((p: any) => p.isGoblin),
         standards: (g.props as any[]).filter((p: any) => !p.isDemon && !p.isGoblin),
       }))
