@@ -86,10 +86,11 @@ SGO_TO_PP: Dict[str, str] = {
     "batting_RBI":             "RBIs",
     "batting_basesOnBalls":    "Walks",
     "batting_stolenBases":     "Stolen Bases",
-    "batting_strikeouts":      "Strikeouts",
+    "batting_strikeouts":      "Strikeouts",   # batter Ks — line typically 0.5–2.5
     "batting_runs":            "Runs",
     # MLB pitching
-    "pitching_strikeouts":     "Strikeouts",
+    # pitching_strikeouts → "Strikeouts" too, but line disambiguation applied in _match_props
+    "pitching_strikeouts":     "Strikeouts",   # pitcher Ks — line typically 3.5–8.5
     "pitching_outs":           "Pitching Outs",
     "pitching_basesOnBalls":   "Walks Allowed",
     "pitching_earnedRuns":     "Earned Runs Allowed",
@@ -115,8 +116,12 @@ SGO_TO_PP: Dict[str, str] = {
     "receptions_nfl":          "Receptions",
 }
 
-# Reverse map: PP stat_type → SGO statID (for lookup)
-PP_TO_SGO: Dict[str, str] = {v: k for k, v in SGO_TO_PP.items()}
+# Strikeouts disambiguation thresholds:
+# Batter Ks lines are 0.5–2.5; pitcher Ks lines are 3.0+.
+# When building the SGO lookup, tag each "Strikeouts" entry with its source
+# so _match_props can route the PP line to the correct SGO pool.
+_PITCHER_KS_LINE_MIN = 3.0   # SGO fair_line >= this → pitcher prop
+_BATTER_KS_LINE_MAX  = 2.5   # SGO fair_line <= this → batter prop
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -349,12 +354,29 @@ def _match_props(
       2. PP stat type == SGO pp_stat_type
       3. Line proximity: |pp_line - sgo_fair_line| ≤ 1.5
 
+    Special handling for Strikeouts: batting_strikeouts (line≤2.5) and
+    pitching_strikeouts (line≥3.0) both map to PP "Strikeouts" but have
+    completely different medians. We partition the SGO pool by line range
+    so a PP pitcher Ks prop (line=4.5) only matches SGO pitcher Ks props.
+
     Returns dict: prop_id → SharpConsensus
     """
     # Build SGO lookup: (norm_name, stat_type_pp) → list of sgo props
+    # For Strikeouts, append a qualifier so pitcher and batter pools don't mix.
     sgo_lookup: Dict[Tuple[str, str], List[dict]] = {}
     for sp in sgo_props:
-        key = (_normalize_name(sp["player_name"]), sp["stat_type_pp"])
+        stat = sp["stat_type_pp"]
+        stat_id = sp.get("stat_id_sgo", "")
+        fair_line = sp["fair_line"]
+
+        # Disambiguate Strikeouts by SGO stat_id and line range
+        if stat == "Strikeouts":
+            if stat_id == "pitching_strikeouts" or fair_line >= _PITCHER_KS_LINE_MIN:
+                stat = "Strikeouts_pitcher"
+            else:
+                stat = "Strikeouts_batter"
+
+        key = (_normalize_name(sp["player_name"]), stat)
         sgo_lookup.setdefault(key, []).append(sp)
 
     result: Dict[str, SharpConsensus] = {}
@@ -365,8 +387,16 @@ def _match_props(
         pp_line = pp.lines.get(tier, list(pp.lines.values())[0])
 
         norm_name = _normalize_name(pp.player_name)
-        key = (norm_name, pp.stat_type)
 
+        # Apply the same Strikeouts disambiguation on the PP side using line range
+        stat_key = pp.stat_type
+        if pp.stat_type == "Strikeouts":
+            if pp_line >= _PITCHER_KS_LINE_MIN:
+                stat_key = "Strikeouts_pitcher"
+            else:
+                stat_key = "Strikeouts_batter"
+
+        key = (norm_name, stat_key)
         candidates = sgo_lookup.get(key, [])
 
         # Find closest line match

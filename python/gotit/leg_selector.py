@@ -65,10 +65,12 @@ STAT_DIST: Dict[str, DistFamily] = {
     "Passing Yards":        DistFamily.GAMMA,
     "Rushing Yards":        DistFamily.GAMMA,
     "Receiving Yards":      DistFamily.GAMMA,
+    "Pts+Reb+Ast":          DistFamily.GAMMA,   # composite — continuous approx
     # Negative Binomial (overdispersed counts)
     "Rebounds":             DistFamily.NEGBIN,
     "Assists":              DistFamily.NEGBIN,
     "Receptions":           DistFamily.NEGBIN,
+    "Rush Attempts":        DistFamily.NEGBIN,  # overdispersed run-game count
     # Poisson (rare discrete counts)
     "Hits":                 DistFamily.POISSON,
     "Strikeouts":           DistFamily.POISSON,
@@ -78,6 +80,8 @@ STAT_DIST: Dict[str, DistFamily] = {
     "Blocks":               DistFamily.POISSON,
     "Steals":               DistFamily.POISSON,
     "Turnovers":            DistFamily.POISSON,
+    "3-PT Made":            DistFamily.POISSON,
+    "Passing TDs":          DistFamily.POISSON,
     # MLB pitcher / hitter counts — Poisson
     "RBIs":                 DistFamily.POISSON,
     "Runs":                 DistFamily.POISSON,
