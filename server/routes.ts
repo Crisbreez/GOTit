@@ -8,6 +8,47 @@ import { startSlipTracker, runTrackingCycle } from './slipTracker';
 import { seedDemoData } from './demo-seed';
 import { centralToday, centralTodayStartUTC } from './time';
 
+// ── Sharp consensus pull helper ────────────────────────────────────────────
+function spawnSharpPull(league: string, props: any[]): void {
+  const scriptPath = path.resolve(process.cwd(), 'python', 'sharp_pull.py');
+  const python = process.env.PYTHON_BIN || 'python3';
+  const payload = JSON.stringify({ league, props });
+
+  const child = spawn(python, [scriptPath], {
+    cwd: process.cwd(),
+    timeout: 45_000,
+  });
+
+  let out = '';
+  let err = '';
+  child.stdout.on('data', (d: Buffer) => { out += d.toString(); });
+  child.stderr.on('data', (d: Buffer) => { err += d.toString(); });
+
+  child.stdin.write(payload);
+  child.stdin.end();
+
+  child.on('close', (code: number | null) => {
+    if (code !== 0) {
+      console.error(`[sharp] pull exited ${code}:`, err.slice(0, 300));
+      return;
+    }
+    try {
+      const result = JSON.parse(out);
+      if (result.ok) {
+        console.log(`[sharp] ${result.matched}/${result.total} props matched for ${result.league}`);
+      } else {
+        console.error('[sharp] pull failed:', result.error);
+      }
+    } catch {
+      console.error('[sharp] non-JSON output:', out.slice(0, 200));
+    }
+  });
+
+  child.on('error', (e: Error) => {
+    console.error('[sharp] spawn error:', e.message);
+  });
+}
+
 export function registerRoutes(httpServer: Server, app: Express) {
 
   // ── Stats ──────────────────────────────────────────────────────────────────
@@ -35,6 +76,8 @@ export function registerRoutes(httpServer: Server, app: Express) {
       if (!result.fromCache && result.providerUsed !== 'cache' && result.providerUsed !== 'demo' && result.props.length > 0) {
         await storage.upsertProps(result.props);
         await storage.logPull(league, result.props.length);
+        // Fire sharp consensus pull in background (non-blocking)
+        spawnSharpPull(league, result.props);
       }
 
       res.json({
@@ -56,6 +99,24 @@ export function registerRoutes(httpServer: Server, app: Express) {
       } else {
         res.status(500).json({ ok: false, error: err.message });
       }
+    }
+  });
+
+  // ── Sharp Pull (standalone) ────────────────────────────────────────────────
+  // Refresh sharp_store.json from SGO without triggering a full PP pull.
+  // Reads existing cached props from Supabase.
+  app.post('/api/sharp-pull', async (req, res) => {
+    const league = (req.query.league as string || 'MLB').toUpperCase();
+    try {
+      const props = await storage.getProps(league);
+      if (props.length === 0) {
+        return res.status(422).json({ ok: false, error: 'No cached props for league — run /api/pull first' });
+      }
+      // Spawn async; respond immediately so the client isn't blocked
+      spawnSharpPull(league, props);
+      res.json({ ok: true, message: `Sharp pull started for ${league} (${props.length} props)` });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message });
     }
   });
 

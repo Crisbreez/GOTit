@@ -1,24 +1,19 @@
 #!/usr/bin/env python3
 """
-GOTit Optimizer — called by Express as a subprocess.
+GOTit Optimizer — subprocess entry point called by Express /api/optimize.
 
-Input  (stdin): JSON array of web-app props (from PrizePicks via Supabase)
+Input  (stdin): JSON array of web-app props (from Supabase)
 Output (stdout): JSON { game_id: { six_legs, two_demons, meta } }
 
-Strategy:
-  Since we have no sharp-book medians, we compute p_win from the PP line
-  directly using tier-delta calibration:
-    - Standard: median = lineScore (line IS the market estimate)
-    - Demon: median = lineScore - delta_demon[stat] (line raised above median)
-    - Goblin: median = lineScore + delta_goblin[stat] (line lowered below median)
-
-  The MILP full-optimizer is available when delta shifts produce enough
-  above-floor legs. When MILP fails (insufficient legs), we fall back to
-  simple p_win ranking per game.
-
-Web-app prop shape (camelCase from frontend):
-  { propId, gameId, playerName, teamAbbr, statType, lineScore,
-    isDemon, isGoblin, direction, gameMatchup, gameStartTime }
+Data flow:
+  1. Load real SharpConsensus from sharp_store.json (written by /api/pull)
+  2. For each PP prop: if real SGO fair_p_win exists → use it directly
+     else → fall back to tier-delta calibration heuristic
+  3. Build LegCandidates with real p_wins
+  4. Run Shapley EV + corr-adj EV per game
+  5. For games with ≥6 candidates + ≥2 demon candidates: run MILP
+     For games that fail MILP: rank by Shapley EV (graceful fallback)
+  6. Output { game_id: { six_legs, two_demons, meta } }
 """
 import sys
 import json
@@ -26,11 +21,9 @@ import hashlib
 import datetime
 import logging
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
 
 logging.basicConfig(level=logging.WARNING)
-
-# Add python/ dir to path so gotit package resolves
 sys.path.insert(0, str(Path(__file__).parent))
 
 from gotit.leg_selector import (
@@ -40,7 +33,6 @@ from gotit.leg_selector import (
     LegCandidate,
     Tier,
     Direction,
-    DistFamily,
     get_default_calibration,
     get_family,
     _calibrated_p_win,
@@ -48,12 +40,12 @@ from gotit.leg_selector import (
     shapley_marginal_ev,
     corr_adjusted_ev,
     solve_game_milp,
-    select_legs_for_slate,
 )
+from gotit.sharp_consensus import load_sharp_consensus
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. Load calibration
+# 1. Calibration
 # ─────────────────────────────────────────────────────────────────────────────
 def load_calibration() -> CalibrationParams:
     cal_path = Path(__file__).parent / "config" / "calibration_latest.json"
@@ -68,7 +60,7 @@ def load_calibration() -> CalibrationParams:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. Helpers
+# 2. Prop conversion helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def _player_id(player_name: str) -> str:
     return hashlib.md5(player_name.lower().encode()).hexdigest()[:16]
@@ -100,70 +92,109 @@ def _direction(d: dict) -> Direction:
     return Direction.UNDER if raw == "under" else Direction.OVER
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3. Compute p_win per prop using calibration tier deltas
-# ─────────────────────────────────────────────────────────────────────────────
-def compute_p_win(d: dict, cal: CalibrationParams) -> float:
-    """
-    Compute p_win for a single web-app prop.
+def build_pp_prop(d: dict) -> PPProp:
+    """Convert web-app prop dict to PPProp for sharp_consensus matching."""
+    line  = float(d.get("lineScore") or d.get("line_score") or 0.5)
+    tier  = _tier(d)
+    return PPProp(
+        prop_id=_prop_id(d),
+        game_id=d.get("gameId") or d.get("game_id") or "unknown",
+        player_id=_player_id(d.get("playerName") or d.get("player_name") or ""),
+        player_name=d.get("playerName") or d.get("player_name") or "",
+        stat_type=d.get("statType") or d.get("stat_type") or "",
+        tiers_offered=[tier],
+        lines={tier: line},
+        hours_to_lock=4.0,
+        public_over_pct=None,
+        dnp_prob=0.0,
+        correlation_partners=[],
+    )
 
-    Tier-delta logic:
-    - Standard: median = lineScore (line ≈ market median, p_win ≈ 0.5)
-    - Demon:    line is ABOVE the true median by delta_demon[stat].
-                To hit OVER on a demon: median = line - delta → p_win > 0.5
-    - Goblin:   line is BELOW the true median by delta_goblin[stat].
-                PP goblins are played OVER, so: median = line + delta → p_win > 0.5
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. p_win computation
+#    Priority: real SGO fair_p_win > calibration CDF
+# ─────────────────────────────────────────────────────────────────────────────
+def compute_p_win(
+    d: dict,
+    sc: SharpConsensus,
+    cal: CalibrationParams,
+) -> float:
     """
-    line = float(d.get("lineScore") or d.get("line_score") or 0.5)
-    stat_type = d.get("statType") or d.get("stat_type") or ""
-    tier = _tier(d)
+    Compute p_win for a prop.
+
+    If SGO gave us a real de-vigged p_win (stored in sc.shape_params):
+        Use it directly — this is the most accurate signal.
+    Otherwise:
+        Fall back to _calibrated_p_win with tier-delta adjusted median.
+    """
     direction = _direction(d)
 
-    if tier == Tier.DEMON:
-        delta = cal.delta_demon.get(stat_type, cal.delta_demon.get("default", 0.0))
-        median = line - delta   # demon line > median → OVER has edge
-    elif tier == Tier.GOBLIN:
-        delta = cal.delta_goblin.get(stat_type, cal.delta_goblin.get("default", 0.0))
-        median = line + delta   # goblin line < median → OVER has edge
-    else:
-        median = line           # standard: fair line, p_win ≈ 0.5
+    # Check for real SGO fair p_win
+    if sc.freshness_sec < 9999.0 and sc.shape_params:
+        if direction == Direction.OVER:
+            fair_p = sc.shape_params.get("fair_p_win_over")
+        else:
+            fair_p = sc.shape_params.get("fair_p_win_under")
 
-    family = get_family(stat_type)
+        if fair_p is not None and 0.0 < fair_p < 1.0:
+            return float(fair_p)
+
+    # Fallback: use calibration CDF with tier-delta adjusted median
+    line      = float(d.get("lineScore") or d.get("line_score") or 0.5)
+    stat_type = d.get("statType") or d.get("stat_type") or ""
+    tier      = _tier(d)
+    median    = sc.median  # already tier-delta adjusted by fallback_sc
+
+    family    = get_family(stat_type)
     cal_shape = cal.dist_params.get(stat_type, {})
 
     return float(_calibrated_p_win(line, median, cal_shape, family, direction, stat_type))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. Build per-game result with Shapley EV (no MILP — works without oracle data)
+# 4. Per-game ranking (Shapley EV + optional MILP)
 # ─────────────────────────────────────────────────────────────────────────────
+MAX_SHAPLEY = 15  # caps Shapley iterations at O(C(15,5)) = 3003
+
 def rank_game_props(
     game_id: str,
     props: List[dict],
+    sc_map: Dict[str, SharpConsensus],
     cal: CalibrationParams,
 ) -> Optional[Dict]:
     """
-    Rank props for a single game by p_win and Shapley EV.
-
-    Returns { six_legs, two_demons, meta } or None if too few props.
+    Build ranked { six_legs, two_demons, meta } for one game.
+    Returns None if not enough props.
     """
-    # Build LegCandidates for all props
     candidates: List[LegCandidate] = []
+
     for d in props:
         try:
-            line = float(d.get("lineScore") or d.get("line_score") or 0.5)
-            tier = _tier(d)
-            direction = _direction(d)
-            p_win = compute_p_win(d, cal)
+            prop_id   = _prop_id(d)
+            sc        = sc_map.get(prop_id)
+            if sc is None:
+                # Build a fallback SC inline
+                line  = float(d.get("lineScore") or 0.5)
+                tier  = _tier(d)
+                stat  = d.get("statType") or ""
+                from gotit.sharp_consensus import _fallback_sc
+                sc = _fallback_sc(prop_id, line, tier, stat)
+
+            p_win = compute_p_win(d, sc, cal)
+            line  = float(d.get("lineScore") or 0.5)
+            tier  = _tier(d)
+            dir_  = _direction(d)
+
             candidates.append(LegCandidate(
-                prop_id=_prop_id(d),
+                prop_id=prop_id,
                 game_id=game_id,
-                player_id=_player_id(d.get("playerName") or d.get("player_name") or ""),
-                player_name=d.get("playerName") or d.get("player_name") or "",
-                stat_type=d.get("statType") or d.get("stat_type") or "",
+                player_id=_player_id(d.get("playerName") or ""),
+                player_name=d.get("playerName") or "",
+                stat_type=d.get("statType") or "",
                 tier=tier,
                 line=line,
-                direction=direction,
+                direction=dir_,
                 p_win=p_win,
             ))
         except Exception as e:
@@ -172,67 +203,52 @@ def rank_game_props(
     if len(candidates) < 2:
         return None
 
-    # Compute Shapley EV (caps at 15 candidates for performance)
-    top_cands = sorted(candidates, key=lambda c: c.p_win, reverse=True)[:15]
+    # Pre-rank and cap for Shapley
+    top = sorted(candidates, key=lambda c: c.p_win, reverse=True)[:MAX_SHAPLEY]
+
+    # Shapley EV
     try:
-        shapley = shapley_marginal_ev(top_cands, BREAKEVEN_R)
-        for c in top_cands:
+        shapley   = shapley_marginal_ev(top, BREAKEVEN_R)
+        corr_adj  = corr_adjusted_ev(top, shapley, {})
+        for c in top:
             c.ev_marginal = shapley.get(c.prop_id, 0.0)
-        corr_adj = corr_adjusted_ev(top_cands, shapley, {})
-        for c in top_cands:
             c.ev_corr_adj = corr_adj.get(c.prop_id, 0.0)
     except Exception as e:
-        logging.warning(f"Shapley failed for game {game_id}: {e}")
-        # Fallback: ev_marginal = p_win - breakeven
-        for c in top_cands:
+        logging.warning(f"Shapley failed for {game_id}: {e}")
+        for c in top:
             c.ev_marginal = max(0.0, c.p_win - BREAKEVEN_R[6])
             c.ev_corr_adj = c.ev_marginal
 
-    # Sort by ev_corr_adj descending (best legs first)
-    ranked = sorted(top_cands, key=lambda c: c.ev_corr_adj, reverse=True)
+    ranked = sorted(top, key=lambda c: c.ev_corr_adj, reverse=True)
 
-    # Six legs: top 6 by EV (at most 1 per player, diversity-aware)
-    six_legs: List[LegCandidate] = []
-    seen_players: set = set()
-    seen_stats: set = set()
-    # Prefer diverse stat types: first pick best per stat, then fill remaining
-    for c in ranked:
-        if len(six_legs) >= 6:
-            break
-        # Enforce max 3 per player
-        player_count = sum(1 for l in six_legs if l.player_id == c.player_id)
-        if player_count >= 3:
-            continue
-        six_legs.append(c)
-        seen_players.add(c.player_id)
-        seen_stats.add(c.stat_type)
+    # ── Try MILP first (strict: ≥6 candidates, ≥2 distinct-player demons) ──
+    milp_result = None
+    demon_cands = [c for c in top if c.tier == Tier.DEMON]
+    demon_players = set(c.player_id for c in demon_cands)
 
-    # Two demons: best 2 demon-tier props by p_win (distinct players)
-    demon_cands = sorted([c for c in candidates if c.tier == Tier.DEMON],
-                         key=lambda c: c.p_win, reverse=True)
-    two_demons: List[LegCandidate] = []
-    demon_players: set = set()
-    for dc in demon_cands:
-        if len(two_demons) >= 2:
-            break
-        if dc.player_id not in demon_players:
-            two_demons.append(dc)
-            demon_players.add(dc.player_id)
+    if len(top) >= 6 and len(demon_players) >= 2:
+        r_star_6 = BREAKEVEN_R[6]
+        ev_map   = {c.prop_id: c.ev_corr_adj for c in top}
+        try:
+            milp_result = solve_game_milp(top, ev_map, r_star_6)
+        except Exception as e:
+            logging.warning(f"MILP failed for {game_id}: {e}")
 
-    # If fewer than 2 demon-tier props exist, pick from highest p_win standards
-    if len(two_demons) < 2:
-        non_demons = [c for c in ranked if c.tier != Tier.DEMON and c.player_id not in demon_players]
-        for c in non_demons:
-            if len(two_demons) >= 2:
-                break
-            if c.player_id not in demon_players:
-                two_demons.append(c)
-                demon_players.add(c.player_id)
+    if milp_result and len(milp_result) == 6:
+        # MILP succeeded — use its exact selection
+        six_legs   = milp_result
+        two_demons = [lg for lg in milp_result if lg.tier == Tier.DEMON][:2]
+        source     = "milp"
+    else:
+        # Graceful fallback: Shapley EV ranking
+        six_legs = _select_diverse(ranked, n=6)
+        two_demons = _pick_demons(candidates, ranked, n=2)
+        source = "shapley_fallback"
 
-    if not six_legs and not two_demons:
+    if not six_legs:
         return None
 
-    def leg_to_dict(lg: LegCandidate) -> dict:
+    def leg_dict(lg: LegCandidate) -> dict:
         return {
             "prop_id":     lg.prop_id,
             "player_name": lg.player_name,
@@ -245,15 +261,66 @@ def rank_game_props(
             "ev_corr_adj": round(lg.ev_corr_adj, 4),
         }
 
+    # Count how many had real SGO data
+    real_sharp = sum(
+        1 for d in props
+        if sc_map.get(_prop_id(d), SharpConsensus("","",{},"",[],9999.0)).freshness_sec < 9999.0
+    )
+
     return {
-        "six_legs":   [leg_to_dict(lg) for lg in six_legs],
-        "two_demons": [leg_to_dict(lg) for lg in two_demons],
+        "six_legs":   [leg_dict(lg) for lg in six_legs],
+        "two_demons": [leg_dict(lg) for lg in two_demons],
         "meta": {
+            "source":              source,
             "slate_breakeven_r6":  round(BREAKEVEN_R[6], 4),
             "total_candidates":    len(candidates),
-            "ranked_count":        len(ranked),
+            "real_sharp_props":    real_sharp,
         },
     }
+
+
+def _select_diverse(ranked: List[LegCandidate], n: int) -> List[LegCandidate]:
+    """Pick top n by EV with max-3-per-player diversity."""
+    selected: List[LegCandidate] = []
+    player_count: Dict[str, int] = {}
+    for c in ranked:
+        if len(selected) >= n:
+            break
+        if player_count.get(c.player_id, 0) >= 3:
+            continue
+        selected.append(c)
+        player_count[c.player_id] = player_count.get(c.player_id, 0) + 1
+    return selected
+
+
+def _pick_demons(
+    all_cands: List[LegCandidate],
+    ranked: List[LegCandidate],
+    n: int,
+) -> List[LegCandidate]:
+    """
+    Pick n demon props for display (distinct players).
+    Prefer Tier.DEMON, fall back to highest p_win if fewer than n.
+    """
+    demons: List[LegCandidate] = []
+    seen: set = set()
+    # First: native demons by p_win desc
+    for c in sorted([c for c in all_cands if c.tier == Tier.DEMON],
+                    key=lambda c: c.p_win, reverse=True):
+        if len(demons) >= n:
+            break
+        if c.player_id not in seen:
+            demons.append(c)
+            seen.add(c.player_id)
+    # Fill from ranked if needed
+    if len(demons) < n:
+        for c in ranked:
+            if len(demons) >= n:
+                break
+            if c.player_id not in seen:
+                demons.append(c)
+                seen.add(c.player_id)
+    return demons
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -268,7 +335,7 @@ def main():
     try:
         props_data = json.loads(raw)
     except json.JSONDecodeError as e:
-        print(json.dumps({"error": f"json parse error: {e}"}))
+        print(json.dumps({"error": f"json parse: {e}"}))
         sys.exit(1)
 
     if not props_data:
@@ -276,6 +343,17 @@ def main():
         sys.exit(1)
 
     cal = load_calibration()
+
+    # Convert to PPProp for SharpConsensus matching
+    pp_props = []
+    for d in props_data:
+        try:
+            pp_props.append(build_pp_prop(d))
+        except Exception:
+            pass
+
+    # Load real sharp consensus (from store written by /api/pull)
+    sc_map: Dict[str, SharpConsensus] = load_sharp_consensus(pp_props)
 
     # Group by gameId
     games: Dict[str, List[dict]] = {}
@@ -285,7 +363,7 @@ def main():
 
     output: Dict[str, dict] = {}
     for game_id, game_props in games.items():
-        result = rank_game_props(game_id, game_props, cal)
+        result = rank_game_props(game_id, game_props, sc_map, cal)
         if result:
             output[game_id] = result
 
