@@ -87,12 +87,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
     }
 
     const games = Array.from(gameMap.values())
-      .filter(g => {
-        if (!g.startTime) return true;
-        const startMs = new Date(g.startTime).getTime();
-        const nowMs = Date.now();
-        return startMs > nowMs - (4 * 60 * 60 * 1000);
-      })
+      .filter(g => !!g.gameId)
       .map(g => ({
         ...g,
         demons: (g.props as any[]).filter((p: any) => p.isDemon).slice(0, 2),

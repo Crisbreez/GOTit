@@ -109,11 +109,7 @@ export const storage: IStorage = {
     }
 
     const league = rows[0].league;
-    const todayStr = centralTodayStartUTC();
-
-    // Purge stale props
-    await db.from('props').eq('league', league).lt('game_start_time', todayStr).delete();
-    // Purge demo props
+    // Purge demo props only
     await db.from('props').eq('league', league).like('id', 'demo-%').delete();
 
     const dbRows = rows.map(r => ({
