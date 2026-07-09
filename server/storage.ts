@@ -109,8 +109,10 @@ export const storage: IStorage = {
     }
 
     const league = rows[0].league;
-    // Purge demo props only
-    await db.from('props').eq('league', league).like('id', 'demo-%').delete();
+    // Purge ALL existing props for this league before writing fresh pull.
+    // Without this, stale props from previous pulls accumulate and corrupt
+    // game grouping, demon selection, and optimizer input.
+    await db.from('props').eq('league', league).delete();
 
     const dbRows = rows.map(r => ({
       id: r.id,
