@@ -1,0 +1,10 @@
+node_modules/
+.vite/
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+data.db
+data.db-shm
+data.db-wal
