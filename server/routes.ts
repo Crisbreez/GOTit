@@ -256,7 +256,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
 
   // ── Version ────────────────────────────────────────────────────────────────
   app.get('/api/version', (_req, res) => {
-    res.json({ version: '2026-07-08-CLEAN', builtAt: new Date().toISOString() });
+    res.json({ version: '2026-07-09-NOFILTER', builtAt: new Date().toISOString() });
   });
 
   // ── Admin ──────────────────────────────────────────────────────────────────
