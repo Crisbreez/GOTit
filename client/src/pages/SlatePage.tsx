@@ -824,21 +824,10 @@ export default function SlatePage() {
       const enrichedGoblins = g.goblins.map(enrichProp)
         .sort((a, b) => (b.pWin ?? b.propScore ?? 0) - (a.pWin ?? a.propScore ?? 0));
 
-      // Replace demons with optimizer's two_demons (find matching props by name+stat)
-      let enrichedDemons = g.demons.map(enrichProp);
-      if (opt.two_demons && opt.two_demons.length > 0) {
-        const demonProps: Prop[] = [];
-        for (const dLeg of opt.two_demons.slice(0, 2)) {
-          // Try to find the matching prop in the game's existing props
-          const key = `${dLeg.player_name}|${dLeg.stat_type}`;
-          const found = [...g.demons, ...g.standards, ...g.goblins]
-            .find(p => p.id === dLeg.prop_id || `${p.playerName}|${p.statType}` === key);
-          if (found) {
-            demonProps.push({ ...found, pWin: dLeg.p_win, evMarginal: dLeg.ev_marginal, isDemon: true });
-          }
-        }
-        if (demonProps.length > 0) enrichedDemons = demonProps;
-      }
+      // PP is the display source of truth for demons — never replace PP's isDemon=true props.
+      // The optimizer enriches demons with p_win but does NOT reassign which props are demons.
+      // PP's odds_type=="demon" flag from the pull is the only authority on demon status.
+      const enrichedDemons = g.demons.map(enrichProp);
 
       return { ...g, standards: enrichedStandards, goblins: enrichedGoblins, demons: enrichedDemons };
     });
