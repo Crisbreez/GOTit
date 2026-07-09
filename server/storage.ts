@@ -147,15 +147,25 @@ export const storage: IStorage = {
   },
 
   async getProps(league) {
-    const { data, error } = await db.from('props')
-      .select('*')
-      .eq('league', league)
-      .order('game_start_time', { ascending: true })
-      .select_run();
-
-    if (error) throw new Error(`[storage] getProps failed: ${error}`);
-
-    return (data ?? [])
+    const PAGE = 1000;
+    let all: any[] = [];
+    let from = 0;
+    while (true) {
+      const url = `${process.env.SUPABASE_URL}/rest/v1/props?select=*&league=eq.${league}&order=game_start_time.asc&limit=${PAGE}&offset=${from}`;
+      const resp = await fetch(url, {
+        headers: {
+          'apikey': process.env.SUPABASE_ANON_KEY ?? '',
+          'Authorization': `Bearer ${process.env.SUPABASE_ANON_KEY ?? ''}`,
+          'Accept': 'application/json',
+        },
+      });
+      if (!resp.ok) throw new Error(`[storage] getProps failed: ${resp.status}`);
+      const rows: any[] = await resp.json();
+      all = all.concat(rows);
+      if (rows.length < PAGE) break;
+      from += PAGE;
+    }
+    return all
       .map(mapProp)
       .filter((p: any) =>
         p.ppDisplayMatchup ||
