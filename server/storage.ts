@@ -151,12 +151,9 @@ export const storage: IStorage = {
   },
 
   async getProps(league) {
-    const todayStr = centralTodayStartUTC();
-
     const { data, error } = await db.from('props')
       .select('*')
       .eq('league', league)
-      .gte('game_start_time', todayStr)
       .order('game_start_time', { ascending: true })
       .select_run();
 
