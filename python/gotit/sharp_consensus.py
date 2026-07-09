@@ -328,7 +328,11 @@ def _fetch_sgo_props(league: str) -> List[dict]:
                 "fetched_at":     fetched_at,
             })
 
-    log.info(f"[sharp] fetched {len(props_out)} SGO props for {league}")
+    # Stat coverage report (debug)
+    stat_counts: Dict[str, int] = {}
+    for p in props_out:
+        stat_counts[p["stat_type_pp"]] = stat_counts.get(p["stat_type_pp"], 0) + 1
+    log.info(f"[sharp] fetched {len(props_out)} SGO props for {league}: {stat_counts}")
     return props_out
 
 
@@ -375,21 +379,20 @@ def _match_props(
                 best = sp
 
         if best and best_diff <= 1.5:
-            # Real sharp data — use de-vigged p_win + fair line as median
-            direction = "over"  # PP demons/goblins are always OVER
-            p_win = best["fair_p_win_over"]
-            # Use fair_line as the sharp consensus median
-            # (fair line is the book's best estimate of the true median)
-            median = best["fair_line"]
-
-            # shape_params: empty — optimizer uses calibration dist_params
+            # Real sharp data.
+            # median = fairOverUnder — the de-vigged consensus line from SGO.
+            # This anchors the CDF inside _calibrated_p_win / select_legs_for_slate.
+            # shape_params = {} — the CDF computes p_win from the distribution;
+            # we do NOT store raw American-odds-derived fair_p_win here because
+            # bypassing the CDF breaks the micro-line cap, Demon floor check,
+            # and stat-family variance scaling that select_legs_for_slate applies.
             result[pp.prop_id] = SharpConsensus(
                 prop_id=pp.prop_id,
-                median=median,
-                shape_params={"fair_p_win_over": p_win, "fair_p_win_under": best["fair_p_win_under"]},
+                median=best["fair_line"],   # sharp consensus line → CDF anchor
+                shape_params={},             # CDF owns p_win, not odds
                 timestamp=best["fetched_at"],
                 books_used=best["books_used"],
-                freshness_sec=0.0,
+                freshness_sec=0.0,           # real data — marks as fresh
             )
             log.debug(
                 f"[sharp] matched {pp.player_name} {pp.stat_type} "
@@ -475,7 +478,16 @@ def pull_sharp_consensus(league: str, pp_props: List[PPProp]) -> Dict[str, Sharp
     _save_store(store)
 
     matched = sum(1 for sc in consensus.values() if sc.freshness_sec == 0.0)
-    log.info(f"[sharp] {matched}/{len(pp_props)} props matched to real SGO data")
+    # Per-stat match breakdown printed to stderr so Express logs see it
+    import sys as _sys
+    print(f"[sharp] {league}: {matched}/{len(pp_props)} props matched to real SGO data",
+          file=_sys.stderr)
+    # Sample unmatched for debugging
+    unmatched = [pp.player_name + " " + pp.stat_type
+                 for pp in pp_props
+                 if consensus.get(pp.prop_id) and consensus[pp.prop_id].freshness_sec >= 9999.0][:10]
+    if unmatched:
+        print(f"[sharp] first unmatched: {unmatched}", file=_sys.stderr)
     return consensus
 
 
