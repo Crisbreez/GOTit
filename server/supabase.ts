@@ -70,6 +70,8 @@ async function pgRest(
     headers['Prefer'] = 'return=representation';
   } else if (method === 'PATCH') {
     headers['Prefer'] = 'return=representation';
+  } else if (method === 'DELETE') {
+    headers['Prefer'] = 'return=minimal';
   }
 
   try {

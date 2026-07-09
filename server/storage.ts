@@ -110,9 +110,24 @@ export const storage: IStorage = {
 
     const league = rows[0].league;
     // Purge ALL existing props for this league before writing fresh pull.
-    // Without this, stale props from previous pulls accumulate and corrupt
-    // game grouping, demon selection, and optimizer input.
-    await db.from('props').eq('league', league).delete();
+    // Use direct fetch (same pattern as getProps) — the db wrapper delete
+    // silently fails due to missing Prefer header for PostgREST DELETE.
+    {
+      const delUrl = `${process.env.SUPABASE_URL}/rest/v1/props?league=eq.${league}`;
+      const delResp = await fetch(delUrl, {
+        method: 'DELETE',
+        headers: {
+          'apikey': process.env.SUPABASE_ANON_KEY ?? '',
+          'Authorization': `Bearer ${process.env.SUPABASE_ANON_KEY ?? ''}`,
+          'Content-Type': 'application/json',
+          'Prefer': 'return=minimal',
+        },
+      });
+      if (!delResp.ok) {
+        const txt = await delResp.text();
+        console.error(`[storage] wipe props failed (${delResp.status}):`, txt);
+      }
+    }
 
     const dbRows = rows.map(r => ({
       id: r.id,
