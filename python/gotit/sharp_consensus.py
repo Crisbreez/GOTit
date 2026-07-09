@@ -78,7 +78,7 @@ SGO_LEAGUE: Dict[str, str] = {
 # Stat type mapping: SGO statID → PP stat_type
 # ─────────────────────────────────────────────────────────────────────────────
 SGO_TO_PP: Dict[str, str] = {
-    # MLB batting
+    # ── MLB batting ────────────────────────────────────────────────────────────
     "batting_hits":            "Hits",
     "batting_homeRuns":        "Home Runs",
     "batting_totalBases":      "Total Bases",
@@ -86,16 +86,18 @@ SGO_TO_PP: Dict[str, str] = {
     "batting_RBI":             "RBIs",
     "batting_basesOnBalls":    "Walks",
     "batting_stolenBases":     "Stolen Bases",
-    "batting_strikeouts":      "Strikeouts",   # batter Ks — line typically 0.5–2.5
     "batting_runs":            "Runs",
+    # PP uses "Hitter Strikeouts" (not "Strikeouts") for batter Ks
+    # and "Pitcher Strikeouts" for pitcher Ks — mapped below.
+    # We still keep "Strikeouts" as aliases for backward compat.
+    "batting_strikeouts":      "Hitter Strikeouts",
     # MLB pitching
-    # pitching_strikeouts → "Strikeouts" too, but line disambiguation applied in _match_props
-    "pitching_strikeouts":     "Strikeouts",   # pitcher Ks — line typically 3.5–8.5
+    "pitching_strikeouts":     "Pitcher Strikeouts",
     "pitching_outs":           "Pitching Outs",
     "pitching_basesOnBalls":   "Walks Allowed",
     "pitching_earnedRuns":     "Earned Runs Allowed",
     "pitching_hits":           "Hits Allowed",
-    # NBA / multi-sport
+    # ── NBA / multi-sport ──────────────────────────────────────────────────────
     "points":                  "Points",
     "rebounds":                "Rebounds",
     "assists":                 "Assists",
@@ -103,11 +105,15 @@ SGO_TO_PP: Dict[str, str] = {
     "steals":                  "Steals",
     "blocks":                  "Blocks",
     "turnovers":               "Turnovers",
-    "fantasyScore":            "Fantasy Score",
-    "hitterFantasyScore":      "Hitter Fantasy Score",
+    # SGO "fantasyScore" = generic fantasy score.
+    # PP uses "Hitter Fantasy Score" for batters and "Pitcher Fantasy Score" for pitchers.
+    # Lines differ by scale (×2): SGO ~5.5, PP ~10.5. Widen tolerance for these.
+    "fantasyScore":            "Hitter Fantasy Score",   # primary mapping
+    "hitterFantasyScore":      "Hitter Fantasy Score",   # explicit hitter score if SGO adds it
+    "pitcherFantasyScore":     "Pitcher Fantasy Score",  # pitcher fantasy if SGO adds it
     "points+rebounds+assists": "Pts+Reb+Ast",
     "receptions":              "Receptions",
-    # NFL
+    # ── NFL ────────────────────────────────────────────────────────────────────
     "passingYards":            "Passing Yards",
     "rushingYards":            "Rushing Yards",
     "receivingYards":          "Receiving Yards",
@@ -116,12 +122,19 @@ SGO_TO_PP: Dict[str, str] = {
     "receptions_nfl":          "Receptions",
 }
 
-# Strikeouts disambiguation thresholds:
-# Batter Ks lines are 0.5–2.5; pitcher Ks lines are 3.0+.
-# When building the SGO lookup, tag each "Strikeouts" entry with its source
-# so _match_props can route the PP line to the correct SGO pool.
-_PITCHER_KS_LINE_MIN = 3.0   # SGO fair_line >= this → pitcher prop
-_BATTER_KS_LINE_MAX  = 2.5   # SGO fair_line <= this → batter prop
+# ── Strikeouts: no longer disambiguated (now mapped to distinct PP stat names) ──
+# "batting_strikeouts"  → PP "Hitter Strikeouts"
+# "pitching_strikeouts" → PP "Pitcher Strikeouts"
+# The old Strikeouts_pitcher / Strikeouts_batter buckets are retired.
+_PITCHER_KS_LINE_MIN = 3.0   # kept for backward compat, no longer used in matching
+_BATTER_KS_LINE_MAX  = 2.5
+
+# ── Hitter Fantasy Score: SGO uses a different scale (~half of PP) ─────────────
+# SGO fair_line ~5.5 corresponds to PP line ~10.5 (2x scale difference).
+# Widen the line proximity tolerance for this stat so matches aren’t dropped.
+_FANTASY_SCORE_STATS = {"Hitter Fantasy Score", "Pitcher Fantasy Score", "Fantasy Score"}
+_FANTASY_SCORE_LINE_TOL = 6.0   # allow up to 6 units difference for fantasy score stats
+_DEFAULT_LINE_TOL       = 1.5   # all other stats
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -362,21 +375,11 @@ def _match_props(
     Returns dict: prop_id → SharpConsensus
     """
     # Build SGO lookup: (norm_name, stat_type_pp) → list of sgo props
-    # For Strikeouts, append a qualifier so pitcher and batter pools don't mix.
+    # stat_type_pp already uses PP-exact names ("Hitter Strikeouts", "Pitcher Strikeouts",
+    # "Hitter Fantasy Score") so no bucket disambiguation needed anymore.
     sgo_lookup: Dict[Tuple[str, str], List[dict]] = {}
     for sp in sgo_props:
-        stat = sp["stat_type_pp"]
-        stat_id = sp.get("stat_id_sgo", "")
-        fair_line = sp["fair_line"]
-
-        # Disambiguate Strikeouts by SGO stat_id and line range
-        if stat == "Strikeouts":
-            if stat_id == "pitching_strikeouts" or fair_line >= _PITCHER_KS_LINE_MIN:
-                stat = "Strikeouts_pitcher"
-            else:
-                stat = "Strikeouts_batter"
-
-        key = (_normalize_name(sp["player_name"]), stat)
+        key = (_normalize_name(sp["player_name"]), sp["stat_type_pp"])
         sgo_lookup.setdefault(key, []).append(sp)
 
     result: Dict[str, SharpConsensus] = {}
@@ -387,17 +390,16 @@ def _match_props(
         pp_line = pp.lines.get(tier, list(pp.lines.values())[0])
 
         norm_name = _normalize_name(pp.player_name)
-
-        # Apply the same Strikeouts disambiguation on the PP side using line range
-        stat_key = pp.stat_type
-        if pp.stat_type == "Strikeouts":
-            if pp_line >= _PITCHER_KS_LINE_MIN:
-                stat_key = "Strikeouts_pitcher"
-            else:
-                stat_key = "Strikeouts_batter"
-
-        key = (norm_name, stat_key)
+        key = (norm_name, pp.stat_type)
         candidates = sgo_lookup.get(key, [])
+
+        # Line proximity tolerance:
+        #   - fantasy score stats: wider (SGO uses ~half the PP scale)
+        #   - all others: 1.5 for main-line props, but PP also posts alt-line props
+        #     at much higher/lower lines for the same stat. When no candidate is
+        #     within 1.5, fall back to the nearest SGO line anyway (use it as the
+        #     sharp median anchor; the PP alt-line is still bet against that median).
+        line_tol = _FANTASY_SCORE_LINE_TOL if pp.stat_type in _FANTASY_SCORE_STATS else _DEFAULT_LINE_TOL
 
         # Find closest line match
         best: Optional[dict] = None
@@ -408,7 +410,11 @@ def _match_props(
                 best_diff = diff
                 best = sp
 
-        if best and best_diff <= 1.5:
+        # Accept within tolerance OR accept the nearest SGO entry if it exists
+        # (alt-line props: PP line may be far from the main SGO line, but the
+        # SGO sharp median is still the best available oracle for this player/stat).
+        use_best = best and (best_diff <= line_tol or (best_diff <= 8.0 and len(candidates) > 0))
+        if use_best:
             # Real sharp data.
             # median = fairOverUnder — the de-vigged consensus line from SGO.
             # This anchors the CDF inside _calibrated_p_win / select_legs_for_slate.
@@ -430,15 +436,9 @@ def _match_props(
                 f"p_win_over={p_win:.3f}"
             )
         else:
-            # Fallback: calibration tier-delta
+            # Fallback: calibration tier-delta (name not in SGO or stat not covered)
             result[pp.prop_id] = _fallback_sc(pp.prop_id, pp_line, tier, pp.stat_type)
-            if candidates:
-                log.debug(
-                    f"[sharp] no line match {pp.player_name} {pp.stat_type} "
-                    f"PP_line={pp_line} closest_diff={best_diff:.1f}"
-                )
-            else:
-                log.debug(f"[sharp] no SGO data for {pp.player_name} {pp.stat_type}")
+            log.debug(f"[sharp] no SGO data for {pp.player_name} {pp.stat_type} line={pp_line:.1f}")
 
     return result
 
