@@ -505,6 +505,255 @@ def corr_adjusted_ev(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# 10. DEMON QUALIFICATION SCORE
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Demon floor: PP demon must clear this p_win to even be scored.
+# r*_6 + 0.03 ≈ 0.53
+DEMON_PWIN_FLOOR = BREAKEVEN_R.get(6, 0.50) + 0.03  # computed after BREAKEVEN_R
+
+# How much sharper the SGO median must be vs the PP demon line for an OVER demon.
+# If SGO fair line < PP line by more than this, the demon is immediately bad.
+# e.g. PP demon line = 4.5 OVER; SGO median = 3.8 → edge = -0.7 → OVER is a trap.
+_DEMON_EDGE_CUTOFF = -0.5   # SGO median may be at most 0.5 BELOW PP demon line for OVER
+
+# Game-script fit table: stat types that benefit from high-pace / high-volume games.
+# Keys are stat types; value is +1 (pace helps) or -1 (pace hurts).
+# Used as a multiplier on a game's run-rate signal (total projected runs/pts).
+_STAT_PACE_SIGN: Dict[str, int] = {
+    # MLB — high run-environment helps all hitting stats
+    "Hits":                     +1,
+    "Total Bases":              +1,
+    "Hits+Runs+RBIs":           +1,
+    "Home Runs":                +1,
+    "RBIs":                     +1,
+    "Runs":                     +1,
+    "Walks":                    +1,
+    "Plate Appearances":        +1,
+    "Hitter Fantasy Score":     +1,
+    "Hitter Strikeouts":        -1,  # high K environment bad for hitters
+    # MLB pitching — low run-environment helps pitcher stats
+    "Pitcher Strikeouts":       +1,  # high K rate environment helps pitcher Ks
+    "Pitching Outs":            +1,
+    "Pitches Thrown":           +1,
+    "Earned Runs Allowed":      -1,  # high offense bad for pitcher ERA props
+    "Hits Allowed":             -1,
+    # NBA — high pace helps all
+    "Points":                   +1,
+    "Rebounds":                 +1,
+    "Assists":                  +1,
+    "Pts+Reb+Ast":              +1,
+    "3-PT Made":                +1,
+}
+
+
+@dataclass
+class DemonScore:
+    prop_id:           str
+    player_name:       str
+    stat_type:         str
+    line:              float
+    direction:         Direction
+    p_win:             float
+    # Layer sub-scores (0.0–1.0 each)
+    market_anchor:     float   # L1: how well SGO median supports PP demon line
+    dist_hit_rate:     float   # L2: p_win normalized to [0,1] above demon floor
+    game_script_fit:   float   # L3: pace/volume environment signal
+    role_certainty:    float   # L4: inverse DNP risk × freshness weight
+    pair_diversity:    float   # L5: computed later when pairing demons
+    # Combined score
+    composite:         float
+    qualifies:         bool    # True only if ALL hard gates pass
+
+
+def score_demon(
+    cand:       "LegCandidate",
+    sc:         "SharpConsensus",
+    dnp_prob:   float,
+    game_total: float,          # projected total runs/pts for this game (0 = unknown)
+) -> DemonScore:
+    """
+    Score a PP-flagged demon leg across five layers.
+    Returns DemonScore with composite 0–1 and qualifies bool.
+
+    Layer weights (must sum to 1.0):
+      L1 market_anchor   0.30  — is the SGO median on-side with the demon line?
+      L2 dist_hit_rate   0.30  — how far above the demon floor is p_win?
+      L3 game_script_fit 0.20  — does the game environment support this stat?
+      L4 role_certainty  0.20  — is the player locked in and available?
+    """
+    direction = cand.direction
+    pp_line   = cand.line
+    p_win     = cand.p_win
+
+    # ── Hard gates ───────────────────────────────────────────────────────────
+    # Gate 1: p_win must clear demon floor (already enforced in build loop,
+    # but re-check here for defensive clarity).
+    if p_win < DEMON_PWIN_FLOOR:
+        return DemonScore(
+            prop_id=cand.prop_id, player_name=cand.player_name,
+            stat_type=cand.stat_type, line=pp_line, direction=direction,
+            p_win=p_win, market_anchor=0.0, dist_hit_rate=0.0,
+            game_script_fit=0.0, role_certainty=0.0, pair_diversity=0.5,
+            composite=0.0, qualifies=False,
+        )
+
+    # Gate 2: SGO must not be materially against the demon direction.
+    sgo_median = sc.median
+    if direction == Direction.OVER:
+        edge = sgo_median - pp_line   # positive = SGO median > PP line → OVER has edge
+    else:
+        edge = pp_line - sgo_median   # positive = SGO median < PP line → UNDER has edge
+
+    if edge < _DEMON_EDGE_CUTOFF:
+        # SGO says this demon is a trap — disqualify.
+        return DemonScore(
+            prop_id=cand.prop_id, player_name=cand.player_name,
+            stat_type=cand.stat_type, line=pp_line, direction=direction,
+            p_win=p_win, market_anchor=0.0, dist_hit_rate=0.0,
+            game_script_fit=0.0, role_certainty=0.0, pair_diversity=0.5,
+            composite=0.0, qualifies=False,
+        )
+
+    # ── Real sharp data or fallback? ─────────────────────────────────────────
+    is_real_sharp = sc.freshness_sec < 9000.0  # 9999 = fallback
+
+    # ── L1: Market Anchor (0.0–1.0) ──────────────────────────────────────────
+    # How much does the SGO median support the demon direction?
+    # edge = sgo_median - pp_line for OVER (positive = supportive)
+    # Normalize: edge in [-0.5, +2.0] → [0.0, 1.0]
+    if is_real_sharp:
+        l1 = float(np.clip((edge + 0.5) / 2.5, 0.0, 1.0))
+    else:
+        # No real sharp data — neutral score, doesn't reward or penalize
+        l1 = 0.45
+
+    # ── L2: Distribution Hit Rate (0.0–1.0) ──────────────────────────────────
+    # How far above the demon floor is p_win?
+    # p_win range of interest: [DEMON_PWIN_FLOOR, 0.70]
+    floor  = DEMON_PWIN_FLOOR
+    l2_max = 0.70
+    l2 = float(np.clip((p_win - floor) / (l2_max - floor), 0.0, 1.0))
+
+    # ── L3: Game Script Fit (0.0–1.0) ────────────────────────────────────────
+    # Proxy: if game_total > 0, compare to league-average total (8.5 MLB, 220 NBA).
+    # Determine league from stat type.
+    if game_total > 0:
+        mlb_stats = {
+            "Hits", "Total Bases", "Hits+Runs+RBIs", "Home Runs", "RBIs", "Runs",
+            "Walks", "Plate Appearances", "Hitter Fantasy Score", "Hitter Strikeouts",
+            "Pitcher Strikeouts", "Pitching Outs", "Pitches Thrown",
+            "Earned Runs Allowed", "Hits Allowed", "Singles", "Doubles", "Triples",
+        }
+        league_avg = 8.5 if cand.stat_type in mlb_stats else 220.0
+        pace_deviation = (game_total - league_avg) / league_avg   # e.g. +0.15 = 15% above avg
+        pace_sign = _STAT_PACE_SIGN.get(cand.stat_type, +1)       # +1 = pace helps stat
+        script_signal = pace_deviation * pace_sign                 # [-inf, +inf]
+        # Normalize to [0.0, 1.0]: neutral (0.5) at league avg, +0.5 at +100% pace
+        l3 = float(np.clip(0.5 + script_signal * 0.5, 0.0, 1.0))
+    else:
+        l3 = 0.50   # neutral — no game-total data available
+
+    # ── L4: Role Certainty (0.0–1.0) ─────────────────────────────────────────
+    # Combines DNP risk and sharp data freshness.
+    # DNP risk: dnp_prob in [0, 0.15] (capped by hard gate above 0.15)
+    # Freshness: real sharp data = 1.0, fallback = 0.6
+    dnp_score  = float(np.clip(1.0 - dnp_prob / 0.15, 0.0, 1.0))
+    fresh_score = 1.0 if is_real_sharp else 0.6
+    l4 = 0.70 * dnp_score + 0.30 * fresh_score
+
+    # ── L5: Pair Diversity — placeholder (0.5 neutral, computed at pairing stage)
+    l5 = 0.50
+
+    # ── Composite Score ───────────────────────────────────────────────────────
+    # Weights: L1=0.30, L2=0.30, L3=0.20, L4=0.20  (L5 applied at pairing)
+    composite = 0.30 * l1 + 0.30 * l2 + 0.20 * l3 + 0.20 * l4
+
+    return DemonScore(
+        prop_id=cand.prop_id,
+        player_name=cand.player_name,
+        stat_type=cand.stat_type,
+        line=pp_line,
+        direction=direction,
+        p_win=p_win,
+        market_anchor=round(l1, 4),
+        dist_hit_rate=round(l2, 4),
+        game_script_fit=round(l3, 4),
+        role_certainty=round(l4, 4),
+        pair_diversity=round(l5, 4),
+        composite=round(composite, 4),
+        qualifies=True,
+    )
+
+
+def qualify_demons(
+    demon_cands:  List["LegCandidate"],
+    sc_map:       Dict[str, "SharpConsensus"],
+    dnp_model:    Dict[str, float],
+    game_total:   float = 0.0,
+) -> List["LegCandidate"]:
+    """
+    Filter and rank PP demons using demon_score().
+    Returns the subset of demon_cands that pass ALL gates,
+    ordered by composite score descending.
+
+    Pair diversity (L5): after scoring individuals, apply a 10% penalty
+    to the second demon of any pair sharing the same stat_type.
+    This nudges the MILP toward demons from different failure modes.
+
+    Returns: ranked list of qualified LegCandidates (may be empty, 1, or ≥2).
+    """
+    if not demon_cands:
+        return []
+
+    scored: List[tuple] = []  # (DemonScore, LegCandidate)
+    for cand in demon_cands:
+        sc = sc_map.get(cand.prop_id)
+        if not sc:
+            continue
+        dnp_prob = dnp_model.get(cand.player_id, dnp_model.get(cand.prop_id, 0.0))
+        ds = score_demon(cand, sc, dnp_prob, game_total)
+        if ds.qualifies:
+            scored.append((ds, cand))
+
+    if not scored:
+        return []
+
+    # Sort by composite descending
+    scored.sort(key=lambda t: t[0].composite, reverse=True)
+
+    # Apply L5 pair-diversity penalty: if top-2 demons share stat_type, knock
+    # the second one down slightly to open the door for a more diverse alternative.
+    # Rebuild composite with L5 factored in for ranking purposes only.
+    if len(scored) >= 2:
+        top_stat = scored[0][0].stat_type
+        for i in range(1, len(scored)):
+            ds, cand = scored[i]
+            if ds.stat_type == top_stat:
+                # Same failure mode — 10% diversity penalty on composite
+                penalized = DemonScore(
+                    **{**ds.__dict__,
+                       "pair_diversity": 0.0,
+                       "composite": round(ds.composite * 0.90, 4)}
+                )
+                scored[i] = (penalized, cand)
+        # Re-sort after penalty
+        scored.sort(key=lambda t: t[0].composite, reverse=True)
+
+    # Log demon scoring for debugging
+    log.info("[demon] qualified %d/%d PP demons", len(scored), len(demon_cands))
+    for ds, _ in scored[:4]:
+        log.info(
+            "[demon]  %s %s %.1f %s → p_win=%.3f L1=%.2f L2=%.2f L3=%.2f L4=%.2f composite=%.3f",
+            ds.player_name, ds.stat_type, ds.line, ds.direction.value,
+            ds.p_win, ds.market_anchor, ds.dist_hit_rate,
+            ds.game_script_fit, ds.role_certainty, ds.composite,
+        )
+
+    return [cand for _, cand in scored]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # 10. PER-GAME MILP (OR-Tools SCIP)
 # ──────────────────────────────────────────────────────────────────────────────
 def solve_game_milp(
@@ -688,24 +937,29 @@ def select_legs_for_slate(
         by_game.setdefault(c.game_id, []).append(c)
 
     for game_id, gcands in by_game.items():
-        d_cands = sorted([c for c in gcands if c.tier == Tier.DEMON],
-                         key=lambda c: c.p_win, reverse=True)
-        s_cands = sorted([c for c in gcands if c.tier != Tier.DEMON],
-                         key=lambda c: c.p_win, reverse=True)
+        raw_d_cands = [c for c in gcands if c.tier == Tier.DEMON]
+        s_cands     = sorted([c for c in gcands if c.tier != Tier.DEMON],
+                             key=lambda c: c.p_win, reverse=True)
 
-        # Guarantee at least 2 distinct demon players in the shortlist
-        # (MILP requires exactly 2 distinct demon players)
-        demon_slots: List[LegCandidate] = []
-        seen_demon_players: set = set()
-        for dc in d_cands:
-            if len(demon_slots) >= 6:
-                break
-            demon_slots.append(dc)
-            seen_demon_players.add(dc.player_id)
-        # If fewer than 2 distinct demon players, skip this game
+        # ── Demon qualification: PP flags it, GOTit scores and filters it ────
+        # qualify_demons runs the 5-layer score, drops demons that fail hard
+        # gates (p_win floor + SGO edge cutoff), ranks survivors by composite.
+        # Returns 0, 1, or ≥2 qualified candidates — MILP needs ≥2 from 2 distinct players.
+        qualified_d = qualify_demons(
+            demon_cands=raw_d_cands,
+            sc_map=sharp_consensus,
+            dnp_model=dnp_model,
+        )
+
+        # If fewer than 2 distinct demon players qualify, skip this game
+        seen_demon_players = set(dc.player_id for dc in qualified_d)
         if len(seen_demon_players) < 2:
+            log.info("[demon] game %s: only %d distinct demon players qualified — skipping",
+                     game_id, len(seen_demon_players))
             continue
 
+        # Cap demon slots at 6 (enough for MILP to pick 2, with diversity)
+        demon_slots = qualified_d[:6]
         standard_slots = s_cands[:MAX_SHAPLEY - len(demon_slots)]
         filtered.extend(demon_slots + standard_slots)
 
@@ -753,7 +1007,7 @@ def select_legs_for_slate(
         port_ev = sum(corr_adj.get(lg.prop_id, 0.0) for lg in selected)
 
         def leg_to_dict(lg: LegCandidate) -> Dict:
-            return {
+            d = {
                 "prop_id":     lg.prop_id,
                 "player_name": lg.player_name,
                 "stat_type":   lg.stat_type,
@@ -764,6 +1018,21 @@ def select_legs_for_slate(
                 "ev_marginal": round(lg.ev_marginal, 6),
                 "ev_corr_adj": round(lg.ev_corr_adj, 6),
             }
+            # For demons, attach the 5-layer qualification score
+            if lg.tier == Tier.DEMON:
+                sc = sharp_consensus.get(lg.prop_id)
+                if sc:
+                    dnp_p = dnp_model.get(lg.player_id, dnp_model.get(lg.prop_id, 0.0))
+                    ds = score_demon(lg, sc, dnp_p, game_total=0.0)
+                    d["demon_score"] = {
+                        "composite":       ds.composite,
+                        "market_anchor":   ds.market_anchor,
+                        "dist_hit_rate":   ds.dist_hit_rate,
+                        "game_script_fit": ds.game_script_fit,
+                        "role_certainty":  ds.role_certainty,
+                        "pair_diversity":  ds.pair_diversity,
+                    }
+            return d
 
         output[game_id] = {
             "six_legs":   [leg_to_dict(lg) for lg in selected],
