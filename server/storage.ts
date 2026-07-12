@@ -99,7 +99,7 @@ export interface IStorage {
 export const storage: IStorage = {
 
   // ── Props ──────────────────────────────────────────────────────────────────
-  async upsertProps(rows) {
+  async upsertProps(rows: any[]) {
     if (rows.length === 0) return;
 
     for (const r of rows) {
@@ -114,6 +114,25 @@ export const storage: IStorage = {
     // Write-first, delete-second: slate is never left empty if write fails.
     const pullTimestamp = new Date().toISOString();
     rows.forEach(r => { r.pulledAt = pullTimestamp; });
+
+    // Deduplicate: PP sends multiple alt-line entries that can share the same
+    // player+stat+line+direction+game. Keep only one per composite key — prefer
+    // the demon tier, then goblin, then standard.
+    const dedupMap = new Map<string, typeof rows[0]>();
+    for (const r of rows) {
+      const key = `${r.playerName}|${r.statType}|${r.lineScore}|${r.direction}|${r.gameId}`;
+      const existing = dedupMap.get(key);
+      if (!existing) {
+        dedupMap.set(key, r);
+      } else {
+        // Prefer demon > goblin > standard
+        const tierRank = (p: typeof r) => p.isDemon ? 2 : p.isGoblin ? 1 : 0;
+        if (tierRank(r) > tierRank(existing)) dedupMap.set(key, r);
+      }
+    }
+    const deduped = Array.from(dedupMap.values());
+    console.log(`[storage] upsertProps: ${rows.length} raw → ${deduped.length} after dedup`);
+    rows = deduped;
 
     const dbRows = rows.map(r => ({
       id: r.id,
