@@ -115,23 +115,48 @@ export const storage: IStorage = {
     const pullTimestamp = new Date().toISOString();
     rows.forEach(r => { r.pulledAt = pullTimestamp; });
 
-    // Deduplicate: PP sends multiple alt-line entries that can share the same
-    // player+stat+line+direction+game. Keep only one per composite key — prefer
-    // the demon tier, then goblin, then standard.
-    const dedupMap = new Map<string, typeof rows[0]>();
+    // ── Dedup pass 1: exact duplicate (same player+stat+line+direction+game)
+    // PP occasionally sends the same projection twice with different IDs.
+    const exactMap = new Map<string, typeof rows[0]>();
     for (const r of rows) {
       const key = `${r.playerName}|${r.statType}|${r.lineScore}|${r.direction}|${r.gameId}`;
-      const existing = dedupMap.get(key);
+      const existing = exactMap.get(key);
       if (!existing) {
-        dedupMap.set(key, r);
+        exactMap.set(key, r);
       } else {
-        // Prefer demon > goblin > standard
-        const tierRank = (p: typeof r) => p.isDemon ? 2 : p.isGoblin ? 1 : 0;
-        if (tierRank(r) > tierRank(existing)) dedupMap.set(key, r);
+        // Prefer standard > goblin > demon for canonical line
+        const tierRank = (p: typeof r) => p.isDemon ? 0 : p.isGoblin ? 1 : 2;
+        if (tierRank(r) > tierRank(existing)) exactMap.set(key, r);
       }
     }
-    const deduped = Array.from(dedupMap.values());
-    console.log(`[storage] upsertProps: ${rows.length} raw → ${deduped.length} after dedup`);
+
+    // ── Dedup pass 2: alt-line collapse (same player+stat+direction+game, different lines)
+    // PP is an alt-line platform — each player+stat has 6-7 lines (0.5, 1.5 ... 7.5).
+    // Keep ONE line per player+stat+direction+game:
+    //   • The standard/goblin line is the canonical PP line — always preferred.
+    //   • If no standard/goblin exists, keep the demon line closest to the median
+    //     (middle of the range = most liquid alt-line).
+    const altMap = new Map<string, typeof rows[0]>();
+    for (const r of Array.from(exactMap.values())) {
+      const key = `${r.playerName}|${r.statType}|${r.direction}|${r.gameId}`;
+      const existing = altMap.get(key);
+      if (!existing) {
+        altMap.set(key, r);
+      } else {
+        const isStandard = (p: typeof r) => !p.isDemon && !p.isGoblin;
+        const isGoblin   = (p: typeof r) => !!p.isGoblin;
+        // Standard wins always; goblin beats demon; among same tier pick middle line
+        if (isStandard(r) && !isStandard(existing)) {
+          altMap.set(key, r);
+        } else if (isGoblin(r) && !isStandard(existing) && !isGoblin(existing)) {
+          altMap.set(key, r);
+        }
+        // Among same tier: keep existing (first seen is fine — lines are random order)
+      }
+    }
+
+    const deduped = Array.from(altMap.values());
+    console.log(`[storage] upsertProps: ${rows.length} raw → ${deduped.length} after dedup (pass1=${exactMap.size})`);
     rows = deduped;
 
     const dbRows = rows.map(r => ({
