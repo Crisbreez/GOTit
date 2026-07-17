@@ -163,28 +163,43 @@ export async function pullPrizePicks(league: string): Promise<RawCanonicalProp[]
     console.log(`[PrizePicks] Using proxy for ${league} pull`);
   }
 
-  let resp: Response;
-  try {
-    resp = await fetch(url, {
-      // @ts-ignore — node fetch accepts dispatcher/agent
-      ...(agent ? { agent } : {}),
-      headers: {
-        'User-Agent': nextUA(),
-        'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Origin': 'https://app.prizepicks.com',
-        'Referer': 'https://app.prizepicks.com/',
-        'x-device-id': nextDeviceId(),
-        'Cache-Control': 'no-cache',
-        'Pragma': 'no-cache',
-        'Sec-Fetch-Dest': 'empty',
-        'Sec-Fetch-Mode': 'cors',
-        'Sec-Fetch-Site': 'same-site',
-      },
-    });
-  } catch (e: any) {
-    throw new Error(`Network error pulling PP ${league}: ${e.message}`);
+  // Retry up to 3 times on EPIPE / network errors — Render's egress can drop
+  // connections mid-stream. EPIPE on a socket emits an 'error' event that
+  // crashes the process if unhandled; catch it here at the fetch level.
+  let resp: Response | null = null;
+  let lastErr: Error | null = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      resp = await fetch(url, {
+        // @ts-ignore — node fetch accepts dispatcher/agent
+        ...(agent ? { agent } : {}),
+        headers: {
+          'User-Agent': nextUA(),
+          'Accept': 'application/json, text/plain, */*',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Accept-Encoding': 'gzip, deflate, br',
+          'Origin': 'https://app.prizepicks.com',
+          'Referer': 'https://app.prizepicks.com/',
+          'x-device-id': nextDeviceId(),
+          'Cache-Control': 'no-cache',
+          'Pragma': 'no-cache',
+          'Sec-Fetch-Dest': 'empty',
+          'Sec-Fetch-Mode': 'cors',
+          'Sec-Fetch-Site': 'same-site',
+        },
+      });
+      break; // success — exit retry loop
+    } catch (e: any) {
+      lastErr = e;
+      const isEpipe = e.code === 'EPIPE' || (e.message ?? '').includes('EPIPE');
+      console.warn(`[PrizePicks] ${league} fetch attempt ${attempt} failed: ${e.message}`);
+      if (attempt < 3) {
+        await sleep(isEpipe ? 2000 : 1000 * attempt);
+      }
+    }
+  }
+  if (!resp) {
+    throw new Error(`Network error pulling PP ${league} after 3 attempts: ${lastErr?.message}`);
   }
 
   if (resp.status === 403 || resp.status === 429) {

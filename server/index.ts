@@ -5,6 +5,20 @@ import { registerRoutes } from "./routes";
 import { serveStatic } from "./static";
 import { createServer } from "node:http";
 
+// Prevent EPIPE / broken-pipe socket errors from crashing the server.
+// These occur when Render's egress drops a connection mid-stream.
+process.on('uncaughtException', (err: any) => {
+  if (err.code === 'EPIPE' || err.code === 'ECONNRESET' || err.code === 'ECONNABORTED') {
+    console.warn('[server] Swallowed network error:', err.code, err.message);
+    return;
+  }
+  console.error('[server] Uncaught exception:', err);
+  process.exit(1);
+});
+process.on('unhandledRejection', (reason: any) => {
+  console.error('[server] Unhandled rejection:', reason);
+});
+
 const app = express();
 const httpServer = createServer(app);
 
