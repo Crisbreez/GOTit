@@ -284,14 +284,16 @@ export function registerRoutes(httpServer: Server, app: Express) {
     }
 
     const updatedLegs = await storage.getLegsBySlip(id);
-    const hits = updatedLegs.filter(l => l.status === 'hit').length;
-    const allHit = hits === updatedLegs.length;
+    // DNP legs are voided (PP rules) — exclude from win/loss calculation
+    const activeLegs = updatedLegs.filter(l => l.status !== 'dnp');
+    const hits = activeLegs.filter(l => l.status === 'hit').length;
+    const allHit = activeLegs.length > 0 && hits === activeLegs.length;
 
     await storage.updateSlipStatus(id, allHit ? 'settled_win' : 'settled_loss', {
       settledAt: new Date().toISOString(),
     });
 
-    res.json({ ok: true, won: allHit, hits, total: updatedLegs.length });
+    res.json({ ok: true, won: allHit, hits, total: activeLegs.length, dnp: updatedLegs.length - activeLegs.length });
   });
 
   // ── Update Leg ─────────────────────────────────────────────────────────────
