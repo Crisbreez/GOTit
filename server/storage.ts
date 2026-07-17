@@ -145,13 +145,19 @@ export const storage: IStorage = {
       } else {
         const isStandard = (p: typeof r) => !p.isDemon && !p.isGoblin;
         const isGoblin   = (p: typeof r) => !!p.isGoblin;
-        // Standard wins always; goblin beats demon; among same tier pick middle line
+        // Tier priority: standard > goblin > demon
+        // Among same tier: standard/goblin keep lower line; demon keeps higher line
         if (isStandard(r) && !isStandard(existing)) {
           altMap.set(key, r);
         } else if (isGoblin(r) && !isStandard(existing) && !isGoblin(existing)) {
           altMap.set(key, r);
+        } else if (isStandard(r) && isStandard(existing)) {
+          if (r.lineScore < existing.lineScore) altMap.set(key, r);
+        } else if (isGoblin(r) && isGoblin(existing)) {
+          if (r.lineScore < existing.lineScore) altMap.set(key, r);
+        } else if (r.isDemon && existing.isDemon) {
+          if (r.lineScore > existing.lineScore) altMap.set(key, r);
         }
-        // Among same tier: keep existing (first seen is fine — lines are random order)
       }
     }
 
