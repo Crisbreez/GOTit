@@ -511,45 +511,40 @@ def corr_adjusted_ev(
 # 10. DEMON QUALIFICATION SCORE
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Demon floor: PP demon must clear this p_win to even be scored.
-# r*_6 + 0.03 ≈ 0.53
-DEMON_PWIN_FLOOR = BREAKEVEN_R.get(6, 0.50) + 0.03  # computed after BREAKEVEN_R
+# ── Demon policy (canonical) ──────────────────────────────────────────────────
+# 1. PP odds_type == "demon" is the ONLY source of demon identity.
+# 2. GOTit never promotes a standard prop to demon.
+# 3. GOTit scores only PP demons.
+# 4. If a PP demon fails the keep rule, it is dropped.
+# 5. If a game has 0 or 1 qualifying demons, show 0 or 1. No substitutions.
+# 6. Final demon ranking is by composite descending, distinct-player enforced.
 
-# Gate 0: minimum line score per stat type for a demon to even be considered.
-# Low-frequency stats (HR, Triple, SB, Walk, Double, Single, RBI, Run) at 0.5 are
-# essentially coin flips that PP labels demon to look exciting. We reject them.
-# Volume / composite stats (Hits, HFS, TB, H+R+RBI, K) need a lower floor because
-# their distributions are centered higher and a 1.5 is meaningful.
+DEMON_PWIN_FLOOR  = 0.53   # keep gate: p_win must clear this
+_DEMON_EDGE_CUTOFF = -0.5   # keep gate: anchor_delta >= this
+_DEMON_DNP_CUTOFF  = 0.15   # keep gate: dnp_prob must be below this
+
+# Gate 0 — minimum line per stat type (rejects 0.5 lottery lines PP mislabels demon)
 _DEMON_LINE_FLOOR: dict = {
-    # Rate / low-frequency events — must be a real alt-line, not just 0.5
-    "Home Runs":          1.5,
-    "Triples":            1.5,
-    "Stolen Bases":       1.5,
-    "Doubles":            1.5,
-    "Walks":              1.5,
-    "Singles":            1.5,
-    "RBIs":               1.5,
-    "Runs":               1.5,
-    # Volume / composite — still require something above 0.5
-    "Hits":               1.5,
-    "Total Bases":        2.5,
-    "Hits+Runs+RBIs":     2.5,
+    "Home Runs":            1.5,
+    "Triples":              1.5,
+    "Stolen Bases":         1.5,
+    "Doubles":              1.5,
+    "Walks":                1.5,
+    "Singles":              1.5,
+    "RBIs":                 1.5,
+    "Runs":                 1.5,
+    "Hits":                 1.5,
+    "Total Bases":          2.5,
+    "Hits+Runs+RBIs":       2.5,
     "Hitter Fantasy Score": 3.5,
-    "Hitter Strikeouts":  1.5,
-    # Pitching
-    "Pitcher Strikeouts": 3.5,
-    "Pitching Outs":      9.5,
-    "Pitches Thrown":    59.5,
-    "Earned Runs Allowed":0.5,
-    "Hits Allowed":       2.5,
-    # Default for any stat not listed — require at least 1.5
-    "_default":           1.5,
+    "Hitter Strikeouts":    1.5,
+    "Pitcher Strikeouts":   3.5,
+    "Pitching Outs":        9.5,
+    "Pitches Thrown":      59.5,
+    "Earned Runs Allowed":  0.5,
+    "Hits Allowed":         2.5,
+    "_default":             1.5,
 }
-
-# How much sharper the SGO median must be vs the PP demon line for an OVER demon.
-# If SGO fair line < PP line by more than this, the demon is immediately bad.
-# e.g. PP demon line = 4.5 OVER; SGO median = 3.8 → edge = -0.7 → OVER is a trap.
-_DEMON_EDGE_CUTOFF = -0.5   # SGO median may be at most 0.5 BELOW PP demon line for OVER
 
 # Game-script fit table: stat types that benefit from high-pace / high-volume games.
 # Keys are stat types; value is +1 (pace helps) or -1 (pace hurts).
@@ -590,102 +585,83 @@ class DemonScore:
     direction:         Direction
     p_win:             float
     # Layer sub-scores (0.0–1.0 each)
-    market_anchor:     float   # L1: how well SGO median supports PP demon line
-    dist_hit_rate:     float   # L2: p_win normalized to [0,1] above demon floor
-    game_script_fit:   float   # L3: pace/volume environment signal
-    role_certainty:    float   # L4: inverse DNP risk × freshness weight
-    pair_diversity:    float   # L5: computed later when pairing demons
-    # Combined score
+    market_anchor:     float   # L1
+    dist_hit_rate:     float   # L2
+    game_script_fit:   float   # L3
+    role_certainty:    float   # L4
+    pair_diversity:    float   # L5 (applied at pairing stage)
     composite:         float
-    qualifies:         bool    # True only if ALL hard gates pass
+    qualifies:         bool
+
+
+def _demon_keep(
+    line_floor_pass: bool,
+    anchor_delta:    float,
+    p_win:           float,
+    dnp_prob:        float,
+) -> bool:
+    """Hard keep gate — all four must be true."""
+    return (
+        line_floor_pass
+        and anchor_delta >= _DEMON_EDGE_CUTOFF
+        and p_win        >= DEMON_PWIN_FLOOR
+        and dnp_prob      < _DEMON_DNP_CUTOFF
+    )
 
 
 def score_demon(
     cand:       "LegCandidate",
     sc:         "SharpConsensus",
     dnp_prob:   float,
-    game_total: float,          # projected total runs/pts for this game (0 = unknown)
+    game_total: float,
+    pace_fit:        float = 0.5,
+    matchup_fit:     float = 0.5,
+    environment_fit: float = 0.5,
+    usage_fragility: float = 0.0,
+    freshness_risk:  float = 0.0,
+    same_failure_penalty: float = 0.0,
 ) -> DemonScore:
     """
-    Score a PP-flagged demon leg across five layers.
-    Returns DemonScore with composite 0–1 and qualifies bool.
-
-    Layer weights (must sum to 1.0):
-      L1 market_anchor   0.30  — is the SGO median on-side with the demon line?
-      L2 dist_hit_rate   0.30  — how far above the demon floor is p_win?
-      L3 game_script_fit 0.20  — does the game environment support this stat?
-      L4 role_certainty  0.20  — is the player locked in and available?
+    Score a PP-flagged demon leg.
+    Keep gate: line_floor AND anchor_delta >= -0.5 AND p_win >= 0.53 AND dnp_prob < 0.15
+    Weights:   L1=0.34  L2=0.28  L3=0.18  L4=0.12  L5=0.08
     """
     direction = cand.direction
     pp_line   = cand.line
     p_win     = cand.p_win
 
-    # ── Hard gates ───────────────────────────────────────────────────────────
-    # Gate 0: minimum line per stat type.
-    # Rejects PP's 0.5-line "demons" on low-frequency stats (HR, SB, Triple …)
-    # that are essentially coin flips PP labels demon to look exciting.
-    min_line = _DEMON_LINE_FLOOR.get(cand.stat_type, _DEMON_LINE_FLOOR["_default"])
-    if pp_line < min_line:
+    # ── Gate 0: line floor per stat type ─────────────────────────────────────
+    min_line        = _DEMON_LINE_FLOOR.get(cand.stat_type, _DEMON_LINE_FLOOR["_default"])
+    line_floor_pass = pp_line >= min_line
+
+    # ── anchor_delta = sharp_fair_line − pp_demon_line (OVER convention) ─────
+    sgo_median    = sc.median
+    anchor_delta  = (sgo_median - pp_line) if direction == Direction.OVER else (pp_line - sgo_median)
+    is_real_sharp = sc.freshness_sec < 9000.0
+
+    # ── Keep gate ─────────────────────────────────────────────────────────────
+    qualifies = _demon_keep(line_floor_pass, anchor_delta, p_win, dnp_prob)
+    if not qualifies:
         return DemonScore(
             prop_id=cand.prop_id, player_name=cand.player_name,
             stat_type=cand.stat_type, line=pp_line, direction=direction,
             p_win=p_win, market_anchor=0.0, dist_hit_rate=0.0,
-            game_script_fit=0.0, role_certainty=0.0, pair_diversity=0.5,
+            game_script_fit=0.0, role_certainty=0.0, pair_diversity=0.0,
             composite=0.0, qualifies=False,
         )
 
-    # Gate 1: p_win must clear demon floor (already enforced in build loop,
-    # but re-check here for defensive clarity).
-    if p_win < DEMON_PWIN_FLOOR:
-        return DemonScore(
-            prop_id=cand.prop_id, player_name=cand.player_name,
-            stat_type=cand.stat_type, line=pp_line, direction=direction,
-            p_win=p_win, market_anchor=0.0, dist_hit_rate=0.0,
-            game_script_fit=0.0, role_certainty=0.0, pair_diversity=0.5,
-            composite=0.0, qualifies=False,
-        )
+    # ── L1: Market anchor ─────────────────────────────────────────────────────
+    # clamp(0.5 + anchor_delta / 1.0)
+    l1 = float(np.clip(0.5 + anchor_delta / 1.0, 0.0, 1.0)) if is_real_sharp else 0.45
 
-    # Gate 2: SGO must not be materially against the demon direction.
-    sgo_median = sc.median
-    if direction == Direction.OVER:
-        edge = sgo_median - pp_line   # positive = SGO median > PP line → OVER has edge
-    else:
-        edge = pp_line - sgo_median   # positive = SGO median < PP line → UNDER has edge
+    # ── L2: Distribution hit rate ─────────────────────────────────────────────
+    # clamp((p_win − 0.53) / 0.17)
+    l2 = float(np.clip((p_win - 0.53) / 0.17, 0.0, 1.0))
 
-    if edge < _DEMON_EDGE_CUTOFF:
-        # SGO says this demon is a trap — disqualify.
-        return DemonScore(
-            prop_id=cand.prop_id, player_name=cand.player_name,
-            stat_type=cand.stat_type, line=pp_line, direction=direction,
-            p_win=p_win, market_anchor=0.0, dist_hit_rate=0.0,
-            game_script_fit=0.0, role_certainty=0.0, pair_diversity=0.5,
-            composite=0.0, qualifies=False,
-        )
-
-    # ── Real sharp data or fallback? ─────────────────────────────────────────
-    is_real_sharp = sc.freshness_sec < 9000.0  # 9999 = fallback
-
-    # ── L1: Market Anchor (0.0–1.0) ──────────────────────────────────────────
-    # How much does the SGO median support the demon direction?
-    # edge = sgo_median - pp_line for OVER (positive = supportive)
-    # Normalize: edge in [-0.5, +2.0] → [0.0, 1.0]
-    if is_real_sharp:
-        l1 = float(np.clip((edge + 0.5) / 2.5, 0.0, 1.0))
-    else:
-        # No real sharp data — neutral score, doesn't reward or penalize
-        l1 = 0.45
-
-    # ── L2: Distribution Hit Rate (0.0–1.0) ──────────────────────────────────
-    # How far above the demon floor is p_win?
-    # p_win range of interest: [DEMON_PWIN_FLOOR, 0.70]
-    floor  = DEMON_PWIN_FLOOR
-    l2_max = 0.70
-    l2 = float(np.clip((p_win - floor) / (l2_max - floor), 0.0, 1.0))
-
-    # ── L3: Game Script Fit (0.0–1.0) ────────────────────────────────────────
-    # Proxy: if game_total > 0, compare to league-average total (8.5 MLB, 220 NBA).
-    # Determine league from stat type.
-    if game_total > 0:
+    # ── L3: Game script fit ───────────────────────────────────────────────────
+    # clamp(0.40*pace_fit + 0.30*matchup_fit + 0.30*environment_fit)
+    # Derive pace_fit from game_total when not externally provided.
+    if game_total > 0 and pace_fit == 0.5:
         mlb_stats = {
             "Hits", "Total Bases", "Hits+Runs+RBIs", "Home Runs", "RBIs", "Runs",
             "Walks", "Plate Appearances", "Hitter Fantasy Score", "Hitter Strikeouts",
@@ -693,28 +669,24 @@ def score_demon(
             "Earned Runs Allowed", "Hits Allowed", "Singles", "Doubles", "Triples",
         }
         league_avg = 8.5 if cand.stat_type in mlb_stats else 220.0
-        pace_deviation = (game_total - league_avg) / league_avg   # e.g. +0.15 = 15% above avg
-        pace_sign = _STAT_PACE_SIGN.get(cand.stat_type, +1)       # +1 = pace helps stat
-        script_signal = pace_deviation * pace_sign                 # [-inf, +inf]
-        # Normalize to [0.0, 1.0]: neutral (0.5) at league avg, +0.5 at +100% pace
-        l3 = float(np.clip(0.5 + script_signal * 0.5, 0.0, 1.0))
-    else:
-        l3 = 0.50   # neutral — no game-total data available
+        pace_dev   = (game_total - league_avg) / league_avg
+        pace_sign  = _STAT_PACE_SIGN.get(cand.stat_type, +1)
+        pace_fit   = float(np.clip(0.5 + pace_dev * pace_sign * 0.5, 0.0, 1.0))
+    l3 = float(np.clip(0.40 * pace_fit + 0.30 * matchup_fit + 0.30 * environment_fit, 0.0, 1.0))
 
-    # ── L4: Role Certainty (0.0–1.0) ─────────────────────────────────────────
-    # Combines DNP risk and sharp data freshness.
-    # DNP risk: dnp_prob in [0, 0.15] (capped by hard gate above 0.15)
-    # Freshness: real sharp data = 1.0, fallback = 0.6
-    dnp_score  = float(np.clip(1.0 - dnp_prob / 0.15, 0.0, 1.0))
-    fresh_score = 1.0 if is_real_sharp else 0.6
-    l4 = 0.70 * dnp_score + 0.30 * fresh_score
+    # ── L4: Role certainty ────────────────────────────────────────────────────
+    # clamp(1.0 − (0.55*dnp_prob + 0.25*usage_fragility + 0.20*freshness_risk))
+    fr = 0.0 if is_real_sharp else (freshness_risk if freshness_risk else 0.4)
+    l4 = float(np.clip(1.0 - (0.55 * dnp_prob + 0.25 * usage_fragility + 0.20 * fr), 0.0, 1.0))
 
-    # ── L5: Pair Diversity — placeholder (0.5 neutral, computed at pairing stage)
-    l5 = 0.50
+    # ── L5: Pair diversity (applied at pairing stage; default 1.0 = no penalty)
+    l5 = float(np.clip(1.0 - same_failure_penalty, 0.0, 1.0))
 
-    # ── Composite Score ───────────────────────────────────────────────────────
-    # Weights: L1=0.30, L2=0.30, L3=0.20, L4=0.20  (L5 applied at pairing)
-    composite = 0.30 * l1 + 0.30 * l2 + 0.20 * l3 + 0.20 * l4
+    # ── Composite: L1=0.34  L2=0.28  L3=0.18  L4=0.12  L5=0.08 ─────────────
+    composite = float(np.clip(
+        0.34 * l1 + 0.28 * l2 + 0.18 * l3 + 0.12 * l4 + 0.08 * l5,
+        0.0, 1.0,
+    ))
 
     return DemonScore(
         prop_id=cand.prop_id,
