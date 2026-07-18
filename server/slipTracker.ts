@@ -15,8 +15,43 @@
 
 import { storage } from './storage';
 import { getPlayerStat } from './mlbTracker';
+import { getMMAFighterStat } from './mmaTracker';
 
 const TRACK_INTERVAL_MS = 90_000; // 90 seconds
+
+// ── Settle a single MMA leg against ESPN data ───────────────────────────────
+async function trackMMALeg(leg: any): Promise<void> {
+  if (leg.status === 'hit' || leg.status === 'miss' || leg.status === 'dnp') return;
+
+  console.log(`[SlipTracker] MMA Leg ${leg.id}: fighter="${leg.playerName}" stat="${leg.statType}" line=${leg.lineScore} dir=${leg.direction}`);
+
+  const result = await getMMAFighterStat(
+    leg.playerName,
+    leg.statType,
+    leg.gameMatchup ?? undefined,
+  );
+
+  if (!result) {
+    console.log(`[SlipTracker] MMA Leg ${leg.id}: no result yet`);
+    return;
+  }
+
+  const actual = result.actualValue;
+  const line   = leg.lineScore;
+  const dir    = (leg.direction ?? 'over').toLowerCase();
+
+  console.log(`[SlipTracker] MMA Leg ${leg.id}: actual=${actual} vs line=${line} (${dir}) status=${result.gameStatus}`);
+
+  if (result.gameStatus === 'live') {
+    await storage.updateLegStatus(leg.id, 'live', actual);
+    return;
+  }
+
+  // Fight is final — settle
+  const hit = dir === 'over' ? actual > line : actual < line;
+  await storage.updateLegStatus(leg.id, hit ? 'hit' : 'miss', actual);
+  console.log(`[SlipTracker] MMA Leg ${leg.id}: SETTLED → ${hit ? 'HIT' : 'MISS'} (actual=${actual} ${dir} ${line})`);
+}
 
 // ── Settle a single MLB leg against real data ─────────────────────────────────
 async function trackMLBLeg(leg: any): Promise<void> {
@@ -83,16 +118,20 @@ async function trackSlip(slip: any): Promise<void> {
     }
   }
 
-  // Only MLB tracking is real — others stay live until manually settled
-  if (slip.league !== 'MLB') {
-    console.log(`[SlipTracker] Slip ${slip.id}: skipping stat settlement (${slip.league} not yet supported — only MLB has real stat tracking)`);
+  // Route each league to the correct tracker
+  if (slip.league !== 'MLB' && slip.league !== 'MMA') {
+    console.log(`[SlipTracker] Slip ${slip.id}: skipping stat settlement (${slip.league} tracking not yet implemented)`);
     return;
   }
 
-  // Track each unresolved leg.
+  // Track each unresolved leg
   for (const leg of legs) {
     if (leg.status !== 'hit' && leg.status !== 'miss' && leg.status !== 'dnp') {
-      await trackMLBLeg(leg);
+      if (slip.league === 'MMA') {
+        await trackMMALeg(leg);
+      } else {
+        await trackMLBLeg(leg);
+      }
     }
   }
 
