@@ -398,6 +398,7 @@ class LegCandidate:
     p_win:       float
     ev_marginal: float = 0.0
     ev_corr_adj: float = 0.0
+    under_score: Optional["UnderScore"] = None  # set for UNDER standard legs that qualify
 
     @property
     def family(self) -> DistFamily:
@@ -775,6 +776,139 @@ def qualify_demons(
 # ──────────────────────────────────────────────────────────────────────────────
 # 10. PER-GAME MILP (OR-Tools SCIP)
 # ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# 11. UNDER SCORING ENGINE
+# ──────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class UnderScore:
+    prop_id:                 str
+    player_name:             str
+    stat_type:               str
+    line:                    float
+    p_under:                 float
+    u1_market_anchor:        float
+    u2_dist_hit_rate:        float
+    u3_volume_weakness:      float
+    u4_game_script_suppression: float
+    u5_pair_diversity:       float
+    composite:               float
+    qualifies:               bool
+
+
+def _keep_under(
+    p_under:          float,
+    edge:             float,   # pp_line - fair_line (positive = PP line > fair = value on under)
+    dnp_prob:         float,
+    volume_weakness:  float,
+    upside_trap:      bool,
+) -> bool:
+    """Hard keep gate for under legs. All five conditions must be true."""
+    return (
+        p_under          >= 0.54
+        and edge          > 0.0
+        and dnp_prob      < 0.15
+        and volume_weakness >= 0.45
+        and not upside_trap
+    )
+
+
+def score_under(
+    cand:                   "LegCandidate",
+    sc:                     "SharpConsensus",
+    dnp_prob:               float,
+    # U3 volume weakness inputs
+    lineup_risk:            float = 0.5,
+    order_penalty:          float = 0.5,
+    pitch_count_risk:       float = 0.5,
+    sub_risk:               float = 0.0,
+    # U4 game script suppression inputs
+    park_suppression:       float = 0.5,
+    matchup_suppression:    float = 0.5,
+    run_env_suppression:    float = 0.5,
+    push_mass:              float = 0.5,
+    # U5
+    shared_failure_penalty: float = 0.0,
+) -> UnderScore:
+    """
+    Score a standard UNDER leg.
+    Keep gate: p_under>=0.54 AND edge>0 AND dnp<0.15 AND volume_weakness>=0.45 AND not upside_trap
+    Weights:   U1=0.36  U2=0.24  U3=0.18  U4=0.12  U5=0.10
+    """
+    pp_line   = cand.line
+    p_under   = cand.p_win   # p_win was computed for UNDER direction
+    fair_line = sc.median
+    is_real   = sc.freshness_sec < 9000.0
+
+    # edge = pp_line - fair_line: positive means PP line is above the fair line → under has value
+    edge = pp_line - fair_line
+
+    # Derive volume_weakness and upside_trap from available data when inputs are default
+    # volume_weakness: proxy = U3 formula with defaults (0.5 neutral each component)
+    volume_weakness = float(np.clip(
+        0.35 * lineup_risk + 0.25 * order_penalty +
+        0.25 * pitch_count_risk + 0.15 * sub_risk,
+        0.0, 1.0
+    ))
+    # upside_trap: true when the fair line is materially BELOW pp_line (edge > 1.5)
+    # meaning PP is pricing in a scenario where the player blows up the over — risky to fade
+    upside_trap = edge > 1.5
+
+    qualifies = _keep_under(p_under, edge, dnp_prob, volume_weakness, upside_trap)
+    if not qualifies:
+        return UnderScore(
+            prop_id=cand.prop_id, player_name=cand.player_name,
+            stat_type=cand.stat_type, line=pp_line, p_under=p_under,
+            u1_market_anchor=0.0, u2_dist_hit_rate=0.0, u3_volume_weakness=0.0,
+            u4_game_script_suppression=0.0, u5_pair_diversity=1.0,
+            composite=0.0, qualifies=False,
+        )
+
+    # ── U1: Market anchor ────────────────────────────────────────────────
+    # clamp(0.5 + (pp_line - fair_line) / 1.0)
+    u1 = float(np.clip(0.5 + edge / 1.0, 0.0, 1.0)) if is_real else 0.40
+
+    # ── U2: Distribution hit rate ─────────────────────────────────────────
+    # clamp((p_under - 0.54) / 0.16)
+    u2 = float(np.clip((p_under - 0.54) / 0.16, 0.0, 1.0))
+
+    # ── U3: Volume weakness ──────────────────────────────────────────────
+    # clamp(0.35*lineup_risk + 0.25*order_penalty + 0.25*pitch_count_risk + 0.15*sub_risk)
+    u3 = volume_weakness  # already computed above
+
+    # ── U4: Game script suppression ────────────────────────────────────────
+    # clamp(0.30*park_suppression + 0.25*matchup_suppression + 0.25*run_env + 0.20*push_mass)
+    u4 = float(np.clip(
+        0.30 * park_suppression + 0.25 * matchup_suppression +
+        0.25 * run_env_suppression + 0.20 * push_mass,
+        0.0, 1.0
+    ))
+
+    # ── U5: Pair diversity ─────────────────────────────────────────────────
+    u5 = float(np.clip(1.0 - shared_failure_penalty, 0.0, 1.0))
+
+    # ── Composite: U1=0.36 U2=0.24 U3=0.18 U4=0.12 U5=0.10 ────────────────
+    composite = float(np.clip(
+        0.36 * u1 + 0.24 * u2 + 0.18 * u3 + 0.12 * u4 + 0.10 * u5,
+        0.0, 1.0
+    ))
+
+    return UnderScore(
+        prop_id=cand.prop_id,
+        player_name=cand.player_name,
+        stat_type=cand.stat_type,
+        line=pp_line,
+        p_under=p_under,
+        u1_market_anchor=round(u1, 4),
+        u2_dist_hit_rate=round(u2, 4),
+        u3_volume_weakness=round(u3, 4),
+        u4_game_script_suppression=round(u4, 4),
+        u5_pair_diversity=round(u5, 4),
+        composite=round(composite, 4),
+        qualifies=True,
+    )
+
+
 def solve_game_milp(
     candidates: List[LegCandidate],
     ev_map:     Dict[str, float],
@@ -935,7 +1069,7 @@ def select_legs_for_slate(
                 if tier == Tier.DEMON and p_win < BREAKEVEN_R[6] + 0.03:
                     continue
 
-                all_candidates.append(LegCandidate(
+                cand = LegCandidate(
                     prop_id=pp.prop_id,
                     game_id=pp.game_id,
                     player_id=pp.player_id,
@@ -945,7 +1079,14 @@ def select_legs_for_slate(
                     line=line,
                     direction=d,
                     p_win=float(np.clip(p_win, 0.001, 0.999)),
-                ))
+                )
+                # Score UNDER standard legs immediately; drop those that fail keep gate
+                if d == Direction.UNDER and tier == Tier.STANDARD:
+                    us = score_under(cand, sc, dnp_model.get(pp.player_id, dnp_model.get(pp.prop_id, 0.0)))
+                    if not us.qualifies:
+                        continue   # UNDER didn't pass keep gate — skip it
+                    cand.under_score = us
+                all_candidates.append(cand)
 
     if not all_candidates:
         log.warning("No leg candidates passed hard filters — slate is empty")
@@ -1045,10 +1186,10 @@ def select_legs_for_slate(
             }
             # For demons, attach the 5-layer qualification score
             if lg.tier == Tier.DEMON:
-                sc = sharp_consensus.get(lg.prop_id)
-                if sc:
+                sc_d = sharp_consensus.get(lg.prop_id)
+                if sc_d:
                     dnp_p = dnp_model.get(lg.player_id, dnp_model.get(lg.prop_id, 0.0))
-                    ds = score_demon(lg, sc, dnp_p, game_total=0.0)
+                    ds = score_demon(lg, sc_d, dnp_p, game_total=0.0)
                     d["demon_score"] = {
                         "composite":       ds.composite,
                         "market_anchor":   ds.market_anchor,
@@ -1057,6 +1198,17 @@ def select_legs_for_slate(
                         "role_certainty":  ds.role_certainty,
                         "pair_diversity":  ds.pair_diversity,
                     }
+            # For UNDER standard legs, attach the 5-layer under score
+            if lg.direction == Direction.UNDER and lg.under_score is not None:
+                us = lg.under_score
+                d["under_score"] = {
+                    "composite":                  us.composite,
+                    "market_anchor":              us.u1_market_anchor,
+                    "dist_hit_rate":              us.u2_dist_hit_rate,
+                    "volume_weakness":            us.u3_volume_weakness,
+                    "game_script_suppression":    us.u4_game_script_suppression,
+                    "pair_diversity":             us.u5_pair_diversity,
+                }
             return d
 
         output[game_id] = {
