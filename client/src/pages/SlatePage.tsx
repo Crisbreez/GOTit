@@ -232,8 +232,8 @@ function DemonCard({ prop, rank }: { prop: Prop; rank: number }) {
 
 // ── Game card ─────────────────────────────────────────────────────────────────
 // ── Selectable prop row ───────────────────────────────────────────────────────
-function PropRow({ prop, isSelected, onToggle, onFlip, disabled }: {
-  prop: Prop; isSelected: boolean; onToggle: () => void; onFlip?: () => void; disabled: boolean;
+function PropRow({ prop, isSelected, onToggle, disabled }: {
+  prop: Prop; isSelected: boolean; onToggle: () => void; disabled: boolean;
 }) {
   const isGoblin = prop.isGoblin;
   const isDemon = prop.isDemon;
@@ -250,7 +250,7 @@ function PropRow({ prop, isSelected, onToggle, onFlip, disabled }: {
   // Show data indicator dot when backed by player recents
   const hasRecents = (prop.gamesFound ?? 0) >= 5;
   // Standard props (not demon, not goblin) can be flipped by the user
-  const canFlip = !isDemon && !isGoblin && !!onFlip;
+  // Direction is GOTit-decided and locked — no user flipping ever
 
   return (
     <div
@@ -314,10 +314,10 @@ function PropRow({ prop, isSelected, onToggle, onFlip, disabled }: {
         <div style={{ fontSize: '0.88rem', fontWeight: 800, fontFamily: 'Space Mono, monospace', color: isSelected ? 'hsl(var(--g-gold))' : 'hsl(var(--foreground))' }}>
           {prop.lineScore}
         </div>
-        {/* Direction arrow badge — tappable to flip for standard props */}
+        {/* Direction arrow badge — GOTit-decided, locked */}
         <div
-          onClick={canFlip ? (e) => { e.stopPropagation(); onFlip!(); } : undefined}
-          title={canFlip ? (dirConf === 'low' ? 'Low conviction — tap to flip' : 'Tap to flip direction') : undefined}
+          onClick={undefined}
+          title={undefined}
           style={{
             display: 'flex', alignItems: 'center', gap: 3,
             padding: '2px 6px', borderRadius: 6,
@@ -325,7 +325,7 @@ function PropRow({ prop, isSelected, onToggle, onFlip, disabled }: {
               ? 'hsl(142 72% 46% / 0.15)'
               : 'hsl(210 80% 60% / 0.15)',
             border: `1px solid ${isOver ? 'hsl(142 72% 46% / 0.4)' : 'hsl(210 80% 60% / 0.4)'}`,
-            cursor: canFlip ? 'pointer' : 'default',
+            cursor: 'default',
             transition: 'all 150ms',
             userSelect: 'none',
             opacity: badgeOpacity,
@@ -370,15 +370,9 @@ function GameCard({ game, selectedIds, onToggle, atMax, onSave, isSaving }: {
 }) {
   const [propCount, setPropCount] = useState<number>(0);
   const isActivated = propCount > 0;
-  // Local direction overrides — user can flip standard props (not demons/goblins)
-  const [dirOverrides, setDirOverrides] = useState<Record<string, 'over' | 'under'>>({});
+  // Direction is GOTit-decided and locked — dirOverrides removed
 
-  const handleFlip = (propId: string, currentDir: string) => {
-    setDirOverrides(prev => ({
-      ...prev,
-      [propId]: (prev[propId] ?? currentDir) === 'over' ? 'under' : 'over',
-    }));
-  };
+  // Direction is GOTit-decided and locked. No flip. No override.
 
   const allStandards = [...game.standards, ...game.goblins]
     .sort((a, b) => (b.propScore ?? 0) - (a.propScore ?? 0));
@@ -489,14 +483,13 @@ function GameCard({ game, selectedIds, onToggle, atMax, onSave, isSaving }: {
       {visibleProps.length > 0 && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 5, marginBottom: 12 }}>
           {visibleProps.map(p => {
-            const overriddenProp = dirOverrides[p.id] ? { ...p, direction: dirOverrides[p.id] } : p;
+            const overriddenProp = p;
             return (
               <PropRow
                 key={p.id}
                 prop={overriddenProp}
                 isSelected={selectedIds.has(p.id)}
                 onToggle={() => onToggle({ ...overriddenProp })}
-                onFlip={!p.isDemon && !p.isGoblin ? () => handleFlip(p.id, p.direction) : undefined}
                 disabled={atMax && !selectedIds.has(p.id)}
               />
             );
