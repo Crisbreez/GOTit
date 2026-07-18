@@ -200,20 +200,21 @@ function SlipCard({ slip, onRefresh, isRefreshing, onDelete, isDeleting, onMarkD
                     {overTarget ? '↑' : '↓'} {leg.lineScore}
                   </div>
                 )}
-                {/* DNP button — pending or live legs only */}
+                {/* VOID / DNP button — pending or live legs only */}
                 {(leg.status === 'pending' || leg.status === 'live') && (
                   <button
                     data-testid={`dnp-leg-${leg.id}`}
                     onClick={() => onMarkDnp(leg.id)}
+                    title="Mark player as Did Not Play — voids this leg"
                     style={{
                       fontSize:'0.52rem', fontWeight:800, letterSpacing:'0.06em',
-                      color:'hsl(var(--muted-foreground))',
-                      background:'hsl(var(--g-border))',
+                      color:'hsl(var(--muted-foreground) / 0.5)',
+                      background:'transparent',
                       border:'1px solid hsl(var(--g-border))',
                       borderRadius:4, padding:'2px 6px',
                       cursor:'pointer', lineHeight:1.4,
                     }}
-                  >DNP</button>
+                  >VOID</button>
                 )}
               </div>
             </div>

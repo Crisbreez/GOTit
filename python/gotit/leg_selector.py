@@ -547,6 +547,31 @@ _DEMON_LINE_FLOOR: dict = {
     "_default":             1.5,
 }
 
+# Standard-tier line floors — minimum line score to enter optimizer.
+# Prevents near-certain "lottery" props (e.g. TB 0.5) from clogging the slate.
+# Rule: standard legs with line < floor are dropped before scoring.
+_STANDARD_LINE_FLOOR: dict = {
+    # MLB hitting — anything at 0.5 is a near-certain hit (player just needs
+    # one hit/base/contact event), so we require at least 1.5 to be meaningful.
+    "Total Bases":         1.5,
+    "Hits":                1.5,
+    "Hits+Runs+RBIs":      1.5,
+    "RBIs":                0.5,   # RBI 0.5 OK — at least 1 RBI is not trivial
+    "Runs":                0.5,
+    "Home Runs":           0.5,
+    "Stolen Bases":        0.5,
+    "Singles":             1.5,
+    "Doubles":             0.5,
+    "Triples":             0.5,
+    # MLB pitching
+    "Pitcher Strikeouts":  2.5,
+    "Innings Pitched":     4.5,
+    # MMA — 0.5 submission attempts / knockdowns are near-certain; require at least 1.5
+    "Significant Strikes": 15.0,
+    "Takedowns":           0.5,
+    "_default":            0.5,   # conservative default — only block sub-0.5 lines
+}
+
 # Game-script fit table: stat types that benefit from high-pace / high-volume games.
 # Keys are stat types; value is +1 (pace helps) or -1 (pace hurts).
 # Used as a multiplier on a game's run-rate signal (total projected runs/pts).
@@ -1062,6 +1087,13 @@ def select_legs_for_slate(
                 dirs = [Direction.OVER, Direction.UNDER]
 
             dnp_prob = dnp_model.get(pp.player_id, dnp_model.get(pp.prop_id, 0.0))
+
+            # Standard line floor — block lottery lines before scoring
+            if tier == Tier.STANDARD:
+                std_floor = _STANDARD_LINE_FLOOR.get(pp.stat_type, _STANDARD_LINE_FLOOR["_default"])
+                if line < std_floor:
+                    log.debug(f"Gate 0 (std floor): {pp.player_name} {pp.stat_type} line={line} < floor={std_floor}")
+                    continue
 
             best_cand: Optional[LegCandidate] = None
             for d in dirs:
