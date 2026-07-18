@@ -83,8 +83,11 @@ def _tier(d: dict) -> Tier:
 
 def build_pp_prop(d: dict) -> PPProp:
     """Convert web-app prop dict to PPProp. Called by both optimize.py and sharp_pull.py."""
+    from gotit.leg_selector import Direction as Dir
     tier = _tier(d)
     line = float(d.get("lineScore") or d.get("line_score") or 0.5)
+    raw_dir = (d.get("direction") or "over").strip().upper()
+    stored_dir = Dir.UNDER if raw_dir == "UNDER" else Dir.OVER
     return PPProp(
         prop_id=_prop_id(d),
         game_id=d.get("gameId") or d.get("game_id") or "unknown",
@@ -95,8 +98,9 @@ def build_pp_prop(d: dict) -> PPProp:
         lines={tier: line},
         hours_to_lock=4.0,
         public_over_pct=None,
-        dnp_prob=0.0,           # no real DNP model yet — passes the 0.15 gate
+        dnp_prob=0.0,
         correlation_partners=[],
+        stored_direction=stored_dir,
     )
 
 

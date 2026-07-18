@@ -219,6 +219,9 @@ class PPProp:
     public_over_pct:      Optional[float]
     dnp_prob:             float
     correlation_partners: List[str]
+    # Direction stored on the prop from PP — governs which side the CDF evaluates.
+    # If PP sends an under, we evaluate UNDER; never force a direction ourselves.
+    stored_direction:     Direction = Direction.OVER
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -896,8 +899,19 @@ def select_legs_for_slate(
         for tier in pp.tiers_offered:
             line = pp.lines[tier]
 
-            # Direction(s) to consider
-            dirs = [Direction.OVER] if tier in (Tier.GOBLIN, Tier.DEMON) else [Direction.OVER, Direction.UNDER]
+            # Direction(s) to consider.
+            # Always use the direction PP stored on the prop.
+            # For standards where PP didn't specify, try both directions
+            # so unders can surface when PP sends them.
+            if tier in (Tier.GOBLIN, Tier.DEMON):
+                # Goblins and demons: use the stored direction exactly —
+                # never flip a demon line to evaluate the opposite side.
+                dirs = [pp.stored_direction]
+            else:
+                # Standards: if PP stored a direction, honour it;
+                # if over (default), also probe under so any true under
+                # props from PP are not missed.
+                dirs = [Direction.OVER, Direction.UNDER]
 
             for d in dirs:
                 p_win = _calibrated_p_win(line, median, cal_shape, family, d, pp.stat_type)
