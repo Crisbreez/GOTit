@@ -183,7 +183,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
 
   // ── Build Slip ─────────────────────────────────────────────────────────────
   app.post('/api/slips/build', async (req, res) => {
-    const { gameId, matchup, startTime, scriptLabel, propCount, propIds, league } = req.body;
+    const { gameId, matchup, startTime, scriptLabel, propCount, propIds, league, demonScores } = req.body;
     if (!league) return res.status(400).json({ error: 'league required' });
 
     const rawProps = await storage.getProps(league);
@@ -241,6 +241,49 @@ export function registerRoutes(httpServer: Server, app: Express) {
 
     await storage.createLegs(legs);
     const createdLegs = await storage.getLegsBySlip(slip.id);
+
+    // ── Write demon_log entries for every demon leg ────────────────────────
+    // Records all 5-layer scores at selection time so we can audit which
+    // component is fooling the model when demons lose.
+    if (demonScores && typeof demonScores === 'object') {
+      for (const leg of createdLegs) {
+        if (!leg.isDemon) continue;
+        const ds = demonScores[leg.propId] || demonScores[leg.id];
+        if (!ds) continue;
+        try {
+          const supaUrl = process.env.SUPABASE_URL;
+          const supaKey = process.env.SUPABASE_ANON_KEY;
+          await fetch(`${supaUrl}/rest/v1/demon_log`, {
+            method: 'POST',
+            headers: {
+              'apikey': supaKey ?? '',
+              'Authorization': `Bearer ${supaKey ?? ''}`,
+              'Content-Type': 'application/json',
+              'Prefer': 'return=minimal',
+            },
+            body: JSON.stringify({
+              slip_id:          slip.id,
+              player_name:      leg.playerName,
+              stat_type:        leg.statType,
+              line_score:       leg.lineScore,
+              direction:        leg.direction,
+              game_matchup:     leg.gameMatchup,
+              p_win:            ds.pWin ?? null,
+              l1_market_anchor: ds.market_anchor ?? null,
+              l2_dist_hit_rate: ds.dist_hit_rate ?? null,
+              l3_game_script:   ds.game_script_fit ?? null,
+              l4_role_certainty:ds.role_certainty ?? null,
+              l5_pair_diversity:ds.pair_diversity ?? null,
+              composite:        ds.composite ?? null,
+              selected_at:      new Date().toISOString(),
+            }),
+          });
+        } catch (e) {
+          console.warn('[demon_log] insert failed:', e);
+        }
+      }
+    }
+
     res.json({ ...slip, legs: createdLegs });
   });
 
@@ -284,6 +327,36 @@ export function registerRoutes(httpServer: Server, app: Express) {
     }
 
     const updatedLegs = await storage.getLegsBySlip(id);
+
+    // ── Write actual results back to demon_log ─────────────────────────────
+    // This closes the loop: we know the score at selection, now we know the result.
+    for (const leg of updatedLegs) {
+      if (!leg.isDemon) continue;
+      try {
+        const supaUrl = process.env.SUPABASE_URL;
+        const supaKey = process.env.SUPABASE_ANON_KEY;
+        await fetch(
+          `${supaUrl}/rest/v1/demon_log?slip_id=eq.${id}&player_name=eq.${encodeURIComponent(leg.playerName)}&stat_type=eq.${encodeURIComponent(leg.statType)}`,
+          {
+            method: 'PATCH',
+            headers: {
+              'apikey': supaKey ?? '',
+              'Authorization': `Bearer ${supaKey ?? ''}`,
+              'Content-Type': 'application/json',
+              'Prefer': 'return=minimal',
+            },
+            body: JSON.stringify({
+              actual_value: leg.actualValue ?? null,
+              result:       leg.status,
+              settled_at:   new Date().toISOString(),
+            }),
+          }
+        );
+      } catch (e) {
+        console.warn('[demon_log] settle patch failed:', e);
+      }
+    }
+
     // DNP legs are voided (PP rules) — exclude from win/loss calculation
     const activeLegs = updatedLegs.filter(l => l.status !== 'dnp');
     const hits = activeLegs.filter(l => l.status === 'hit').length;

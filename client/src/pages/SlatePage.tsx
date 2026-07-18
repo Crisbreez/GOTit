@@ -46,6 +46,14 @@ interface Prop {
   evMarginal?: number;
   evCorrAdj?: number;
   optimizerTier?: 'demon' | 'standard';
+  demonScore?: {
+    composite: number;
+    market_anchor: number;
+    dist_hit_rate: number;
+    game_script_fit: number;
+    role_certainty: number;
+    pair_diversity: number;
+  };
 }
 
 interface OptimizerLeg {
@@ -58,6 +66,14 @@ interface OptimizerLeg {
   p_win: number;
   ev_marginal: number;
   ev_corr_adj: number;
+  demon_score?: {
+    composite: number;
+    market_anchor: number;
+    dist_hit_rate: number;
+    game_script_fit: number;
+    role_certainty: number;
+    pair_diversity: number;
+  };
 }
 
 interface OptimizerResult {
@@ -678,6 +694,17 @@ export default function SlatePage() {
     setSavingGameId(gameId);
     try {
       const game = games.find((g: any) => g.gameId === gameId);
+      // Collect optimized game state (enriched with demonScore, pWin)
+      const optGame = optimizedGames.find((g: any) => g.gameId === gameId);
+      const allOptProps = optGame
+        ? [...(optGame.demons || []), ...(optGame.standards || []), ...(optGame.goblins || [])]
+        : [];
+      // Build demonScores map: propId -> demonScore for any selected demon legs
+      const demonScores: Record<string, any> = {};
+      for (const pid of cardSelectedIds) {
+        const p = allOptProps.find((x: any) => x.id === pid);
+        if (p?.demonScore) demonScores[pid] = { ...p.demonScore, pWin: p.pWin };
+      }
       const body = {
         league,
         gameId,
@@ -685,6 +712,7 @@ export default function SlatePage() {
         matchup: game?.matchup || '',
         startTime: game?.startTime || '',
         scriptLabel: game?.scriptLabel || '',
+        demonScores,
       };
       await apiRequest('POST', '/api/slips/build', body);
       // Invalidate and force-refetch so SlipPage shows the new slip immediately
@@ -718,6 +746,12 @@ export default function SlatePage() {
     try {
       // Build matchup from first prop's game metadata
       const firstProp = selectedPropMap[allIds[0]];
+      // Collect demonScores for all selected demon props across all games
+      const trayDemonScores: Record<string, any> = {};
+      for (const pid of allIds) {
+        const p = selectedPropMap[pid];
+        if (p?.demonScore) trayDemonScores[pid] = { ...p.demonScore, pWin: p.pWin };
+      }
       const body = {
         league,
         gameId: `cross-${Date.now()}`,
@@ -725,6 +759,7 @@ export default function SlatePage() {
         matchup: firstProp?.gameMatchup || '',
         startTime: firstProp?.gameStartTime || '',
         scriptLabel: 'Cross-Game Slip',
+        demonScores: trayDemonScores,
       };
       await apiRequest('POST', '/api/slips/build', body);
       await queryClient.invalidateQueries({ queryKey: ['/api/slips', 'active'] });
@@ -815,7 +850,7 @@ export default function SlatePage() {
         const key = `${p.playerName}|${p.statType}`;
         const leg = legLookup.get(p.id || '') || legLookup.get(key);
         if (!leg) return p;
-        return { ...p, pWin: leg.p_win, evMarginal: leg.ev_marginal, evCorrAdj: leg.ev_corr_adj };
+        return { ...p, pWin: leg.p_win, evMarginal: leg.ev_marginal, evCorrAdj: leg.ev_corr_adj, demonScore: leg.demon_score };
       }
 
       // Re-rank standards+goblins by p_win descending
