@@ -262,12 +262,13 @@ export async function pullPrizePicks(league: string): Promise<RawCanonicalProp[]
   // Leagues where synthetic under generation is active
   const SYNTHETIC_UNDER_LEAGUES = new Set(['MLB', 'MMA']);
 
+  // Build synthetic under rows for eligible props
   const syntheticUnders: RawCanonicalProp[] = [];
   for (const row of results) {
-    if (!SYNTHETIC_UNDER_LEAGUES.has(row.league)) continue; // only MLB + MMA
-    if (row.isDemon || row.isGoblin) continue;              // demons/goblins: over-only
-    if (row.direction === 'under') continue;                 // already an under
-    if (UNDER_EXCLUDED_STATS.has(row.statType)) continue;   // excluded stat types
+    if (!SYNTHETIC_UNDER_LEAGUES.has(row.league)) continue;
+    if (row.isDemon || row.isGoblin) continue;
+    if (row.direction === 'under') continue;
+    if (UNDER_EXCLUDED_STATS.has(row.statType)) continue;
     syntheticUnders.push({
       ...row,
       id: `prizepicks-under:${row.sourcePropId}`,
@@ -276,5 +277,11 @@ export async function pullPrizePicks(league: string): Promise<RawCanonicalProp[]
     });
   }
 
+  // Both over and under rows are stored in the DB with distinct IDs.
+  // Direction arbitration (one direction per player+stat+game) happens in
+  // leg_selector.py where real p_win is computed for both sides — that's
+  // where the winning direction is chosen. Storing both rows here is correct
+  // because the optimizer only receives one candidate per player+stat+game
+  // (the one that scores higher after the keep gate).
   return [...results, ...syntheticUnders];
 }

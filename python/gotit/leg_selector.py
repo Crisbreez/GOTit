@@ -1088,6 +1088,23 @@ def select_legs_for_slate(
                     cand.under_score = us
                 all_candidates.append(cand)
 
+    # ── Direction arbitration ───────────────────────────────────────────────────
+    # GOTit cannot pick both over AND under for the same player+stat+game.
+    # After scoring both sides, keep only the one with higher p_win.
+    # Demons and goblins are always over-only so they never have a competing
+    # under candidate and are passed through unchanged.
+    arb_map: Dict[str, LegCandidate] = {}  # key: player|stat|game_id
+    passthrough: List[LegCandidate] = []    # demons / goblins
+    for cand in all_candidates:
+        if cand.tier in (Tier.DEMON, Tier.GOBLIN):
+            passthrough.append(cand)
+            continue
+        key = f"{cand.player_name}|{cand.stat_type}|{cand.game_id}"
+        existing = arb_map.get(key)
+        if existing is None or cand.p_win > existing.p_win:
+            arb_map[key] = cand
+    all_candidates = passthrough + list(arb_map.values())
+
     if not all_candidates:
         log.warning("No leg candidates passed hard filters — slate is empty")
         return {}
