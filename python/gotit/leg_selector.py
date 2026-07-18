@@ -515,6 +515,37 @@ def corr_adjusted_ev(
 # r*_6 + 0.03 ≈ 0.53
 DEMON_PWIN_FLOOR = BREAKEVEN_R.get(6, 0.50) + 0.03  # computed after BREAKEVEN_R
 
+# Gate 0: minimum line score per stat type for a demon to even be considered.
+# Low-frequency stats (HR, Triple, SB, Walk, Double, Single, RBI, Run) at 0.5 are
+# essentially coin flips that PP labels demon to look exciting. We reject them.
+# Volume / composite stats (Hits, HFS, TB, H+R+RBI, K) need a lower floor because
+# their distributions are centered higher and a 1.5 is meaningful.
+_DEMON_LINE_FLOOR: dict = {
+    # Rate / low-frequency events — must be a real alt-line, not just 0.5
+    "Home Runs":          1.5,
+    "Triples":            1.5,
+    "Stolen Bases":       1.5,
+    "Doubles":            1.5,
+    "Walks":              1.5,
+    "Singles":            1.5,
+    "RBIs":               1.5,
+    "Runs":               1.5,
+    # Volume / composite — still require something above 0.5
+    "Hits":               1.5,
+    "Total Bases":        2.5,
+    "Hits+Runs+RBIs":     2.5,
+    "Hitter Fantasy Score": 3.5,
+    "Hitter Strikeouts":  1.5,
+    # Pitching
+    "Pitcher Strikeouts": 3.5,
+    "Pitching Outs":      9.5,
+    "Pitches Thrown":    59.5,
+    "Earned Runs Allowed":0.5,
+    "Hits Allowed":       2.5,
+    # Default for any stat not listed — require at least 1.5
+    "_default":           1.5,
+}
+
 # How much sharper the SGO median must be vs the PP demon line for an OVER demon.
 # If SGO fair line < PP line by more than this, the demon is immediately bad.
 # e.g. PP demon line = 4.5 OVER; SGO median = 3.8 → edge = -0.7 → OVER is a trap.
@@ -590,6 +621,19 @@ def score_demon(
     p_win     = cand.p_win
 
     # ── Hard gates ───────────────────────────────────────────────────────────
+    # Gate 0: minimum line per stat type.
+    # Rejects PP's 0.5-line "demons" on low-frequency stats (HR, SB, Triple …)
+    # that are essentially coin flips PP labels demon to look exciting.
+    min_line = _DEMON_LINE_FLOOR.get(cand.stat_type, _DEMON_LINE_FLOOR["_default"])
+    if pp_line < min_line:
+        return DemonScore(
+            prop_id=cand.prop_id, player_name=cand.player_name,
+            stat_type=cand.stat_type, line=pp_line, direction=direction,
+            p_win=p_win, market_anchor=0.0, dist_hit_rate=0.0,
+            game_script_fit=0.0, role_certainty=0.0, pair_diversity=0.5,
+            composite=0.0, qualifies=False,
+        )
+
     # Gate 1: p_win must clear demon floor (already enforced in build loop,
     # but re-check here for defensive clarity).
     if p_win < DEMON_PWIN_FLOOR:
