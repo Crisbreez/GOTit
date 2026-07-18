@@ -13,6 +13,7 @@ export const props = sqliteTable("props", {
   direction: text("direction").notNull(),     // over | under
   isDemon: integer("is_demon", { mode: "boolean" }).default(false),
   isGoblin: integer("is_goblin", { mode: "boolean" }).default(false),
+  isSynthetic: integer("is_synthetic", { mode: "boolean" }).default(false),  // GOTit-derived under from PP threshold
   gameId: text("game_id"),
   gameMatchup: text("game_matchup"),
   gameStartTime: text("game_start_time"),

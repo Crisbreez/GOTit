@@ -42,6 +42,11 @@ export interface CanonicalProp {
   ppDisplayTeam: string | null;     // team abbr/name exactly as PrizePicks returns it
   ppEventTitle: string | null;      // event title from PP (MMA event name etc)
 
+  // Synthetic flag — true when GOTit derived this row from a PP threshold,
+  // not because PP explicitly sent this direction.
+  // Rule: only standard props; never demons or goblins.
+  isSynthetic: boolean;
+
   // Scoring (filled by enrichProps after normalization)
   confidenceLevel: number;
   confidenceLabel: string;
@@ -67,6 +72,7 @@ export type RawCanonicalProp = Pick<
   | 'playerName' | 'teamAbbr'
   | 'statType' | 'lineScore' | 'direction'
   | 'isDemon' | 'isGoblin' | 'tier'
+  | 'isSynthetic'
   | 'pulledAt'
 > & Partial<Pick<CanonicalProp,
   | 'confidenceLevel' | 'confidenceLabel' | 'propScore' | 'rejectReason'

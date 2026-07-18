@@ -123,6 +123,7 @@ function normalizeToCanonical(
     isDemon,
     isGoblin,
     tier,
+    isSynthetic: false,
     // Display truth columns — preserved verbatim, never mutated by GOTit internals
     ppDisplayMatchup,
     ppDisplayPlayer,
@@ -241,5 +242,33 @@ export async function pullPrizePicks(league: string): Promise<RawCanonicalProp[]
     if (row) results.push(row);
   }
 
-  return results;
+  // ── Synthetic under generation ────────────────────────────────────────────────
+  // Rule: standard props only. Demons and goblins are over-only.
+  // PP partner API only sends over lines; GOTit derives the under side from
+  // the same threshold so the scoring engine can evaluate both directions.
+  // Synthetic unders are marked isSynthetic=true and get a distinct id.
+  //
+  // Stat types excluded from synthetic under generation:
+  //   - Ultra-low median stats where the under would be near-certain (p_under ~1.0)
+  //     and therefore not meaningful: Home Runs (median ~0.1), Triples, Stolen Bases
+  //   - These would clog the optimizer with trivially easy unders.
+  const UNDER_EXCLUDED_STATS = new Set([
+    'Home Runs', 'Triples', 'Stolen Bases',
+  ]);
+
+  const syntheticUnders: RawCanonicalProp[] = [];
+  for (const row of results) {
+    if (row.isDemon || row.isGoblin) continue;          // demons/goblins: over-only
+    if (row.direction === 'under') continue;             // already an under
+    if (UNDER_EXCLUDED_STATS.has(row.statType)) continue; // excluded stat types
+    // Only synthesize if the native row is an over (PP default)
+    syntheticUnders.push({
+      ...row,
+      id: `prizepicks-under:${row.sourcePropId}`,
+      direction: 'under',
+      isSynthetic: true,
+    });
+  }
+
+  return [...results, ...syntheticUnders];
 }
