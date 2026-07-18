@@ -156,7 +156,9 @@ export const storage: IStorage = {
         } else if (isGoblin(r) && isGoblin(existing)) {
           if (r.lineScore < existing.lineScore) altMap.set(key, r);
         } else if (r.isDemon && existing.isDemon) {
-          if (r.lineScore > existing.lineScore) altMap.set(key, r);
+          // Keep the LOWEST demon line — most achievable.
+          // High demon lines (e.g. H+R+RBI 6.5) are near-impossible traps.
+          if (r.lineScore < existing.lineScore) altMap.set(key, r);
         }
       }
     }
