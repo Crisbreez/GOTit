@@ -243,25 +243,31 @@ export async function pullPrizePicks(league: string): Promise<RawCanonicalProp[]
   }
 
   // ── Synthetic under generation ────────────────────────────────────────────────
-  // Rule: standard props only. Demons and goblins are over-only.
+  // Rule: standard props only, applies to MLB and MMA.
+  // Demons and goblins are over-only (never synthesize for those).
   // PP partner API only sends over lines; GOTit derives the under side from
   // the same threshold so the scoring engine can evaluate both directions.
   // Synthetic unders are marked isSynthetic=true and get a distinct id.
   //
-  // Stat types excluded from synthetic under generation:
-  //   - Ultra-low median stats where the under would be near-certain (p_under ~1.0)
-  //     and therefore not meaningful: Home Runs (median ~0.1), Triples, Stolen Bases
-  //   - These would clog the optimizer with trivially easy unders.
+  // Excluded stats — near-certain unders (near p_under~1.0) that are meaningless:
+  //   MLB: Home Runs, Triples, Stolen Bases
+  //   MMA: Knockdowns, Submission Attempts (low-frequency; under is trivially easy)
   const UNDER_EXCLUDED_STATS = new Set([
+    // MLB
     'Home Runs', 'Triples', 'Stolen Bases',
+    // MMA
+    'Knockdowns', 'Submission Attempts',
   ]);
+
+  // Leagues where synthetic under generation is active
+  const SYNTHETIC_UNDER_LEAGUES = new Set(['MLB', 'MMA']);
 
   const syntheticUnders: RawCanonicalProp[] = [];
   for (const row of results) {
-    if (row.isDemon || row.isGoblin) continue;          // demons/goblins: over-only
-    if (row.direction === 'under') continue;             // already an under
-    if (UNDER_EXCLUDED_STATS.has(row.statType)) continue; // excluded stat types
-    // Only synthesize if the native row is an over (PP default)
+    if (!SYNTHETIC_UNDER_LEAGUES.has(row.league)) continue; // only MLB + MMA
+    if (row.isDemon || row.isGoblin) continue;              // demons/goblins: over-only
+    if (row.direction === 'under') continue;                 // already an under
+    if (UNDER_EXCLUDED_STATS.has(row.statType)) continue;   // excluded stat types
     syntheticUnders.push({
       ...row,
       id: `prizepicks-under:${row.sourcePropId}`,
