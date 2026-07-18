@@ -1052,25 +1052,31 @@ def select_legs_for_slate(
             # Direction rules (non-negotiable):
             #   DEMON   → OVER only, demon section only
             #   GOBLIN  → OVER only, slate section only
-            #   STANDARD → OVER and UNDER both considered
+            #   STANDARD → GOTit evaluates BOTH directions internally,
+            #              then keeps ONLY the one with higher p_win.
+            #              The DB stores a single over row per player+stat+game.
+            #              Both sides are derived here from the same line.
             if tier in (Tier.GOBLIN, Tier.DEMON):
                 dirs = [Direction.OVER]
             else:
                 dirs = [Direction.OVER, Direction.UNDER]
 
+            dnp_prob = dnp_model.get(pp.player_id, dnp_model.get(pp.prop_id, 0.0))
+
+            best_cand: Optional[LegCandidate] = None
             for d in dirs:
                 p_win = _calibrated_p_win(line, median, cal_shape, family, d, pp.stat_type)
 
                 # Hard filters
                 if p_win < BREAKEVEN_R[6] - 0.02:
                     continue
-                if dnp_model.get(pp.player_id, dnp_model.get(pp.prop_id, 0.0)) > 0.15:
+                if dnp_prob > 0.15:
                     continue
                 if tier == Tier.DEMON and p_win < BREAKEVEN_R[6] + 0.03:
                     continue
 
                 cand = LegCandidate(
-                    prop_id=pp.prop_id,
+                    prop_id=pp.prop_id if d == Direction.OVER else f"{pp.prop_id}:under",
                     game_id=pp.game_id,
                     player_id=pp.player_id,
                     player_name=pp.player_name,
@@ -1080,30 +1086,25 @@ def select_legs_for_slate(
                     direction=d,
                     p_win=float(np.clip(p_win, 0.001, 0.999)),
                 )
-                # Score UNDER standard legs immediately; drop those that fail keep gate
-                if d == Direction.UNDER and tier == Tier.STANDARD:
-                    us = score_under(cand, sc, dnp_model.get(pp.player_id, dnp_model.get(pp.prop_id, 0.0)))
-                    if not us.qualifies:
-                        continue   # UNDER didn't pass keep gate — skip it
-                    cand.under_score = us
-                all_candidates.append(cand)
 
-    # ── Direction arbitration ───────────────────────────────────────────────────
-    # GOTit cannot pick both over AND under for the same player+stat+game.
-    # After scoring both sides, keep only the one with higher p_win.
-    # Demons and goblins are always over-only so they never have a competing
-    # under candidate and are passed through unchanged.
-    arb_map: Dict[str, LegCandidate] = {}  # key: player|stat|game_id
-    passthrough: List[LegCandidate] = []    # demons / goblins
-    for cand in all_candidates:
-        if cand.tier in (Tier.DEMON, Tier.GOBLIN):
-            passthrough.append(cand)
-            continue
-        key = f"{cand.player_name}|{cand.stat_type}|{cand.game_id}"
-        existing = arb_map.get(key)
-        if existing is None or cand.p_win > existing.p_win:
-            arb_map[key] = cand
-    all_candidates = passthrough + list(arb_map.values())
+                # Score UNDER standard legs; drop those that fail keep gate
+                if d == Direction.UNDER and tier == Tier.STANDARD:
+                    us = score_under(cand, sc, dnp_prob)
+                    if not us.qualifies:
+                        continue
+                    cand.under_score = us
+
+                # For standard legs: keep only the better-scoring direction
+                if tier == Tier.STANDARD:
+                    if best_cand is None or cand.p_win > best_cand.p_win:
+                        best_cand = cand
+                else:
+                    # Demons and goblins: only one direction (OVER), add directly
+                    all_candidates.append(cand)
+
+            # Add the single winning direction for standard legs
+            if tier == Tier.STANDARD and best_cand is not None:
+                all_candidates.append(best_cand)
 
     if not all_candidates:
         log.warning("No leg candidates passed hard filters — slate is empty")

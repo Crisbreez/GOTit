@@ -262,26 +262,11 @@ export async function pullPrizePicks(league: string): Promise<RawCanonicalProp[]
   // Leagues where synthetic under generation is active
   const SYNTHETIC_UNDER_LEAGUES = new Set(['MLB', 'MMA']);
 
-  // Build synthetic under rows for eligible props
-  const syntheticUnders: RawCanonicalProp[] = [];
-  for (const row of results) {
-    if (!SYNTHETIC_UNDER_LEAGUES.has(row.league)) continue;
-    if (row.isDemon || row.isGoblin) continue;
-    if (row.direction === 'under') continue;
-    if (UNDER_EXCLUDED_STATS.has(row.statType)) continue;
-    syntheticUnders.push({
-      ...row,
-      id: `prizepicks-under:${row.sourcePropId}`,
-      direction: 'under',
-      isSynthetic: true,
-    });
-  }
-
-  // Both over and under rows are stored in the DB with distinct IDs.
-  // Direction arbitration (one direction per player+stat+game) happens in
-  // leg_selector.py where real p_win is computed for both sides — that's
-  // where the winning direction is chosen. Storing both rows here is correct
-  // because the optimizer only receives one candidate per player+stat+game
-  // (the one that scores higher after the keep gate).
-  return [...results, ...syntheticUnders];
+  // Synthetic unders are NOT stored in the DB as separate rows.
+  // PP gives us the threshold (the over line). GOTit derives both sides
+  // internally in leg_selector.py using the CDF — over and under are
+  // both evaluated from the same stored prop row, and the better-scoring
+  // direction wins. Storing both rows caused over+under to both appear
+  // in the slate for the same fighter/player, which makes no sense.
+  return results;
 }
