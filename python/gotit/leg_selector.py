@@ -899,18 +899,13 @@ def select_legs_for_slate(
         for tier in pp.tiers_offered:
             line = pp.lines[tier]
 
-            # Direction(s) to consider.
-            # Always use the direction PP stored on the prop.
-            # For standards where PP didn't specify, try both directions
-            # so unders can surface when PP sends them.
+            # Direction rules (non-negotiable):
+            #   DEMON   → OVER only, demon section only
+            #   GOBLIN  → OVER only, slate section only
+            #   STANDARD → OVER and UNDER both considered
             if tier in (Tier.GOBLIN, Tier.DEMON):
-                # Goblins and demons: use the stored direction exactly —
-                # never flip a demon line to evaluate the opposite side.
-                dirs = [pp.stored_direction]
+                dirs = [Direction.OVER]
             else:
-                # Standards: if PP stored a direction, honour it;
-                # if over (default), also probe under so any true under
-                # props from PP are not missed.
                 dirs = [Direction.OVER, Direction.UNDER]
 
             for d in dirs:
