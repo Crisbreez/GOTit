@@ -62,7 +62,7 @@ function LegTypeTag({ isDemon, isGoblin }: { isDemon?: boolean; isGoblin?: boole
   return null;
 }
 
-function SlipCard({ slip, onRefresh, isRefreshing, onDelete, isDeleting }: { slip: Slip; onRefresh: (id:number) => void; isRefreshing: boolean; onDelete: (id:number) => void; isDeleting: boolean }) {
+function SlipCard({ slip, onRefresh, isRefreshing, onDelete, isDeleting, onMarkDnp }: { slip: Slip; onRefresh: (id:number) => void; isRefreshing: boolean; onDelete: (id:number) => void; isDeleting: boolean; onMarkDnp: (legId:number) => void }) {
   const allLegs = slip.legs || [];
   const activeLegs = allLegs.filter(l => l.status !== 'dnp');  // DNP legs excluded (PrizePicks voids them)
   const dnpLegs = allLegs.filter(l => l.status === 'dnp');
@@ -190,7 +190,7 @@ function SlipCard({ slip, onRefresh, isRefreshing, onDelete, isDeleting }: { sli
                   </div>
                 )}
               </div>
-              <div style={{ textAlign:'right', flexShrink:0 }}>
+              <div style={{ textAlign:'right', flexShrink:0, display:'flex', flexDirection:'column', alignItems:'flex-end', gap:5 }}>
                 {isDnp ? (
                   <div style={{ fontSize:'0.6rem', color:'hsl(var(--muted-foreground))', fontStyle:'italic' }}>voided</div>
                 ) : (
@@ -199,6 +199,21 @@ function SlipCard({ slip, onRefresh, isRefreshing, onDelete, isDeleting }: { sli
                   }}>
                     {overTarget ? '↑' : '↓'} {leg.lineScore}
                   </div>
+                )}
+                {/* DNP button — pending or live legs only */}
+                {(leg.status === 'pending' || leg.status === 'live') && (
+                  <button
+                    data-testid={`dnp-leg-${leg.id}`}
+                    onClick={() => onMarkDnp(leg.id)}
+                    style={{
+                      fontSize:'0.52rem', fontWeight:800, letterSpacing:'0.06em',
+                      color:'hsl(var(--muted-foreground))',
+                      background:'hsl(var(--g-border))',
+                      border:'1px solid hsl(var(--g-border))',
+                      borderRadius:4, padding:'2px 6px',
+                      cursor:'pointer', lineHeight:1.4,
+                    }}
+                  >DNP</button>
                 )}
               </div>
             </div>
@@ -262,6 +277,11 @@ export default function SlipPage() {
     queryFn: () => apiRequest('GET', '/api/slips?status=active').then(r => r.json()),
     refetchInterval: 60_000, // auto-refresh every 60s
     refetchIntervalInBackground: true,
+  });
+
+  const dnpLegMutation = useMutation({
+    mutationFn: (legId: number) => apiRequest('PATCH', `/api/legs/${legId}`, { status: 'dnp', actualValue: null }).then(r => r.json()),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['/api/slips'] }),
   });
 
   const refreshMutation = useMutation({
@@ -329,7 +349,7 @@ export default function SlipPage() {
                 <span>Live Now</span>
               </div>
               {activeSlips.filter(s => s.status === 'live').map(slip => (
-                <SlipCard key={slip.id} slip={slip} onRefresh={(id) => refreshMutation.mutate(id)} isRefreshing={refreshMutation.isPending} onDelete={(id) => deleteMutation.mutate(id)} isDeleting={deleteMutation.isPending && deleteMutation.variables === slip.id}/>
+                <SlipCard key={slip.id} slip={slip} onRefresh={(id) => refreshMutation.mutate(id)} isRefreshing={refreshMutation.isPending} onDelete={(id) => deleteMutation.mutate(id)} isDeleting={deleteMutation.isPending && deleteMutation.variables === slip.id} onMarkDnp={(legId) => dnpLegMutation.mutate(legId)}/>
               ))}
             </>
           )}
@@ -338,7 +358,7 @@ export default function SlipPage() {
             <>
               <div className="section-title">Pending</div>
               {activeSlips.filter(s => s.status === 'pending').map(slip => (
-                <SlipCard key={slip.id} slip={slip} onRefresh={(id) => refreshMutation.mutate(id)} isRefreshing={refreshMutation.isPending} onDelete={(id) => deleteMutation.mutate(id)} isDeleting={deleteMutation.isPending && deleteMutation.variables === slip.id}/>
+                <SlipCard key={slip.id} slip={slip} onRefresh={(id) => refreshMutation.mutate(id)} isRefreshing={refreshMutation.isPending} onDelete={(id) => deleteMutation.mutate(id)} isDeleting={deleteMutation.isPending && deleteMutation.variables === slip.id} onMarkDnp={(legId) => dnpLegMutation.mutate(legId)}/>
               ))}
             </>
           )}
