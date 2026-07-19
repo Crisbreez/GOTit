@@ -352,7 +352,11 @@ async function getPlayerStatFromGame(
 
       const val = resolveStatValue(statType, batting, pitching);
       if (val !== null) {
-        const resolvedStatus = gameStatus === 'In Progress' ? 'live' : 'final';
+        // Only treat as final when the MLB API explicitly says the game is over.
+        // Anything else (Warmup, Pre-Game, Delayed, Suspended, etc.) stays live
+        // so we never prematurely settle a leg mid-game.
+        const FINAL_STATES = new Set(['Final', 'Game Over', 'Completed Early']);
+        const resolvedStatus: 'live' | 'final' = FINAL_STATES.has(gameStatus) ? 'final' : 'live';
         return { playerName, statType, actualValue: val, gameStatus: resolvedStatus, gamePk };
       }
     }
