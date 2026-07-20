@@ -785,17 +785,35 @@ def qualify_demons(
         # Re-sort after penalty
         scored.sort(key=lambda t: t[0].composite, reverse=True)
 
-    # Log demon scoring for debugging
-    log.info("[demon] qualified %d/%d PP demons", len(scored), len(demon_cands))
-    for ds, _ in scored[:4]:
+    # Hard-cap: top 2 distinct-player demons only. No substitutions.
+    # Walk the ranked list and pick the first 2 distinct players.
+    top2: List[tuple] = []
+    seen_players: set = set()
+    for ds, cand in scored:
+        if cand.player_id not in seen_players:
+            top2.append((ds, cand))
+            seen_players.add(cand.player_id)
+        if len(top2) == 2:
+            break
+
+    log.info("[demon] qualified %d/%d PP demons → top2=%d",
+             len(scored), len(demon_cands), len(top2))
+    for ds, _ in top2:
         log.info(
-            "[demon]  %s %s %.1f %s → p_win=%.3f L1=%.2f L2=%.2f L3=%.2f L4=%.2f composite=%.3f",
+            "[demon]  SELECTED %s %s %.1f %s → p_win=%.3f L1=%.2f L2=%.2f L3=%.2f L4=%.2f composite=%.3f",
             ds.player_name, ds.stat_type, ds.line, ds.direction.value,
             ds.p_win, ds.market_anchor, ds.dist_hit_rate,
             ds.game_script_fit, ds.role_certainty, ds.composite,
         )
+    # Log dropped demons so we can audit why they were cut
+    dropped = [(ds, c) for ds, c in scored if c not in [cand for _, cand in top2]]
+    for ds, _ in dropped[:4]:
+        log.info(
+            "[demon]  DROPPED  %s %s %.1f → composite=%.3f",
+            ds.player_name, ds.stat_type, ds.line, ds.composite,
+        )
 
-    return [cand for _, cand in scored]
+    return [cand for _, cand in top2]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -973,25 +991,32 @@ def solve_game_milp(
     # ── Exactly 6 legs ────────────────────────────────────────────────────────
     solver.Add(solver.Sum(list(x.values())) == 6)
 
-    # ── Exactly 2 Demon legs ──────────────────────────────────────────────────
+    # ── Demon legs: AT MOST 2, gate survivors only, no substitutions ──────────
+    # Rule: PP is the only authority on demon identity. GOTit applies 4 gates
+    # (line floor, sharp sanity, hit-rate floor, role/script quality) and ranks
+    # survivors. Top 2 distinct-player demons enter. If fewer than 2 survive,
+    # we use fewer than 2. NEVER force a bad demon to fill the second slot.
     demon_vars = [x[lg.prop_id] for lg in candidates if lg.tier == Tier.DEMON]
-    if len(demon_vars) < 2:
-        return None
-    solver.Add(solver.Sum(demon_vars) == 2)
+    n_qual = len(demon_vars)
 
-    # ── 2 distinct Demon players ───────────────────────────────────────────────
-    demon_player_vars: Dict[str, List] = {}
-    for lg in candidates:
-        if lg.tier == Tier.DEMON:
-            demon_player_vars.setdefault(lg.player_id, []).append(x[lg.prop_id])
-
-    y_demon: Dict[str, pywraplp.Variable] = {}
-    for pid, vars_ in demon_player_vars.items():
-        y = solver.BoolVar(f"y_demon_{pid}")
-        solver.Add(solver.Sum(vars_) >= y)
-        solver.Add(solver.Sum(vars_) <= 2 * y)
-        y_demon[pid] = y
-    solver.Add(solver.Sum(list(y_demon.values())) == 2)
+    if n_qual == 0:
+        pass  # No demons survived gates — slip has 0 demons, that is correct
+    elif n_qual == 1:
+        solver.Add(solver.Sum(demon_vars) == 1)  # lock the one survivor in
+    else:
+        # 2+ survived — pick exactly 2 distinct players
+        solver.Add(solver.Sum(demon_vars) == 2)
+        demon_player_vars: Dict[str, List] = {}
+        for lg in candidates:
+            if lg.tier == Tier.DEMON:
+                demon_player_vars.setdefault(lg.player_id, []).append(x[lg.prop_id])
+        y_demon: Dict[str, pywraplp.Variable] = {}
+        for pid, vars_ in demon_player_vars.items():
+            y = solver.BoolVar(f"y_demon_{pid}")
+            solver.Add(solver.Sum(vars_) >= y)
+            solver.Add(solver.Sum(vars_) <= 2 * y)
+            y_demon[pid] = y
+        solver.Add(solver.Sum(list(y_demon.values())) == 2)
 
     # ── ≤ 3 legs per player ───────────────────────────────────────────────────
     player_vars: Dict[str, List] = {}
