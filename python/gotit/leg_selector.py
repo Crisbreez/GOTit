@@ -551,25 +551,29 @@ _DEMON_LINE_FLOOR: dict = {
 # Prevents near-certain "lottery" props (e.g. TB 0.5) from clogging the slate.
 # Rule: standard legs with line < floor are dropped before scoring.
 _STANDARD_LINE_FLOOR: dict = {
-    # MLB hitting — anything at 0.5 is a near-certain hit (player just needs
-    # one hit/base/contact event), so we require at least 1.5 to be meaningful.
+    # MLB hitting — 0.5 lines are near-certain for any player who starts.
+    # Require meaningful lines only.
     "Total Bases":         1.5,
     "Hits":                1.5,
     "Hits+Runs+RBIs":      1.5,
-    "RBIs":                0.5,   # RBI 0.5 OK — at least 1 RBI is not trivial
-    "Runs":                0.5,
-    "Home Runs":           0.5,
-    "Stolen Bases":        0.5,
     "Singles":             1.5,
-    "Doubles":             0.5,
-    "Triples":             0.5,
+    "RBIs":                1.5,
+    "Runs":                1.5,
+    "Walks":               1.5,
+    "Hitter Strikeouts":   1.5,
+    "Home Runs":           0.51,  # block 0.5 HR lines — need a real HR line
+    "Stolen Bases":        0.51,  # block 0.5 SB lines
+    "Doubles":             0.51,  # block 0.5 doubles lines
+    "Triples":             0.51,
     # MLB pitching
     "Pitcher Strikeouts":  2.5,
     "Innings Pitched":     4.5,
-    # MMA — 0.5 submission attempts / knockdowns are near-certain; require at least 1.5
+    "Hits Allowed":        2.5,
+    "Earned Runs Allowed": 0.5,
+    # MMA
     "Significant Strikes": 15.0,
     "Takedowns":           0.5,
-    "_default":            0.5,   # conservative default — only block sub-0.5 lines
+    "_default":            0.5,
 }
 
 # Game-script fit table: stat types that benefit from high-pace / high-volume games.
@@ -1117,7 +1121,27 @@ def select_legs_for_slate(
             if tier == Tier.STANDARD:
                 std_floor = _STANDARD_LINE_FLOOR.get(pp.stat_type, _STANDARD_LINE_FLOOR["_default"])
                 if line < std_floor:
-                    log.debug(f"Gate 0 (std floor): {pp.player_name} {pp.stat_type} line={line} < floor={std_floor}")
+                    log.debug("Gate 0 (std floor): %s %s line=%.1f < floor=%.1f",
+                              pp.player_name, pp.stat_type, line, std_floor)
+                    continue
+
+            # Player-level junk filter — if EVERY standard prop this player has
+            # across all stat types is below floor, the player has no meaningful
+            # line on the board and should not appear in the slate at all.
+            # (Checks all props for this player in the same game batch, not just current.)
+            if tier == Tier.STANDARD:
+                all_player_props = [
+                    p for p in props
+                    if p.player_id == pp.player_id
+                    and not p.is_demon and not p.is_goblin
+                ]
+                has_meaningful = any(
+                    p.line_score >= _STANDARD_LINE_FLOOR.get(p.stat_type, _STANDARD_LINE_FLOOR["_default"])
+                    for p in all_player_props
+                )
+                if not has_meaningful:
+                    log.info("Player junk filter: %s has no prop above floor — skipping",
+                             pp.player_name)
                     continue
 
             best_cand: Optional[LegCandidate] = None
