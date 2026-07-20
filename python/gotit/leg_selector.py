@@ -712,9 +712,12 @@ def score_demon(
     # ── L5: Pair diversity (applied at pairing stage; default 1.0 = no penalty)
     l5 = float(np.clip(1.0 - same_failure_penalty, 0.0, 1.0))
 
-    # ── Composite: L1=0.34  L2=0.28  L3=0.18  L4=0.12  L5=0.08 ─────────────
+    # ── DemonWinScore: 0.40*L1 + 0.30*L2 + 0.15*L3 + 0.10*L4 + 0.05*L5 ────
+    # Weights front-load market anchor (L1) and distribution hit rate (L2).
+    # A demon that passes all 4 gates AND has sharp market + CDF agreement
+    # is a genuine ceiling play. L3/L4/L5 differentiate within that set.
     composite = float(np.clip(
-        0.34 * l1 + 0.28 * l2 + 0.18 * l3 + 0.12 * l4 + 0.08 * l5,
+        0.40 * l1 + 0.30 * l2 + 0.15 * l3 + 0.10 * l4 + 0.05 * l5,
         0.0, 1.0,
     ))
 
@@ -821,8 +824,93 @@ def qualify_demons(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 10. PER-GAME MILP (OR-Tools SCIP)
+# 10. WIN SCORE — STANDARD LEGS
 # ──────────────────────────────────────────────────────────────────────────────
+# WinScoreStandard: a must-win score for a single standard leg.
+# Unlike Shapley EV (which optimizes portfolio payout), this score answers:
+# "How confident are we that this specific side of this line wins?"
+#
+# Formula:
+#   WinScore = 0.40 * W1 + 0.30 * W2 + 0.20 * W3 + 0.10 * W4
+#
+#   W1 = clamp((p_win - H*) / (1 - H*))          — how far above must-win floor
+#   W2 = clamp(0.5 + anchor_delta / 1.0)         — sharp market agreement
+#   W3 = clamp((p_win - 0.57) / 0.20)            — distribution conviction
+#   W4 = clamp(1 - dnp_prob / 0.15)              — role certainty
+#
+# H* = STANDARD_PWIN_FLOOR = 0.57  (must-win admission floor)
+# Only legs that clear H* reach this scorer.
+
+STANDARD_PWIN_FLOOR = 0.57   # must-win admission floor for standard legs
+
+@dataclass
+class WinScoreStandard:
+    prop_id:         str
+    player_name:     str
+    stat_type:       str
+    line:            float
+    direction:       Direction
+    p_win:           float
+    w1_pwin_margin:  float   # how far above must-win floor
+    w2_market_agree: float   # sharp market agreement
+    w3_dist_conv:    float   # distribution conviction
+    w4_role:         float   # role certainty
+    win_score:       float   # final 0-1 score
+
+
+def score_standard_leg(
+    cand:      "LegCandidate",
+    sc:        "SharpConsensus",
+    dnp_prob:  float,
+) -> WinScoreStandard:
+    """
+    Score a standard leg for must-win probability.
+    Caller guarantees cand.p_win >= STANDARD_PWIN_FLOOR already.
+    """
+    pp_line   = cand.line
+    p_win     = cand.p_win
+    direction = cand.direction
+    is_real   = sc.freshness_sec < 9000.0
+
+    # anchor_delta: positive = market agrees this side has value
+    if direction == Direction.OVER:
+        anchor_delta = sc.median - pp_line   # positive = line is below fair → OVER has edge
+    else:
+        anchor_delta = pp_line - sc.median   # positive = line is above fair → UNDER has edge
+
+    # W1: p_win margin above must-win floor
+    h_star = STANDARD_PWIN_FLOOR
+    w1 = float(np.clip((p_win - h_star) / max(1 - h_star, 0.01), 0.0, 1.0))
+
+    # W2: market agreement
+    w2 = float(np.clip(0.5 + anchor_delta / 1.0, 0.0, 1.0)) if is_real else 0.40
+
+    # W3: distribution conviction (above 0.57 floor)
+    w3 = float(np.clip((p_win - 0.57) / 0.20, 0.0, 1.0))
+
+    # W4: role certainty
+    w4 = float(np.clip(1.0 - dnp_prob / 0.15, 0.0, 1.0))
+
+    win_score = float(np.clip(
+        0.40 * w1 + 0.30 * w2 + 0.20 * w3 + 0.10 * w4,
+        0.0, 1.0,
+    ))
+
+    return WinScoreStandard(
+        prop_id=cand.prop_id,
+        player_name=cand.player_name,
+        stat_type=cand.stat_type,
+        line=pp_line,
+        direction=direction,
+        p_win=p_win,
+        w1_pwin_margin=round(w1, 4),
+        w2_market_agree=round(w2, 4),
+        w3_dist_conv=round(w3, 4),
+        w4_role=round(w4, 4),
+        win_score=round(win_score, 4),
+    )
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 11. UNDER SCORING ENGINE
 # ──────────────────────────────────────────────────────────────────────────────
@@ -956,22 +1044,41 @@ def score_under(
     )
 
 
+# ── Slip-level must-win floor ─────────────────────────────────────────────────
+# A slip is only shown if its geometric hit probability clears this floor.
+# 6 legs at p_win=0.62 each → 0.62^6 ≈ 0.0566 — too low to show.
+# This floor filters boards where even the "best" 6 legs are too weak.
+SLIP_HIT_PROB_FLOOR = 0.04   # 6 legs at 0.64 each ≈ 0.075; floor is conservative
+
 def solve_game_milp(
     candidates: List[LegCandidate],
-    ev_map:     Dict[str, float],
+    win_score_map: Dict[str, float],   # WinScoreStandard.win_score or DemonWinScore composite
     r_star_6:   float,
     time_limit_sec: float = 5.0,
 ) -> Optional[List[LegCandidate]]:
     """
-    Maximize Σ EV*_L * x_L
-    Subject to:
+    Must-Win Slip Optimizer.
+
+    Primary objective: maximize slip hit probability (product of p_wins).
+    In log-space: maximize Σ log(p_win) * x_L  — this is linear and exact.
+
+    Secondary objective embedded in win_score_map: among legs with similar
+    log(p_win), prefer those with higher WinScore (market agreement, distribution
+    conviction, role certainty).
+
+    Combined objective coefficient per leg:
+        obj_L = log(p_win_L) + 0.10 * win_score_L
+
+    The 0.10 weight keeps payout/quality as a tiebreaker without overriding
+    the hit-probability primary objective.
+
+    Constraints:
       Σ x_L = 6
-      Exactly 2 Demon legs
-      Demon legs come from exactly 2 distinct players
+      Standard legs: p_win ≥ STANDARD_PWIN_FLOOR (0.57)
+      Demon legs: at most 2, gate survivors only, distinct players, no subs
       ≤ 3 legs per player
-      ≤ 4 OVER, ≤ 4 UNDER
       ≥ 2 distinct stat categories
-      p_win ≥ r*_6 - 0.01 for all selected legs
+      No-slip: returned None if slip_hit_prob < SLIP_HIT_PROB_FLOOR
     """
     if len(candidates) < 6:
         return None
@@ -987,9 +1094,17 @@ def solve_game_milp(
         lg.prop_id: solver.BoolVar(f"x_{lg.prop_id}") for lg in candidates
     }
 
-    # Objective
+    # ── Must-Win Objective ────────────────────────────────────────────────────
+    # Primary: maximize Σ log(p_win) * x   [maximizes product of p_wins]
+    # Tiebreaker: + 0.10 * win_score       [market/distribution conviction]
+    obj_coeffs = []
+    for lg in candidates:
+        log_pwin = math.log(max(lg.p_win, 0.001))
+        ws = win_score_map.get(lg.prop_id, 0.0)
+        obj_coeffs.append((lg.prop_id, log_pwin + 0.10 * ws))
+
     solver.Maximize(
-        solver.Sum([ev_map.get(pid, 0.0) * var for pid, var in x.items()])
+        solver.Sum([coeff * x[pid] for pid, coeff in obj_coeffs])
     )
 
     # ── Exactly 6 legs ────────────────────────────────────────────────────────
@@ -1052,10 +1167,18 @@ def solve_game_milp(
         z_stat[stat] = z
     solver.Add(solver.Sum(list(z_stat.values())) >= 2)
 
-    # ── Win prob floor ─────────────────────────────────────────────────────────
+    # ── Per-leg admission floors ──────────────────────────────────────────────
+    # Standard legs: must clear the must-win floor (0.57).
+    # Demon legs already passed qualify_demons 4-gate chain; use demon floor (0.53).
+    # Goblin legs: treated as lower-tier standards — use r_star_6 floor.
     for lg in candidates:
-        if lg.p_win < r_star_6 - 0.01:
-            solver.Add(x[lg.prop_id] == 0)
+        if lg.tier == Tier.STANDARD:
+            if lg.p_win < STANDARD_PWIN_FLOOR:
+                solver.Add(x[lg.prop_id] == 0)
+        elif lg.tier == Tier.GOBLIN:
+            if lg.p_win < r_star_6:
+                solver.Add(x[lg.prop_id] == 0)
+        # DEMON: qualify_demons already gated them; trust that gate
 
     # ── Solve ─────────────────────────────────────────────────────────────────
     status = solver.Solve()
@@ -1063,7 +1186,27 @@ def solve_game_milp(
         return None
 
     selected = [lg_map[pid] for pid, var in x.items() if var.solution_value() > 0.5]
-    return selected if len(selected) == 6 else None
+    if len(selected) != 6:
+        return None
+
+    # ── No-slip check: reject if geometric hit probability is below floor ──────
+    # If the "best" 6 legs the optimizer found still combine to a slip hit
+    # probability below SLIP_HIT_PROB_FLOOR, the board is too weak. Show nothing.
+    slip_hit_prob = 1.0
+    for lg in selected:
+        slip_hit_prob *= lg.p_win
+    if slip_hit_prob < SLIP_HIT_PROB_FLOOR:
+        log.info(
+            "No-slip: slip_hit_prob=%.4f < floor=%.4f — board too weak",
+            slip_hit_prob, SLIP_HIT_PROB_FLOOR,
+        )
+        return None
+
+    log.info("Slip selected: hit_prob=%.4f legs=%s",
+             slip_hit_prob,
+             [(lg.player_name, lg.stat_type, lg.direction.value, round(lg.p_win,3))
+              for lg in selected])
+    return selected
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1207,25 +1350,25 @@ def select_legs_for_slate(
                              key=lambda c: c.p_win, reverse=True)
 
         # ── Demon qualification: PP flags it, GOTit scores and filters it ────
-        # qualify_demons runs the 5-layer score, drops demons that fail hard
-        # gates (p_win floor + SGO edge cutoff), ranks survivors by composite.
-        # Returns 0, 1, or ≥2 qualified candidates — MILP needs ≥2 from 2 distinct players.
         qualified_d = qualify_demons(
             demon_cands=raw_d_cands,
             sc_map=sharp_consensus,
             dnp_model=dnp_model,
         )
+        # Note: MILP handles 0/1/2 demon case — no skip here.
+        # Games with 0 qualifying demons produce a standard-only slip (no demon slots).
 
-        # If fewer than 2 distinct demon players qualify, skip this game
-        seen_demon_players = set(dc.player_id for dc in qualified_d)
-        if len(seen_demon_players) < 2:
-            log.info("[demon] game %s: only %d distinct demon players qualified — skipping",
-                     game_id, len(seen_demon_players))
-            continue
+        # ── Standard admission floor: drop before Shapley ─────────────────────
+        # Standards that can't clear STANDARD_PWIN_FLOOR have no path to selection;
+        # excluding them keeps Shapley fast and clean.
+        s_cands_admitted = [
+            c for c in s_cands
+            if c.tier == Tier.GOBLIN or c.p_win >= STANDARD_PWIN_FLOOR
+        ]
 
         # Cap demon slots at 6 (enough for MILP to pick 2, with diversity)
         demon_slots = qualified_d[:6]
-        standard_slots = s_cands[:MAX_SHAPLEY - len(demon_slots)]
+        standard_slots = s_cands_admitted[:MAX_SHAPLEY - len(demon_slots)]
         filtered.extend(demon_slots + standard_slots)
 
     all_candidates = filtered
@@ -1241,35 +1384,56 @@ def select_legs_for_slate(
     output: Dict[str, Dict] = {}
     r_star_6 = BREAKEVEN_R[6]
     shapley_all:  Dict[str, float] = {}
-    corr_adj_all: Dict[str, float] = {}
+    # corr_adj_all removed — MILP now uses WinScoreStandard, not Shapley corr-adj EV
 
     for game_id in set(c.game_id for c in all_candidates):
         game_cands = [c for c in all_candidates if c.game_id == game_id]
         if len(game_cands) < 6:
             continue
 
-        # Shapley per-game
+        # ── Build WinScore map for MILP objective ────────────────────────────
+        # Standards + goblins: WinScoreStandard.win_score
+        # Demons: DemonWinScore composite (from qualify_demons scoring)
+        win_score_map: Dict[str, float] = {}
+        game_demons_scored = {
+            lg.prop_id: lg for lg in game_cands if lg.tier == Tier.DEMON
+        }
+        for c in game_cands:
+            dnp_p = dnp_model.get(c.player_id, dnp_model.get(c.prop_id, 0.0))
+            if c.tier == Tier.DEMON:
+                sc_d = sharp_consensus.get(c.prop_id)
+                if sc_d:
+                    ds = score_demon(c, sc_d, dnp_p, game_total=0.0)
+                    win_score_map[c.prop_id] = ds.composite
+                else:
+                    win_score_map[c.prop_id] = 0.0
+            else:
+                sc_s = sharp_consensus.get(c.prop_id)
+                if sc_s:
+                    ws = score_standard_leg(c, sc_s, dnp_p)
+                    win_score_map[c.prop_id] = ws.win_score
+                    c.ev_corr_adj = ws.win_score  # store for leg_to_dict output
+                else:
+                    win_score_map[c.prop_id] = 0.0
+
+        # Keep Shapley for EV metadata in output (not used in objective)
         shapley = shapley_marginal_ev(game_cands, BREAKEVEN_R)
         for c in game_cands:
-            c.ev_marginal = shapley[c.prop_id]
+            c.ev_marginal = shapley.get(c.prop_id, 0.0)
         shapley_all.update(shapley)
 
-        # Corr-adj EV per-game
-        corr_adj = corr_adjusted_ev(game_cands, shapley, rho_map)
-        for c in game_cands:
-            c.ev_corr_adj = corr_adj[c.prop_id]
-        corr_adj_all.update(corr_adj)
-
-        selected = solve_game_milp(game_cands, corr_adj, r_star_6)
+        selected = solve_game_milp(game_cands, win_score_map, r_star_6)
         if not selected:
-            log.debug("Game %s: MILP infeasible", game_id)
+            log.info("Game %s: no qualifying slip (MILP infeasible or board too weak)", game_id)
             continue
 
-        demons  = [lg for lg in selected if lg.tier == Tier.DEMON]
-        if len(demons) != 2:
-            continue
+        demons = [lg for lg in selected if lg.tier == Tier.DEMON]
+        # Demons may be 0 or 1 on weak boards — that is correct; no forced fill
 
-        port_ev = sum(corr_adj.get(lg.prop_id, 0.0) for lg in selected)
+        port_ev = sum(win_score_map.get(lg.prop_id, 0.0) for lg in selected)
+        slip_hit_prob = 1.0
+        for lg in selected:
+            slip_hit_prob *= lg.p_win
 
         def leg_to_dict(lg: LegCandidate) -> Dict:
             d = {
@@ -1315,7 +1479,8 @@ def select_legs_for_slate(
             "two_demons": [leg_to_dict(lg) for lg in demons],
             "meta": {
                 "slate_breakeven_r6":    round(r_star_6, 4),
-                "portfolio_ev_per_$1":   round(port_ev / 6, 6),
+                "portfolio_win_score":    round(port_ev / 6, 6),
+                "slip_hit_prob":         round(slip_hit_prob, 6),
                 "calibration_version":   calibration.version,
                 "calibration_hash":      calibration.sha256[:16],
             },
