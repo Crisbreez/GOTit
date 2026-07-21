@@ -93,6 +93,7 @@ export interface IStorage {
   createLegs(legs: InsertLeg[]): Promise<void>;
   getLegsBySlip(slipId: number): Promise<SlipLeg[]>;
   updateLegStatus(id: number, status: string, actualValue?: number): Promise<void>;
+  reconcileLeg(id: number, status: string, actualValue: number | null, lastCheckedAt: string, trackingError: boolean): Promise<void>;
   logPull(league: string, count: number, status?: string): Promise<void>;
   getLastPull(league: string): Promise<any>;
 }
@@ -336,6 +337,13 @@ export const storage: IStorage = {
     if (actualValue != null) updates.actual_value = actualValue;
     const { error } = await db.from('slip_legs').eq('id', id).update(updates);
     if (error) throw new Error(`[storage] updateLegStatus failed: ${error}`);
+  },
+
+  async reconcileLeg(id, status, actualValue, lastCheckedAt, trackingError) {
+    const updates: any = { status, last_checked_at: lastCheckedAt, tracking_error: trackingError };
+    if (actualValue != null) updates.actual_value = actualValue;
+    const { error } = await db.from('slip_legs').eq('id', id).update(updates);
+    if (error) throw new Error(`[storage] reconcileLeg failed: ${error}`);
   },
 
   // ── Pull log ───────────────────────────────────────────────────────────────

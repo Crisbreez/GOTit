@@ -1,183 +1,183 @@
 /**
- * GOTit Slip Tracker
+ * GOTit Slip Tracker — reconcile_leg pattern
  *
- * Runs on a 90-second interval and:
- *  1. Promotes pending slips → live when game start time has passed
- *  2. Fetches real MLB stats for each live leg and updates actualValue + hit/miss
- *  3. Settles live slips → settled_win / settled_loss when all legs are resolved
+ * Every 90 seconds:
+ *  1. Promotes pending slips → live when earliest leg game starts
+ *  2. For each non-void leg, fetches the official feed stat
+ *  3. Derives expected_status + expected_actual from the feed
+ *  4. Writes an audit row (console log) comparing displayed vs expected
+ *  5. Overwrites the leg if there is any mismatch (status OR actual)
+ *  6. Settles slip when all active legs are resolved
  *
- * Only runs for MLB right now. NBA/NFL/MMA stay pending until real tracking added.
- *
- * Game narrowing fix: each leg now stores its own game_matchup column.
- * The tracker passes leg.gameMatchup to getPlayerStat so the correct game is
- * identified even when multiple games are active simultaneously.
+ * reconcile_leg is the single source of truth — nothing settles
+ * a leg except reconcile_leg seeing gameStatus='final' from the feed.
  */
 
 import { storage } from './storage';
-import { getPlayerStat } from './mlbTracker';
+import { getPlayerStat, PlayerGameStat } from './mlbTracker';
 import { getMMAFighterStat } from './mmaTracker';
 
 const TRACK_INTERVAL_MS = 90_000; // 90 seconds
 
-// ── Settle a single MMA leg against ESPN data ───────────────────────────────
-async function trackMMALeg(leg: any): Promise<void> {
-  if (leg.status === 'dnp') return;
-  const alreadySettled = leg.status === 'hit' || leg.status === 'miss';
-
-  console.log(`[SlipTracker] MMA Leg ${leg.id}: fighter="${leg.playerName}" stat="${leg.statType}" line=${leg.lineScore} dir=${leg.direction} currentStatus=${leg.status}`);
-
-  const result = await getMMAFighterStat(
-    leg.playerName,
-    leg.statType,
-    leg.gameMatchup ?? undefined,
-  );
-
-  if (!result) {
-    console.log(`[SlipTracker] MMA Leg ${leg.id}: no result yet`);
-    return;
-  }
-
-  const actual = result.actualValue;
-  const line   = leg.lineScore;
-  const dir    = (leg.direction ?? 'over').toLowerCase();
-
-  console.log(`[SlipTracker] MMA Leg ${leg.id}: actual=${actual} vs line=${line} (${dir}) status=${result.gameStatus}`);
-
-  if (result.gameStatus === 'live') {
-    if (alreadySettled) {
-      console.log(`[SlipTracker] MMA Leg ${leg.id}: was ${leg.status} but fight still live — reverting to live, actual=${actual}`);
-    }
-    await storage.updateLegStatus(leg.id, 'live', actual);
-    return;
-  }
-
-  // Fight is final — settle definitively
-  const hit = dir === 'over' ? actual > line : actual < line;
-  await storage.updateLegStatus(leg.id, hit ? 'hit' : 'miss', actual);
-  console.log(`[SlipTracker] MMA Leg ${leg.id}: SETTLED → ${hit ? 'HIT' : 'MISS'} (actual=${actual} ${dir} ${line})`);
+// ─────────────────────────────────────────────────────────────────────────────
+// 1. derive_expected_status
+//    Maps (feed game status, actual value, line, direction) → leg status string
+// ─────────────────────────────────────────────────────────────────────────────
+function deriveExpectedStatus(
+  sourceGameStatus: 'live' | 'final',
+  sourceActual: number | null,
+  lineScore: number,
+  direction: string,
+): string {
+  if (sourceGameStatus === 'live') return 'live';
+  // Game is final — settle
+  if (sourceActual === null) return 'live'; // no data yet, stay live
+  const dir = (direction ?? 'over').toLowerCase();
+  const hit = dir === 'over' ? sourceActual > lineScore : sourceActual < lineScore;
+  return hit ? 'hit' : 'miss';
 }
 
-// ── Settle a single MLB leg against real data ─────────────────────────────────
-async function trackMLBLeg(leg: any): Promise<void> {
-  // DNP legs are permanently voided — never re-check
-  if (leg.status === 'dnp') return;
-  // hit/miss legs are ONLY skipped if the game is confirmed final.
-  // If they were settled prematurely (game was still live), we re-check
-  // and correct the actual value. We detect this by letting the stat
-  // fetch run — if it returns gameStatus='live' we revert to live.
-  // If gameStatus='final', the settled value stays.
-  const alreadySettled = leg.status === 'hit' || leg.status === 'miss';
+// ─────────────────────────────────────────────────────────────────────────────
+// 2. classify_mismatch
+// ─────────────────────────────────────────────────────────────────────────────
+function classifyMismatch(
+  leg: any,
+  expectedStatus: string,
+  expectedActual: number | null,
+): string {
+  const statMismatch   = leg.actualValue !== expectedActual;
+  const statusMismatch = leg.status      !== expectedStatus;
+  if (statMismatch && statusMismatch) return 'status_and_actual';
+  if (statusMismatch)                 return 'status_only';
+  if (statMismatch)                   return 'actual_only';
+  return 'none';
+}
 
-  console.log(`[SlipTracker] Leg ${leg.id}: player="${leg.playerName}" stat="${leg.statType}" line=${leg.lineScore} dir=${leg.direction} matchup="${leg.gameMatchup || 'unknown'}" currentStatus=${leg.status}`);
+// ─────────────────────────────────────────────────────────────────────────────
+// 3. reconcile_leg — the single settlement function
+// ─────────────────────────────────────────────────────────────────────────────
+async function reconcileLeg(leg: any, league: 'MLB' | 'MMA'): Promise<void> {
+  // void / dnp legs are permanently settled — never touch them
+  if (leg.status === 'dnp' || leg.status === 'void') return;
 
-  const result = await getPlayerStat(
-    leg.playerName,
-    leg.statType,
-    leg.gameMatchup ?? undefined,
-  );
-
-  if (!result) {
-    console.log(`[SlipTracker] Leg ${leg.id}: no result yet (game not started or boxscore not ready)`);
-    return;
-  }
-
-  const actual = result.actualValue;
-  const line = leg.lineScore;
-  const dir = (leg.direction ?? 'over').toLowerCase();
-
-  console.log(`[SlipTracker] Leg ${leg.id}: actual=${actual} vs line=${line} (${dir}) — gameStatus=${result.gameStatus}`);
-
-  if (result.gameStatus === 'live') {
-    // Game still in progress — always update actual value and revert to 'live'
-    // even if a previous cycle prematurely settled this leg
-    if (alreadySettled) {
-      console.log(`[SlipTracker] Leg ${leg.id}: was ${leg.status} but game is still live — reverting to live, actual=${actual}`);
+  // ── Fetch official feed ───────────────────────────────────────────────────
+  let feedResult: PlayerGameStat | null = null;
+  try {
+    if (league === 'MMA') {
+      feedResult = await getMMAFighterStat(leg.playerName, leg.statType, leg.gameMatchup ?? undefined);
     } else {
-      console.log(`[SlipTracker] Leg ${leg.id}: status=live, actualValue=${actual}`);
+      feedResult = await getPlayerStat(leg.playerName, leg.statType, leg.gameMatchup ?? undefined);
     }
-    await storage.updateLegStatus(leg.id, 'live', actual);
+  } catch (e: any) {
+    console.warn(`[reconcile] Leg ${leg.id}: feed fetch error — ${e.message}`);
     return;
   }
 
-  // Game is final — settle definitively
-  const hit = dir === 'over' ? actual > line : actual < line;
-  await storage.updateLegStatus(leg.id, hit ? 'hit' : 'miss', actual);
-  console.log(`[SlipTracker] Leg ${leg.id}: SETTLED → ${hit ? 'HIT' : 'MISS'} (actual=${actual} ${dir} ${line})`);
+  if (!feedResult) {
+    // No data yet — game hasn't started or boxscore not ready
+    console.log(`[reconcile] Leg ${leg.id} ${leg.playerName} ${leg.statType}: no feed result yet`);
+    return;
+  }
+
+  const sourceGameStatus = feedResult.gameStatus;   // 'live' | 'final'
+  const sourceActual     = feedResult.actualValue;  // number
+
+  // ── Derive what the leg SHOULD look like ─────────────────────────────────
+  const expectedStatus = deriveExpectedStatus(
+    sourceGameStatus,
+    sourceActual,
+    leg.lineScore,
+    leg.direction ?? 'over',
+  );
+  const expectedActual = sourceActual;
+
+  // ── Audit comparison ──────────────────────────────────────────────────────
+  const isMatch = leg.status === expectedStatus && leg.actualValue === expectedActual;
+  const mismatchType = isMatch ? 'none' : classifyMismatch(leg, expectedStatus, expectedActual);
+
+  console.log(
+    `[reconcile] Leg ${leg.id} | ${leg.playerName} | ${leg.statType} | ` +
+    `feed=${sourceGameStatus} actual=${sourceActual} | ` +
+    `displayed: status=${leg.status} actual=${leg.actualValue} | ` +
+    `expected: status=${expectedStatus} actual=${expectedActual} | ` +
+    `match=${isMatch}${isMatch ? '' : ' mismatch=' + mismatchType} action=${isMatch ? 'none' : 'overwrite'}`
+  );
+
+  // ── Write to DB ───────────────────────────────────────────────────────────
+  const now = new Date().toISOString();
+
+  if (!isMatch) {
+    // Overwrite leg with correct values + flag tracking_error
+    await (storage as any).reconcileLeg(leg.id, expectedStatus, expectedActual, now, true);
+  } else {
+    // Touch last_checked_at so we know it was verified this cycle
+    await (storage as any).reconcileLeg(leg.id, leg.status, leg.actualValue, now, false);
+  }
 }
 
-// ── Try to settle an entire slip ──────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// 4. trackSlip — drives reconcile_leg for every leg in a slip
+// ─────────────────────────────────────────────────────────────────────────────
 async function trackSlip(slip: any): Promise<void> {
   const legs = await storage.getLegsBySlip(slip.id);
   if (!legs.length) return;
 
-  console.log(`[SlipTracker] Slip ${slip.id} (${slip.league}): status=${slip.status} legs=${legs.length} matchup="${slip.gameMatchup}" start=${slip.gameStartTime}`);
+  console.log(`[SlipTracker] Slip ${slip.id} (${slip.league}): status=${slip.status} legs=${legs.length}`);
 
-  // Promote pending → live if ANY leg's game has started (supports cross-game slips)
+  // ── Promote pending → live when earliest game has started ────────────────
   if (slip.status === 'pending') {
     const now = Date.now();
-    const legs = await storage.getLegsBySlip(slip.id);
-    // For cross-game slips, use the earliest leg game start time
     const legStartTimes = legs
       .map(l => (l as any).gameStartTime ? new Date((l as any).gameStartTime).getTime() : null)
       .filter((t): t is number => t !== null);
     const slipStart = slip.gameStartTime ? new Date(slip.gameStartTime).getTime() : null;
-    const earliestStart = legStartTimes.length
-      ? Math.min(...legStartTimes)
-      : slipStart;
+    const earliestStart = legStartTimes.length ? Math.min(...legStartTimes) : slipStart;
     if (earliestStart && now >= earliestStart) {
-      console.log(`[SlipTracker] Slip ${slip.id}: promoting pending → live (earliest game started)`);
+      console.log(`[SlipTracker] Slip ${slip.id}: promoting pending → live`);
       await storage.updateSlipStatus(slip.id, 'live');
     } else {
-      const waitMs = earliestStart ? earliestStart - now : null;
-      console.log(`[SlipTracker] Slip ${slip.id}: still pending — game starts in ${waitMs ? Math.round(waitMs / 60000) + 'min' : 'unknown time'}`);
+      const waitMin = earliestStart ? Math.round((earliestStart - now) / 60000) : null;
+      console.log(`[SlipTracker] Slip ${slip.id}: still pending — starts in ${waitMin != null ? waitMin + 'min' : 'unknown'}`);
       return;
     }
   }
 
-  // Route each league to the correct tracker
+  // ── Only MLB and MMA have live tracking ──────────────────────────────────
   if (slip.league !== 'MLB' && slip.league !== 'MMA') {
-    console.log(`[SlipTracker] Slip ${slip.id}: skipping stat settlement (${slip.league} tracking not yet implemented)`);
+    console.log(`[SlipTracker] Slip ${slip.id}: ${slip.league} tracking not yet implemented`);
     return;
   }
 
-  // Track each unresolved leg
+  // ── Reconcile every non-void leg ─────────────────────────────────────────
   for (const leg of legs) {
-    if (leg.status !== 'hit' && leg.status !== 'miss' && leg.status !== 'dnp') {
-      if (slip.league === 'MMA') {
-        await trackMMALeg(leg);
-      } else {
-        await trackMLBLeg(leg);
-      }
-    }
+    await reconcileLeg(leg, slip.league as 'MLB' | 'MMA');
   }
 
-  // Re-fetch updated legs
-  const updatedLegs = await storage.getLegsBySlip(slip.id);
+  // ── Check for full settlement ─────────────────────────────────────────────
+  const updatedLegs  = await storage.getLegsBySlip(slip.id);
+  const activeLegs   = updatedLegs.filter(l => l.status !== 'dnp' && l.status !== 'void');
+  const resolvedLegs = activeLegs.filter(l => l.status === 'hit' || l.status === 'miss');
+  const dnpCount     = updatedLegs.length - activeLegs.length;
+  const allResolved  = resolvedLegs.length === activeLegs.length && activeLegs.length > 0;
 
-  // DNP legs are voided — exclude from win/loss calculation (PrizePicks behavior)
-  const activeLeg = updatedLegs.filter(l => l.status !== 'dnp');
-  const resolved = activeLeg.filter(l => l.status === 'hit' || l.status === 'miss');
-  const allResolved = resolved.length === activeLeg.length && activeLeg.length > 0;
-  const dnpCount = updatedLegs.length - activeLeg.length;
-
-  console.log(`[SlipTracker] Slip ${slip.id}: ${resolved.length}/${activeLeg.length} active legs resolved, ${dnpCount} DNP voided`);
+  console.log(`[SlipTracker] Slip ${slip.id}: ${resolvedLegs.length}/${activeLegs.length} resolved, ${dnpCount} voided`);
 
   if (allResolved) {
-    const allHit = activeLeg.every(l => l.status === 'hit');
+    const allHit = activeLegs.every(l => l.status === 'hit');
     await storage.updateSlipStatus(slip.id, allHit ? 'settled_win' : 'settled_loss', {
       settledAt: new Date().toISOString(),
     });
-    console.log(`[SlipTracker] Slip ${slip.id} SETTLED → ${allHit ? 'WIN 🌟' : 'LOSS'} (${dnpCount} leg(s) voided DNP)`);
+    console.log(`[SlipTracker] Slip ${slip.id} → ${allHit ? 'WIN 🌟' : 'LOSS'} (${dnpCount} voided)`);
   }
 }
 
-// ── Main tracking loop ────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. Main tracking loop
+// ─────────────────────────────────────────────────────────────────────────────
 export async function runTrackingCycle(): Promise<void> {
   const activeSlips = await storage.getSlips(['pending', 'live']);
   if (!activeSlips.length) return;
-
   console.log(`[SlipTracker] Tracking ${activeSlips.length} active slip(s)…`);
-
   for (const slip of activeSlips) {
     try {
       await trackSlip(slip);
@@ -187,24 +187,15 @@ export async function runTrackingCycle(): Promise<void> {
   }
 }
 
-// ── Kick off the interval ─────────────────────────────────────────────────────
 let trackingTimer: ReturnType<typeof setInterval> | null = null;
 
 export function startSlipTracker(): void {
-  if (trackingTimer) return; // already running
-  console.log(`[SlipTracker] Started — tracking every ${TRACK_INTERVAL_MS / 1000}s`);
-
-  // Run once immediately after a short delay (let server finish booting)
+  if (trackingTimer) return;
+  console.log(`[SlipTracker] Started — every ${TRACK_INTERVAL_MS / 1000}s`);
   setTimeout(() => runTrackingCycle().catch(() => {}), 5000);
-
-  trackingTimer = setInterval(() => {
-    runTrackingCycle().catch(() => {});
-  }, TRACK_INTERVAL_MS);
+  trackingTimer = setInterval(() => { runTrackingCycle().catch(() => {}); }, TRACK_INTERVAL_MS);
 }
 
 export function stopSlipTracker(): void {
-  if (trackingTimer) {
-    clearInterval(trackingTimer);
-    trackingTimer = null;
-  }
+  if (trackingTimer) { clearInterval(trackingTimer); trackingTimer = null; }
 }
