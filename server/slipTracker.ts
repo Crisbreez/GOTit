@@ -21,9 +21,10 @@ const TRACK_INTERVAL_MS = 90_000; // 90 seconds
 
 // ── Settle a single MMA leg against ESPN data ───────────────────────────────
 async function trackMMALeg(leg: any): Promise<void> {
-  if (leg.status === 'hit' || leg.status === 'miss' || leg.status === 'dnp') return;
+  if (leg.status === 'dnp') return;
+  const alreadySettled = leg.status === 'hit' || leg.status === 'miss';
 
-  console.log(`[SlipTracker] MMA Leg ${leg.id}: fighter="${leg.playerName}" stat="${leg.statType}" line=${leg.lineScore} dir=${leg.direction}`);
+  console.log(`[SlipTracker] MMA Leg ${leg.id}: fighter="${leg.playerName}" stat="${leg.statType}" line=${leg.lineScore} dir=${leg.direction} currentStatus=${leg.status}`);
 
   const result = await getMMAFighterStat(
     leg.playerName,
@@ -43,11 +44,14 @@ async function trackMMALeg(leg: any): Promise<void> {
   console.log(`[SlipTracker] MMA Leg ${leg.id}: actual=${actual} vs line=${line} (${dir}) status=${result.gameStatus}`);
 
   if (result.gameStatus === 'live') {
+    if (alreadySettled) {
+      console.log(`[SlipTracker] MMA Leg ${leg.id}: was ${leg.status} but fight still live — reverting to live, actual=${actual}`);
+    }
     await storage.updateLegStatus(leg.id, 'live', actual);
     return;
   }
 
-  // Fight is final — settle
+  // Fight is final — settle definitively
   const hit = dir === 'over' ? actual > line : actual < line;
   await storage.updateLegStatus(leg.id, hit ? 'hit' : 'miss', actual);
   console.log(`[SlipTracker] MMA Leg ${leg.id}: SETTLED → ${hit ? 'HIT' : 'MISS'} (actual=${actual} ${dir} ${line})`);
@@ -55,9 +59,16 @@ async function trackMMALeg(leg: any): Promise<void> {
 
 // ── Settle a single MLB leg against real data ─────────────────────────────────
 async function trackMLBLeg(leg: any): Promise<void> {
-  if (leg.status === 'hit' || leg.status === 'miss' || leg.status === 'dnp') return;
+  // DNP legs are permanently voided — never re-check
+  if (leg.status === 'dnp') return;
+  // hit/miss legs are ONLY skipped if the game is confirmed final.
+  // If they were settled prematurely (game was still live), we re-check
+  // and correct the actual value. We detect this by letting the stat
+  // fetch run — if it returns gameStatus='live' we revert to live.
+  // If gameStatus='final', the settled value stays.
+  const alreadySettled = leg.status === 'hit' || leg.status === 'miss';
 
-  console.log(`[SlipTracker] Leg ${leg.id}: player="${leg.playerName}" stat="${leg.statType}" line=${leg.lineScore} dir=${leg.direction} matchup="${leg.gameMatchup || 'unknown'}"`);
+  console.log(`[SlipTracker] Leg ${leg.id}: player="${leg.playerName}" stat="${leg.statType}" line=${leg.lineScore} dir=${leg.direction} matchup="${leg.gameMatchup || 'unknown'}" currentStatus=${leg.status}`);
 
   const result = await getPlayerStat(
     leg.playerName,
@@ -76,14 +87,19 @@ async function trackMLBLeg(leg: any): Promise<void> {
 
   console.log(`[SlipTracker] Leg ${leg.id}: actual=${actual} vs line=${line} (${dir}) — gameStatus=${result.gameStatus}`);
 
-  // For live games, update actualValue even if not yet settled
   if (result.gameStatus === 'live') {
+    // Game still in progress — always update actual value and revert to 'live'
+    // even if a previous cycle prematurely settled this leg
+    if (alreadySettled) {
+      console.log(`[SlipTracker] Leg ${leg.id}: was ${leg.status} but game is still live — reverting to live, actual=${actual}`);
+    } else {
+      console.log(`[SlipTracker] Leg ${leg.id}: status=live, actualValue=${actual}`);
+    }
     await storage.updateLegStatus(leg.id, 'live', actual);
-    console.log(`[SlipTracker] Leg ${leg.id}: status=live, actualValue=${actual}`);
     return;
   }
 
-  // Game is final — settle the leg
+  // Game is final — settle definitively
   const hit = dir === 'over' ? actual > line : actual < line;
   await storage.updateLegStatus(leg.id, hit ? 'hit' : 'miss', actual);
   console.log(`[SlipTracker] Leg ${leg.id}: SETTLED → ${hit ? 'HIT' : 'MISS'} (actual=${actual} ${dir} ${line})`);
