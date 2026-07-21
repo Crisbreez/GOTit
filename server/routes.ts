@@ -502,7 +502,17 @@ export function registerRoutes(httpServer: Server, app: Express) {
     });
   });
 
-  // ── Startup ────────────────────────────────────────────────────────────────
+  // ── Player performance (learning loop) ───────────────────────────────
+  app.get('/api/performance', async (_req, res) => {
+    try {
+      const rows = await (storage as any).getAllPerformance();
+      res.json(rows);
+    } catch (e: any) {
+      res.status(500).json({ error: (e as Error).message });
+    }
+  });
+
+  // ── Startup
   Promise.all(['MLB','NBA','NFL','MMA'].map(l => storage.getProps(l))).then(arrays => {
     const hasAnyProps = arrays.some(a => a.length > 0);
     if (!hasAnyProps) {

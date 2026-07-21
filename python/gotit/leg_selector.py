@@ -222,6 +222,8 @@ class PPProp:
     # Direction stored on the prop from PP — governs which side the CDF evaluates.
     # If PP sends an under, we evaluate UNDER; never force a direction ourselves.
     stored_direction:     Direction = Direction.OVER
+    # Learning loop: injected by optimize.py from player_performance table
+    perf: Optional[Dict] = None  # {hitCount, missCount, last5, avgMargin} or None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -399,6 +401,10 @@ class LegCandidate:
     ev_marginal: float = 0.0
     ev_corr_adj: float = 0.0
     under_score: Optional["UnderScore"] = None  # set for UNDER standard legs that qualify
+    # Learning loop: set from player_performance before scoring
+    perf_hit_rate:    Optional[float] = None  # lifetime hit rate (0.0-1.0), None = no history
+    perf_last5_hits:  int = 0                 # hits in last 5 settled legs
+    perf_sample_size: int = 0                 # total settled legs (hit+miss)
 
     @property
     def family(self) -> DistFamily:
@@ -727,7 +733,17 @@ def score_demon(
     market_misprice     = l1   # sharp market mispricing of the demon line
     script_ceiling_fit  = l3   # game context ceiling alignment
     role_stability      = l4   # player role certainty
-    recent_burst        = 0.50 # TODO: wire historical burst model; neutral for now
+    # recent_burst: real hit rate from player_performance when available
+    if cand.perf_hit_rate is not None and cand.perf_sample_size >= 3:
+        # Use last-5 recency as burst signal, fall back to lifetime rate
+        if cand.perf_sample_size >= 3:
+            last5_rate = cand.perf_last5_hits / min(cand.perf_sample_size, 5)
+            # Blend: 70% last-5 recency, 30% lifetime
+            recent_burst = float(np.clip(0.70 * last5_rate + 0.30 * cand.perf_hit_rate, 0.0, 1.0))
+        else:
+            recent_burst = float(np.clip(cand.perf_hit_rate, 0.0, 1.0))
+    else:
+        recent_burst = 0.50  # no history: neutral
     diversity           = l5   # pair diversity (applied at qualify_demons stage)
 
     composite = float(np.clip(
@@ -1037,8 +1053,15 @@ def score_side(
         pace_sign = -pace_sign  # under on a high-pace stat = bad script fit
     w3 = float(np.clip(0.5 + (script.run_env - 0.5) * pace_sign * 1.0, 0.0, 1.0))
 
-    # W4: role_certainty
-    w4 = float(np.clip(1.0 - dnp_prob / 0.15, 0.0, 1.0))
+    # W4: role_certainty — blended with historical hit rate when available
+    base_role = float(np.clip(1.0 - dnp_prob / 0.15, 0.0, 1.0))
+    if cand.perf_hit_rate is not None and cand.perf_sample_size >= 3:
+        # Weight: 60% base role certainty, 40% historical hit rate
+        # Recent form (last 5) adds a ±0.05 nudge
+        last5_bonus = (cand.perf_last5_hits / max(cand.perf_sample_size, 1) - 0.5) * 0.10 if cand.perf_sample_size >= 3 else 0.0
+        w4 = float(np.clip(0.60 * base_role + 0.40 * cand.perf_hit_rate + last5_bonus, 0.0, 1.0))
+    else:
+        w4 = base_role
 
     # W5: line_value — how far the line is from the median (positive = line set favorably)
     # For OVER: below-median line has value. For UNDER: above-median line has value.
@@ -1501,6 +1524,15 @@ def select_legs_for_slate(
                 if tier == Tier.DEMON and p_win < BREAKEVEN_R[6] + 0.03:
                     continue
 
+                # Extract learning-loop performance fields
+                perf = pp.perf or {}
+                hit_c  = int(perf.get('hitCount', 0))
+                miss_c = int(perf.get('missCount', 0))
+                total_s = hit_c + miss_c
+                last5_raw = perf.get('last5', [])
+                last5_hits = sum(1 for x in last5_raw if x == 'hit')
+                lifetime_rate = (hit_c / total_s) if total_s > 0 else None
+
                 cand = LegCandidate(
                     prop_id=pp.prop_id if d == Direction.OVER else f"{pp.prop_id}:under",
                     game_id=pp.game_id,
@@ -1511,6 +1543,9 @@ def select_legs_for_slate(
                     line=line,
                     direction=d,
                     p_win=float(np.clip(p_win, 0.001, 0.999)),
+                    perf_hit_rate=lifetime_rate,
+                    perf_last5_hits=last5_hits,
+                    perf_sample_size=total_s,
                 )
 
                 # Score UNDER standard legs; drop those that fail keep gate

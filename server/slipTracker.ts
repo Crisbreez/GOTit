@@ -168,6 +168,24 @@ async function trackSlip(slip: any): Promise<void> {
       settledAt: new Date().toISOString(),
     });
     console.log(`[SlipTracker] Slip ${slip.id} → ${allHit ? 'WIN 🌟' : 'LOSS'} (${dnpCount} voided)`);
+
+    // ── Learning loop: write each settled leg to player_performance ──────────
+    for (const leg of activeLegs) {
+      if (leg.status !== 'hit' && leg.status !== 'miss') continue;
+      try {
+        await (storage as any).updatePlayerPerformance(
+          leg.playerName,
+          leg.statType,
+          slip.league,
+          leg.status as 'hit' | 'miss',
+          (leg as any).actualValue ?? null,
+          leg.lineScore,
+        );
+        console.log(`[Learning] ${leg.playerName} ${leg.statType} → ${leg.status}`);
+      } catch (e: any) {
+        console.warn(`[Learning] Failed to update performance for ${leg.playerName}: ${e.message}`);
+      }
+    }
   }
 }
 

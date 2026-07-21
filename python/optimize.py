@@ -21,6 +21,8 @@ import sys
 import json
 import hashlib
 import logging
+import os
+import urllib.request
 from pathlib import Path
 from typing import Dict, List
 
@@ -81,6 +83,44 @@ def _tier(d: dict) -> Tier:
     return Tier.STANDARD
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 2b. Player performance loader (learning loop)
+# ─────────────────────────────────────────────────────────────────────────────
+def load_player_performance() -> Dict[str, dict]:
+    """
+    Fetch all player_performance rows from Supabase.
+    Returns a dict keyed by  "playerName::statType::league".
+    Falls back to empty dict on any error so scoring is unaffected.
+    """
+    url   = os.environ.get('SUPABASE_URL', 'https://iikjgxnjmyzlivaukabc.supabase.co')
+    key   = os.environ.get('SUPABASE_ANON_KEY', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imlpa2pneG5qbXl6bGl2YXVrYWJjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODM1NDg1NjgsImV4cCI6MjA5OTEyNDU2OH0.IFY9ocTpySWvyGXyUt615bkpwDs634T1wRUu97WbyTg')
+    try:
+        req = urllib.request.Request(
+            f"{url}/rest/v1/player_performance?select=player_name,stat_type,league,hit_count,miss_count,last_5,avg_margin",
+            headers={'apikey': key, 'Authorization': f'Bearer {key}'},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            rows = json.loads(resp.read())
+        perf_map: Dict[str, dict] = {}
+        for r in rows:
+            k = f"{r['player_name']}::{r['stat_type']}::{r['league']}"
+            try:
+                last5 = json.loads(r.get('last_5') or '[]')
+            except Exception:
+                last5 = []
+            perf_map[k] = {
+                'hitCount':  r.get('hit_count', 0),
+                'missCount': r.get('miss_count', 0),
+                'last5':     last5,
+                'avgMargin': r.get('avg_margin'),
+            }
+        logging.info(f"[learning] loaded {len(perf_map)} player performance records")
+        return perf_map
+    except Exception as e:
+        logging.warning(f"[learning] could not load player_performance: {e}")
+        return {}
+
+
 def build_pp_prop(d: dict) -> PPProp:
     """Convert web-app prop dict to PPProp. Called by both optimize.py and sharp_pull.py."""
     from gotit.leg_selector import Direction as Dir
@@ -101,6 +141,7 @@ def build_pp_prop(d: dict) -> PPProp:
         dnp_prob=0.0,
         correlation_partners=[],
         stored_direction=stored_dir,
+        perf=d.get('_perf'),  # injected by main() from player_performance
     )
 
 
@@ -126,10 +167,21 @@ def main():
     # ── Load calibration ────────────────────────────────────────────────────
     cal = load_calibration()
 
+    # ── Load player performance (learning loop) ─────────────────────────────
+    # Determine league from the first prop so we look up the right rows
+    first_league = (props_data[0].get('league') or '').upper() if props_data else ''
+    perf_map = load_player_performance()
+
     # ── Build PPProp list ───────────────────────────────────────────────────
     pp_props: List[PPProp] = []
     for d in props_data:
         try:
+            # Inject performance record for this player+stat+league
+            player  = d.get('playerName') or d.get('player_name') or ''
+            stat    = d.get('statType')   or d.get('stat_type')   or ''
+            league  = (d.get('league') or first_league).upper()
+            perf_key = f"{player}::{stat}::{league}"
+            d['_perf'] = perf_map.get(perf_key)  # None if no history yet
             pp_props.append(build_pp_prop(d))
         except Exception as e:
             logging.warning(f"skip prop {d.get('playerName','?')}: {e}")

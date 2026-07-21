@@ -96,6 +96,9 @@ export interface IStorage {
   reconcileLeg(id: number, status: string, actualValue: number | null, lastCheckedAt: string, trackingError: boolean): Promise<void>;
   logPull(league: string, count: number, status?: string): Promise<void>;
   getLastPull(league: string): Promise<any>;
+  updatePlayerPerformance(playerName: string, statType: string, league: string, outcome: 'hit' | 'miss', actualValue: number | null, line: number): Promise<void>;
+  getPlayerPerformance(playerName: string, statType: string, league: string): Promise<{ hitCount: number; missCount: number; last5: string[]; avgMargin: number | null } | null>;
+  getAllPerformance(): Promise<any[]>;
 }
 
 export const storage: IStorage = {
@@ -365,5 +368,95 @@ export const storage: IStorage = {
       pulledAt: data.pulled_at,
       status: data.status,
     };
+  },
+
+  // ── Player performance (learning loop) ────────────────────────────────────
+  async updatePlayerPerformance(playerName, statType, league, outcome, actualValue, line) {
+    // Fetch existing row
+    const { data: existing } = await db
+      .from('player_performance')
+      .select('*')
+      .eq('player_name', playerName)
+      .eq('stat_type', statType)
+      .eq('league', league)
+      .single()
+      .select_run();
+
+    const margin = actualValue != null ? actualValue - line : null;
+    const hitCount  = (existing?.hit_count  ?? 0) + (outcome === 'hit'  ? 1 : 0);
+    const missCount = (existing?.miss_count ?? 0) + (outcome === 'miss' ? 1 : 0);
+
+    // Update last_5 ring buffer
+    let last5: string[] = [];
+    try { last5 = JSON.parse(existing?.last_5 ?? '[]'); } catch (_) {}
+    last5.push(outcome);
+    if (last5.length > 5) last5 = last5.slice(-5);
+
+    // Recalculate running average margin
+    const totalSettled = hitCount + missCount;
+    const prevAvg = existing?.avg_margin ?? 0;
+    const newAvg = totalSettled > 1 && margin != null
+      ? (prevAvg * (totalSettled - 1) + margin) / totalSettled
+      : (margin ?? prevAvg);
+
+    const upsertRow = {
+      player_name: playerName,
+      stat_type: statType,
+      league,
+      hit_count: hitCount,
+      miss_count: missCount,
+      last_5: JSON.stringify(last5),
+      avg_margin: newAvg,
+      last_seen_line: line,
+      updated_at: new Date().toISOString(),
+    };
+
+    if (existing) {
+      await db.from('player_performance').eq('id', existing.id).update(upsertRow);
+    } else {
+      await db.from('player_performance').insert(upsertRow);
+    }
+  },
+
+  async getPlayerPerformance(playerName, statType, league) {
+    const { data } = await db
+      .from('player_performance')
+      .select('*')
+      .eq('player_name', playerName)
+      .eq('stat_type', statType)
+      .eq('league', league)
+      .single()
+      .select_run();
+    if (!data) return null;
+    let last5: string[] = [];
+    try { last5 = JSON.parse(data.last_5 ?? '[]'); } catch (_) {}
+    return {
+      hitCount:  data.hit_count,
+      missCount: data.miss_count,
+      last5,
+      avgMargin: data.avg_margin,
+    };
+  },
+
+  async getAllPerformance() {
+    const { data } = await db
+      .from('player_performance')
+      .select('*')
+      .order('updated_at', { ascending: false })
+      .select_run();
+    return (data ?? []).map((r: any) => ({
+      playerName: r.player_name,
+      statType:   r.stat_type,
+      league:     r.league,
+      hitCount:   r.hit_count,
+      missCount:  r.miss_count,
+      last5:      (() => { try { return JSON.parse(r.last_5 ?? '[]'); } catch (_) { return []; } })(),
+      avgMargin:  r.avg_margin,
+      lastSeenLine: r.last_seen_line,
+      updatedAt:  r.updated_at,
+      hitRate:    (r.hit_count + r.miss_count) > 0
+        ? r.hit_count / (r.hit_count + r.miss_count)
+        : null,
+    }));
   },
 };
