@@ -254,6 +254,11 @@ _STAT_CV: Dict[str, float] = {
     "Passing Yards":       0.40,
     "Rushing Yards":       0.75,
     "Receiving Yards":     0.75,
+    # MMA — extreme variance due to early stoppages; high CV = wide CDF = lower p_win
+    # A fighter projected for 40 sig strikes can land 3 if stopped in round 1.
+    "Significant Strikes": 1.20,  # very high variance — early stoppage risk baked in
+    "Fight Time (Mins)":   0.90,  # fight duration is highly uncertain
+    "Takedowns":           1.10,  # grappling attempts vary wildly
 }
 _DEFAULT_CV = 0.70
 
@@ -557,29 +562,33 @@ _DEMON_LINE_FLOOR: dict = {
 # Prevents near-certain "lottery" props (e.g. TB 0.5) from clogging the slate.
 # Rule: standard legs with line < floor are dropped before scoring.
 _STANDARD_LINE_FLOOR: dict = {
-    # MLB hitting — 0.5 lines are near-certain for any player who starts.
-    # Require meaningful lines only.
-    "Total Bases":         1.5,
+    # MLB hitting — raised floors based on observed miss patterns.
+    # 0.5 and 1.5 binary lines are near-coin-flips; require real volume.
+    "Total Bases":         2.5,   # was 1.5 — TB 1.5 still misses on 0-for nights
     "Hits":                1.5,
-    "Hits+Runs+RBIs":      1.5,
-    "Singles":             1.5,
+    "Hits+Runs+RBIs":      2.5,   # was 1.5 — 1.5 H+R+RBI is a coin flip
+    "Singles":             1.5,   # keep 1.5 but first-name gate blocks junk players
     "RBIs":                1.5,
     "Runs":                1.5,
     "Walks":               1.5,
     "Hitter Strikeouts":   1.5,
-    "Home Runs":           0.51,  # block 0.5 HR lines — need a real HR line
-    "Stolen Bases":        0.51,  # block 0.5 SB lines
-    "Doubles":             0.51,  # block 0.5 doubles lines
+    "Hitter Fantasy Score": 5.5,  # block low-line HFS — must be a meaningful game
+    "Home Runs":           0.51,
+    "Stolen Bases":        0.51,
+    "Doubles":             0.51,
     "Triples":             0.51,
     # MLB pitching
-    "Pitcher Strikeouts":  2.5,
+    "Pitcher Strikeouts":  3.5,   # was 2.5 — 2.5 Ks is too easy to miss
+    "Pitcher Fantasy Score": 25.0, # block low pitcher fantasy lines
     "Innings Pitched":     4.5,
     "Hits Allowed":        2.5,
     "Earned Runs Allowed": 0.5,
-    # MMA
-    "Significant Strikes": 15.0,
-    "Takedowns":           0.5,
-    "_default":            0.5,
+    "Pitches Thrown":      70.0,  # must pitch deep enough to matter
+    # MMA — raised significantly; early stoppages kill low-line picks
+    "Significant Strikes": 25.0,  # was 15 — fighters stopped early score near 0
+    "Takedowns":           1.5,   # was 0.5 — single takedown is a coin flip
+    "Fight Time (Mins)":   8.0,   # must expect a long fight
+    "_default":            1.0,
 }
 
 # Game-script fit table: stat types that benefit from high-pace / high-volume games.
@@ -1391,6 +1400,22 @@ def solve_game_milp(
         solver.Add(solver.Sum(vars_) <= 6 * z)
         z_stat[stat] = z
     solver.Add(solver.Sum(list(z_stat.values())) >= 2)
+
+    # ── Stat-type caps: prevent any single stat from dominating the slip ──────
+    # HFS and Significant Strikes are composite stats with correlated failure modes.
+    # Cap them at 2 per slip to force diversification across stat types.
+    hfs_vars = [x[lg.prop_id] for lg in candidates if lg.stat_type == 'Hitter Fantasy Score']
+    if len(hfs_vars) > 2:
+        solver.Add(solver.Sum(hfs_vars) <= 2)
+
+    sig_vars = [x[lg.prop_id] for lg in candidates if lg.stat_type == 'Significant Strikes']
+    if len(sig_vars) > 2:
+        solver.Add(solver.Sum(sig_vars) <= 2)
+
+    # General cap: no stat type can appear more than 3 times in a 6-leg slip
+    for stat, vars_ in stat_vars.items():
+        if len(vars_) > 3:
+            solver.Add(solver.Sum(vars_) <= 3)
 
     # ── Per-leg admission floors ──────────────────────────────────────────────
     # Standard legs: must clear the must-win floor (0.57).
