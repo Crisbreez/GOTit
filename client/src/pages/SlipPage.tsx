@@ -226,7 +226,7 @@ function SlipCard({ slip, onRefresh, isRefreshing, onDelete, isDeleting, onMarkD
       <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', gap:8, marginTop:14, paddingTop:12, borderTop:'1px solid hsl(var(--g-border))' }}>
         {/* Delete button (left) */}
         <button
-          onClick={() => onDelete(slip.id)}
+          onClick={() => { if (window.confirm('Delete this slip? This cannot be undone.')) onDelete(slip.id); }}
           disabled={isDeleting}
           data-testid={`delete-slip-${slip.id}`}
           style={{
