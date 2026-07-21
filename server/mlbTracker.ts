@@ -37,10 +37,14 @@ const PITCHING_STAT_MAP: Record<string, string> = {
   'strikeouts (pitcher)': 'strikeOuts',
   'pitcher strikeouts': 'strikeOuts',
   'earned runs': 'earnedRuns',
+  'earned runs allowed': 'earnedRuns',
   'hits allowed': 'hits',
   'walks allowed': 'baseOnBalls',
   'outs recorded': 'outs',
+  'pitching outs': 'outs',
   'innings pitched': 'inningsPitched',  // string like "6.1", convert to outs
+  'pitches thrown': 'numberOfPitches',
+  'pitches': 'numberOfPitches',
 };
 
 export interface PlayerGameStat {
