@@ -1,0 +1,28 @@
+{
+  "blocked_stats": [
+    "Singles",
+    "Pitcher Fantasy Score"
+  ],
+  "penalized_stats": {
+    "Total Bases": 0.82,
+    "Hits+Runs+RBIs": 0.93
+  },
+  "blocked_line_buckets": [
+    "Hitter Fantasy Score::4.0-5.0",
+    "Singles::0.0-1.0"
+  ],
+  "blocked_players": [],
+  "stat_floor_overrides": {
+    "Hitter Fantasy Score": 5.0,
+    "Singles": 1.0
+  },
+  "generated_at": "2026-07-21T04:58:00.484771+00:00",
+  "summary": [
+    "PENALIZE stat=Total Bases miss_rate=67% n=9 factor=0.82",
+    "BLOCK stat=Singles miss_rate=80% n=5",
+    "PENALIZE stat=Hits+Runs+RBIs miss_rate=60% n=5 factor=0.93",
+    "BLOCK stat=Pitcher Fantasy Score miss_rate=100% n=3",
+    "BLOCK line_bucket=Hitter Fantasy Score::4.0-5.0 miss_rate=75% n=4",
+    "BLOCK line_bucket=Singles::0.0-1.0 miss_rate=75% n=4"
+  ]
+}

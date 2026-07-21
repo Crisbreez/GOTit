@@ -186,6 +186,30 @@ async function trackSlip(slip: any): Promise<void> {
         console.warn(`[Learning] Failed to update performance for ${leg.playerName}: ${e.message}`);
       }
     }
+
+    // ── Self-audit: auto-adjust scoring gates after every settlement ────────
+    // Runs self_audit.py which reads ALL settled legs, detects miss patterns,
+    // and writes config/audit_adjustments.json — optimize.py reads this before
+    // every scoring call. Zero human intervention needed.
+    try {
+      const { execFile } = await import('child_process');
+      const { promisify } = await import('util');
+      const execFileAsync = promisify(execFile);
+      const pythonPath = process.env.PYTHON_PATH || 'python3';
+      const auditScript = new URL('../../python/self_audit.py', import.meta.url).pathname;
+      const { stdout, stderr } = await execFileAsync(pythonPath, [auditScript], {
+        env: {
+          ...process.env,
+          SUPABASE_URL: process.env.SUPABASE_URL || 'https://iikjgxnjmyzlivaukabc.supabase.co',
+          SUPABASE_ANON_KEY: process.env.SUPABASE_ANON_KEY || '',
+        },
+        timeout: 30_000,
+      });
+      console.log('[Self-Audit] Complete:', stdout.trim().split('\n').slice(-3).join(' | '));
+      if (stderr) console.warn('[Self-Audit] stderr:', stderr.trim());
+    } catch (e: any) {
+      console.warn('[Self-Audit] Failed to run (non-fatal):', e.message);
+    }
   }
 }
 

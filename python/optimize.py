@@ -43,6 +43,79 @@ from gotit.sharp_consensus import load_sharp_consensus
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Calibration loader
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# 1b. Audit adjustments loader (self-learning)
+# ─────────────────────────────────────────────────────────────────────────────
+ADJ_PATH = Path(__file__).parent / 'config' / 'audit_adjustments.json'
+
+def load_audit_adjustments() -> dict:
+    """Load self-audit adjustments written by self_audit.py after each settlement."""
+    if not ADJ_PATH.exists():
+        return {}
+    try:
+        with open(ADJ_PATH) as f:
+            return json.load(f)
+    except Exception as e:
+        logging.warning(f"[audit] could not load adjustments: {e}")
+        return {}
+
+def apply_audit_adjustments(props_data: list, adj: dict) -> list:
+    """
+    Filter and penalize props based on self-audit adjustments before scoring.
+    Returns the filtered list.
+    """
+    if not adj:
+        return props_data
+
+    blocked_stats   = set(adj.get('blocked_stats', []))
+    penalized_stats = adj.get('penalized_stats', {})
+    blocked_buckets = set(adj.get('blocked_line_buckets', []))
+    blocked_players = set(adj.get('blocked_players', []))
+    floor_overrides = adj.get('stat_floor_overrides', {})
+
+    filtered = []
+    blocked_count = 0
+
+    for d in props_data:
+        stat   = d.get('statType') or d.get('stat_type') or ''
+        player = d.get('playerName') or d.get('player_name') or ''
+        line   = float(d.get('lineScore') or d.get('line_score') or 0)
+        pkey   = f"{player}::{stat}"
+
+        # Hard blocks
+        if stat in blocked_stats:
+            blocked_count += 1
+            continue
+        if pkey in blocked_players:
+            blocked_count += 1
+            continue
+
+        # Line bucket block
+        from math import floor as _floor
+        bucket_lo = _floor(line) * 1.0
+        bucket_hi = bucket_lo + 1.0
+        bkey = f"{stat}::{bucket_lo:.1f}-{bucket_hi:.1f}"
+        if bkey in blocked_buckets:
+            blocked_count += 1
+            continue
+
+        # Dynamic floor override — skip if line below the raised floor
+        if stat in floor_overrides and line < floor_overrides[stat]:
+            blocked_count += 1
+            continue
+
+        # Penalty: attach to prop so build_pp_prop can carry it
+        if stat in penalized_stats:
+            d['_audit_penalty'] = penalized_stats[stat]
+
+        filtered.append(d)
+
+    if blocked_count:
+        logging.info(f"[audit] blocked {blocked_count} props based on self-audit patterns")
+
+    return filtered
+
+
 def load_calibration() -> CalibrationParams:
     cal_path = Path(__file__).parent / "config" / "calibration_latest.json"
     if cal_path.exists():
@@ -166,6 +239,13 @@ def main():
 
     # ── Load calibration ────────────────────────────────────────────────────
     cal = load_calibration()
+
+    # ── Load self-audit adjustments (autonomous learning) ───────────────────
+    adj = load_audit_adjustments()
+    props_data = apply_audit_adjustments(props_data, adj)
+    if not props_data:
+        print(json.dumps({"error": "all props blocked by self-audit adjustments"}))
+        sys.exit(0)
 
     # ── Load player performance (learning loop) ─────────────────────────────
     # Determine league from the first prop so we look up the right rows
