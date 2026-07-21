@@ -72,18 +72,24 @@ function nameMatch(a: string, b: string): boolean {
   const cb = stripSuffix(nb);
   if (ca === cb) return true;
 
-  // Last name match (on suffix-stripped name, must be > 2 chars)
-  const lastA = ca.split(' ').pop() ?? '';
-  const lastB = cb.split(' ').pop() ?? '';
-  if (lastA.length > 2 && lastA === lastB) return true;
-
-  // First-name prefix match: "Vlad" matches "Vladimir" — one starts with the other
+  const lastA  = ca.split(' ').pop() ?? '';
+  const lastB  = cb.split(' ').pop() ?? '';
   const firstA = ca.split(' ')[0];
   const firstB = cb.split(' ')[0];
-  if (lastA === lastB && lastA.length > 2) return true; // already handled above
-  if (lastA === lastB &&
-      (firstA.startsWith(firstB) || firstB.startsWith(firstA)) &&
-      Math.min(firstA.length, firstB.length) >= 3) return true;
+
+  // ONLY do last-name-only match when one side has no first name (single-word input)
+  // If BOTH sides have a first name, require first names to also agree
+  // This prevents George Soriano matching Jose Soriano
+  const aHasFirst = ca.includes(' ');
+  const bHasFirst = cb.includes(' ');
+  if (lastA.length > 2 && lastA === lastB) {
+    if (aHasFirst && bHasFirst) {
+      // Both have first names — require first-name prefix agreement too
+      if (firstA.startsWith(firstB) || firstB.startsWith(firstA)) return true;
+      return false; // same last name but different first names
+    }
+    return true; // one side is last-name-only — allow the match
+  }
 
   return false;
 }
