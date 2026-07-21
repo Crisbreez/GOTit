@@ -712,12 +712,31 @@ def score_demon(
     # ── L5: Pair diversity (applied at pairing stage; default 1.0 = no penalty)
     l5 = float(np.clip(1.0 - same_failure_penalty, 0.0, 1.0))
 
-    # ── DemonWinScore: 0.40*L1 + 0.30*L2 + 0.15*L3 + 0.10*L4 + 0.05*L5 ────
-    # Weights front-load market anchor (L1) and distribution hit rate (L2).
-    # A demon that passes all 4 gates AND has sharp market + CDF agreement
-    # is a genuine ceiling play. L3/L4/L5 differentiate within that set.
+    # ── DemonScore formula per spec: ──────────────────────────────────────────
+    #   0.30*p_ceiling + 0.24*market_misprice + 0.18*script_ceiling_fit
+    # + 0.12*role_stability + 0.10*recent_burst_pattern + 0.06*pair_diversity
+    #
+    # Mapping to current variables:
+    #   p_ceiling            = l2  (p_win margin above demon floor — "ceiling hit rate")
+    #   market_misprice      = l1  (anchor_delta — how much market undervalues this line)
+    #   script_ceiling_fit   = l3  (game script alignment with this stat's ceiling)
+    #   role_stability       = l4  (role certainty: low dnp_prob + usage consistency)
+    #   recent_burst_pattern = 0.5 (placeholder — no burst model yet; neutral)
+    #   pair_diversity       = l5  (stat-type diversity penalty applied at pairing)
+    p_ceiling           = l2   # distribution ceiling hit rate
+    market_misprice     = l1   # sharp market mispricing of the demon line
+    script_ceiling_fit  = l3   # game context ceiling alignment
+    role_stability      = l4   # player role certainty
+    recent_burst        = 0.50 # TODO: wire historical burst model; neutral for now
+    diversity           = l5   # pair diversity (applied at qualify_demons stage)
+
     composite = float(np.clip(
-        0.40 * l1 + 0.30 * l2 + 0.15 * l3 + 0.10 * l4 + 0.05 * l5,
+        0.30 * p_ceiling
+      + 0.24 * market_misprice
+      + 0.18 * script_ceiling_fit
+      + 0.12 * role_stability
+      + 0.10 * recent_burst
+      + 0.06 * diversity,
         0.0, 1.0,
     ))
 
@@ -824,90 +843,273 @@ def qualify_demons(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 10. WIN SCORE — STANDARD LEGS
+# 10. GAME-SCRIPT ENGINE + SCRIPTED WINNER SCORE
 # ──────────────────────────────────────────────────────────────────────────────
-# WinScoreStandard: a must-win score for a single standard leg.
-# Unlike Shapley EV (which optimizes portfolio payout), this score answers:
-# "How confident are we that this specific side of this line wins?"
 #
-# Formula:
-#   WinScore = 0.40 * W1 + 0.30 * W2 + 0.20 * W3 + 0.10 * W4
+# build_game_script() returns six contextual signals derived from SharpConsensus
+# and game metadata. These signals adjust the CDF mu before p_win is computed,
+# so the distribution reflects today's environment, not a historical average.
 #
-#   W1 = clamp((p_win - H*) / (1 - H*))          — how far above must-win floor
-#   W2 = clamp(0.5 + anchor_delta / 1.0)         — sharp market agreement
-#   W3 = clamp((p_win - 0.57) / 0.20)            — distribution conviction
-#   W4 = clamp(1 - dnp_prob / 0.15)              — role certainty
+# Score shape (standard legs):
+#   scripted_winner_score =
+#       0.34 * p_win
+#     + 0.22 * market_agreement
+#     + 0.18 * script_fit
+#     + 0.12 * role_certainty
+#     + 0.08 * line_value
+#     + 0.06 * payout_boost
 #
-# H* = STANDARD_PWIN_FLOOR = 0.57  (must-win admission floor)
-# Only legs that clear H* reach this scorer.
+# Score shape (demon legs):
+#   demon_score =
+#       0.30 * p_ceiling
+#     + 0.24 * market_misprice
+#     + 0.18 * script_ceiling_fit
+#     + 0.12 * role_stability
+#     + 0.10 * recent_burst_pattern
+#     + 0.06 * pair_diversity
 
 STANDARD_PWIN_FLOOR = 0.57   # must-win admission floor for standard legs
 
+
+@dataclass(frozen=True)
+class GameScript:
+    run_env:        float   # 0-1: expected scoring volume (run total / league avg)
+    pace:           float   # 0-1: pace signal (fast=1, slow=0)
+    team_edge:      float   # -1..1: home team relative strength (positive = home favored)
+    bullpen_stress: float   # 0-1: how taxed is the bullpen (high = pitcher props riskier)
+    park_weather:   float   # 0-1: park + weather run factor (Coors hot day = 1)
+    blowout_risk:   float   # 0-1: likelihood game becomes lopsided early
+
+
+def build_game_script(
+    sc_list: List["SharpConsensus"],
+    game_total: float = 0.0,
+    home_ml:    float = -110.0,   # moneyline for home team
+    is_dome:    bool  = False,
+    temp_f:     float = 72.0,
+    wind_mph:   float = 5.0,
+    wind_toward_cf: bool = False,
+    bullpen_innings_last3: float = 4.0,  # bullpen IP in last 3 games
+) -> GameScript:
+    """
+    Build a game-script context dict from available inputs.
+    All signals normalized to 0-1 (or -1..1 for team_edge).
+    Falls back to neutral (0.5) when data is unavailable.
+    """
+    # run_env: game total vs league average (MLB=8.5, NBA=220)
+    if game_total > 0:
+        league_avg = 8.5 if game_total < 30 else 220.0
+        run_env = float(np.clip(game_total / league_avg, 0.3, 2.0) / 2.0)
+    else:
+        run_env = 0.5
+
+    # pace: proxy by run_env (high-total game = fast pace)
+    pace = run_env
+
+    # team_edge: derived from moneyline
+    # ML=-200 → implied prob ≈ 0.67; edge = 0.67 - 0.5 = +0.17 normalized
+    try:
+        if home_ml < 0:
+            implied = (-home_ml) / (-home_ml + 100)
+        else:
+            implied = 100 / (home_ml + 100)
+        team_edge = float(np.clip((implied - 0.50) * 2, -1.0, 1.0))
+    except Exception:
+        team_edge = 0.0
+
+    # park_weather: dome = neutral; outdoor hot + wind_out = high
+    if is_dome:
+        park_weather = 0.50
+    else:
+        temp_factor  = float(np.clip((temp_f - 60) / 40, 0.0, 1.0))
+        wind_factor  = float(np.clip(wind_mph / 20, 0.0, 1.0)) if wind_toward_cf else 0.0
+        park_weather = float(np.clip(0.60 * temp_factor + 0.40 * wind_factor, 0.0, 1.0))
+
+    # bullpen_stress: heavy recent usage raises pitcher prop risk
+    bullpen_stress = float(np.clip(bullpen_innings_last3 / 10.0, 0.0, 1.0))
+
+    # blowout_risk: large team edge + high run env = more lopsided risk
+    blowout_risk = float(np.clip(abs(team_edge) * run_env, 0.0, 1.0))
+
+    return GameScript(
+        run_env=round(run_env, 4),
+        pace=round(pace, 4),
+        team_edge=round(team_edge, 4),
+        bullpen_stress=round(bullpen_stress, 4),
+        park_weather=round(park_weather, 4),
+        blowout_risk=round(blowout_risk, 4),
+    )
+
+
+def adjust_distribution(
+    median:    float,
+    direction: "Direction",
+    stat_type: str,
+    script:    GameScript,
+) -> Tuple[float, float]:
+    """
+    Adjust mu_star based on game-script signals before CDF computation.
+    Returns (mu_star, sigma_star) for use in _calibrated_p_win.
+
+    Logic:
+    - pace_sign tells us if a high-pace game boosts or suppresses this stat.
+    - park_weather amplifies the run_env signal for hitting stats.
+    - blowout_risk slightly suppresses extreme overperformance.
+    """
+    pace_sign   = _STAT_PACE_SIGN.get(stat_type, +1)
+    env_signal  = script.run_env * (1.0 + 0.30 * script.park_weather)
+    mu_adj      = (env_signal - 0.50) * pace_sign * 0.12  # ±12% max shift on mu
+
+    # Blowout risk suppresses ceiling: if game goes lopsided early,
+    # volume stats get reduced (starter pulled, starters sit, etc.)
+    blowout_adj = -script.blowout_risk * 0.05  # up to -5% on mu
+
+    mu_star    = max(0.01, median * (1.0 + mu_adj + blowout_adj))
+    sigma_star = mu_star * _STAT_CV.get(stat_type, _DEFAULT_CV)
+
+    return mu_star, sigma_star
+
+
+@dataclass
+class ScriptedCandidate:
+    """Output of score_side() — one evaluated direction for a standard/goblin leg."""
+    prop_id:              str
+    player_name:          str
+    stat_type:            str
+    line:                 float
+    direction:            Direction
+    p_win:                float
+    market_agreement:     float   # W2
+    script_fit:           float   # W3
+    role_certainty:       float   # W4
+    line_value:           float   # W5
+    payout_boost:         float   # W6
+    scripted_winner_score: float  # final 0-1
+
+
 @dataclass
 class WinScoreStandard:
+    """Alias for compatibility — wraps ScriptedCandidate fields."""
     prop_id:         str
     player_name:     str
     stat_type:       str
     line:            float
     direction:       Direction
     p_win:           float
-    w1_pwin_margin:  float   # how far above must-win floor
-    w2_market_agree: float   # sharp market agreement
-    w3_dist_conv:    float   # distribution conviction
-    w4_role:         float   # role certainty
-    win_score:       float   # final 0-1 score
+    w1_pwin_margin:  float
+    w2_market_agree: float
+    w3_dist_conv:    float
+    w4_role:         float
+    win_score:       float
+
+
+def score_side(
+    cand:      "LegCandidate",
+    direction: Direction,
+    sc:        "SharpConsensus",
+    dnp_prob:  float,
+    script:    GameScript,
+    family:    DistFamily,
+    cal_shape: Dict,
+) -> ScriptedCandidate:
+    """
+    Score one direction of a standard or goblin prop against the game script.
+    Returns a ScriptedCandidate with scripted_winner_score.
+    """
+    # Adjust distribution to game context
+    mu_star, _ = adjust_distribution(sc.median, direction, cand.stat_type, script)
+
+    # Recompute p_win using script-adjusted mu
+    p_win = _calibrated_p_win(cand.line, mu_star, cal_shape, family, direction, cand.stat_type)
+
+    # W1 is embedded in p_win itself (p_win IS the primary win signal)
+    # W2: market agreement — anchor delta after script adjustment
+    if direction == Direction.OVER:
+        anchor_delta = sc.median - cand.line
+    else:
+        anchor_delta = cand.line - sc.median
+    is_real = sc.freshness_sec < 9000.0
+    w2 = float(np.clip(0.5 + anchor_delta / 1.0, 0.0, 1.0)) if is_real else 0.40
+
+    # W3: script_fit — how well this stat type benefits from today's environment
+    pace_sign  = _STAT_PACE_SIGN.get(cand.stat_type, +1)
+    if direction == Direction.UNDER:
+        pace_sign = -pace_sign  # under on a high-pace stat = bad script fit
+    w3 = float(np.clip(0.5 + (script.run_env - 0.5) * pace_sign * 1.0, 0.0, 1.0))
+
+    # W4: role_certainty
+    w4 = float(np.clip(1.0 - dnp_prob / 0.15, 0.0, 1.0))
+
+    # W5: line_value — how far the line is from the median (positive = line set favorably)
+    # For OVER: below-median line has value. For UNDER: above-median line has value.
+    lv_raw = anchor_delta / max(sc.median, 0.5)
+    w5 = float(np.clip(0.5 + lv_raw * 0.5, 0.0, 1.0))
+
+    # W6: payout_boost — slight bump for higher-line props (larger payout if it hits)
+    # Normalized to 0-1 based on line relative to stat-family typical range.
+    typical_line = sc.median
+    w6 = float(np.clip(cand.line / max(typical_line * 2, 0.5), 0.0, 1.0))
+
+    score = float(np.clip(
+        0.34 * p_win
+      + 0.22 * w2
+      + 0.18 * w3
+      + 0.12 * w4
+      + 0.08 * w5
+      + 0.06 * w6,
+        0.0, 1.0,
+    ))
+
+    return ScriptedCandidate(
+        prop_id=cand.prop_id,
+        player_name=cand.player_name,
+        stat_type=cand.stat_type,
+        line=cand.line,
+        direction=direction,
+        p_win=p_win,
+        market_agreement=round(w2, 4),
+        script_fit=round(w3, 4),
+        role_certainty=round(w4, 4),
+        line_value=round(w5, 4),
+        payout_boost=round(w6, 4),
+        scripted_winner_score=round(score, 4),
+    )
 
 
 def score_standard_leg(
     cand:      "LegCandidate",
     sc:        "SharpConsensus",
     dnp_prob:  float,
-) -> WinScoreStandard:
+    script:    Optional[GameScript] = None,
+    family:    Optional[DistFamily] = None,
+    cal_shape: Optional[Dict] = None,
+) -> "WinScoreStandard":
     """
-    Score a standard leg for must-win probability.
-    Caller guarantees cand.p_win >= STANDARD_PWIN_FLOOR already.
+    Backwards-compatible wrapper: scores a standard leg using score_side()
+    and returns a WinScoreStandard for MILP win_score_map.
     """
-    pp_line   = cand.line
-    p_win     = cand.p_win
-    direction = cand.direction
-    is_real   = sc.freshness_sec < 9000.0
+    if script is None:
+        script = GameScript(run_env=0.5, pace=0.5, team_edge=0.0,
+                            bullpen_stress=0.3, park_weather=0.5, blowout_risk=0.2)
+    if family is None:
+        family = get_family(cand.stat_type)
+    if cal_shape is None:
+        cal_shape = {}
 
-    # anchor_delta: positive = market agrees this side has value
-    if direction == Direction.OVER:
-        anchor_delta = sc.median - pp_line   # positive = line is below fair → OVER has edge
-    else:
-        anchor_delta = pp_line - sc.median   # positive = line is above fair → UNDER has edge
-
-    # W1: p_win margin above must-win floor
-    h_star = STANDARD_PWIN_FLOOR
-    w1 = float(np.clip((p_win - h_star) / max(1 - h_star, 0.01), 0.0, 1.0))
-
-    # W2: market agreement
-    w2 = float(np.clip(0.5 + anchor_delta / 1.0, 0.0, 1.0)) if is_real else 0.40
-
-    # W3: distribution conviction (above 0.57 floor)
-    w3 = float(np.clip((p_win - 0.57) / 0.20, 0.0, 1.0))
-
-    # W4: role certainty
-    w4 = float(np.clip(1.0 - dnp_prob / 0.15, 0.0, 1.0))
-
-    win_score = float(np.clip(
-        0.40 * w1 + 0.30 * w2 + 0.20 * w3 + 0.10 * w4,
-        0.0, 1.0,
-    ))
+    sc_result = score_side(cand, cand.direction, sc, dnp_prob, script, family, cal_shape)
 
     return WinScoreStandard(
         prop_id=cand.prop_id,
         player_name=cand.player_name,
         stat_type=cand.stat_type,
-        line=pp_line,
-        direction=direction,
-        p_win=p_win,
-        w1_pwin_margin=round(w1, 4),
-        w2_market_agree=round(w2, 4),
-        w3_dist_conv=round(w3, 4),
-        w4_role=round(w4, 4),
-        win_score=round(win_score, 4),
+        line=cand.line,
+        direction=cand.direction,
+        p_win=sc_result.p_win,
+        w1_pwin_margin=round(sc_result.p_win, 4),
+        w2_market_agree=sc_result.market_agreement,
+        w3_dist_conv=sc_result.script_fit,
+        w4_role=sc_result.role_certainty,
+        win_score=sc_result.scripted_winner_score,
     )
 
 
@@ -1391,28 +1593,39 @@ def select_legs_for_slate(
         if len(game_cands) < 6:
             continue
 
+        # ── Build game script for this game ──────────────────────────────────
+        # Use game_total from sharp consensus if available; fall back to 0.
+        game_sc_list = [sc for sc in sharp_consensus.values()
+                        if any(c.prop_id == sc.prop_id for c in game_cands)]
+        game_script = build_game_script(
+            sc_list=game_sc_list,
+            game_total=sum(sc.median for sc in game_sc_list) / max(len(game_sc_list), 1)
+                       if game_sc_list else 0.0,
+        )
+        log.info("[script] game=%s run_env=%.2f pace=%.2f blowout=%.2f",
+                 game_id, game_script.run_env, game_script.pace, game_script.blowout_risk)
+
         # ── Build WinScore map for MILP objective ────────────────────────────
-        # Standards + goblins: WinScoreStandard.win_score
-        # Demons: DemonWinScore composite (from qualify_demons scoring)
+        # Standards + goblins: ScriptedCandidate.scripted_winner_score via score_side()
+        # Demons: DemonWinScore composite with script_ceiling_fit
         win_score_map: Dict[str, float] = {}
-        game_demons_scored = {
-            lg.prop_id: lg for lg in game_cands if lg.tier == Tier.DEMON
-        }
         for c in game_cands:
-            dnp_p = dnp_model.get(c.player_id, dnp_model.get(c.prop_id, 0.0))
+            dnp_p  = dnp_model.get(c.player_id, dnp_model.get(c.prop_id, 0.0))
+            sc_c   = sharp_consensus.get(c.prop_id)
+            family = get_family(c.stat_type)
             if c.tier == Tier.DEMON:
-                sc_d = sharp_consensus.get(c.prop_id)
-                if sc_d:
-                    ds = score_demon(c, sc_d, dnp_p, game_total=0.0)
+                if sc_c:
+                    ds = score_demon(c, sc_c, dnp_p, game_total=game_script.run_env * 8.5)
                     win_score_map[c.prop_id] = ds.composite
                 else:
                     win_score_map[c.prop_id] = 0.0
             else:
-                sc_s = sharp_consensus.get(c.prop_id)
-                if sc_s:
-                    ws = score_standard_leg(c, sc_s, dnp_p)
-                    win_score_map[c.prop_id] = ws.win_score
-                    c.ev_corr_adj = ws.win_score  # store for leg_to_dict output
+                if sc_c:
+                    sc_result = score_side(c, c.direction, sc_c, dnp_p, game_script, family, {})
+                    win_score_map[c.prop_id] = sc_result.scripted_winner_score
+                    c.ev_corr_adj = sc_result.scripted_winner_score
+                    # Update p_win with script-adjusted value
+                    c.p_win = sc_result.p_win
                 else:
                     win_score_map[c.prop_id] = 0.0
 
