@@ -5,9 +5,10 @@ import { apiRequest } from '@/lib/queryClient';
 interface SlipLeg {
   id: number; slipId: number;
   playerName: string; statType: string; lineScore: number; direction: string;
-  isDemon?: boolean; isGoblin?: boolean;
+  isDemon?: boolean; isGoblin?: boolean; gameMatchup?: string;
   status: string; actualValue?: number;
   hitExplanation?: string; missExplanation?: string; propScore?: number;
+  trackingError?: boolean;
 }
 
 interface Slip {
@@ -23,13 +24,32 @@ interface Slip {
 
 const RESULT_TABS = ['History', 'Recaps', 'Errors', 'Script Audit'];
 
-// ── History tab ──────────────────────────────────────────────────────────────
+// ── helpers ───────────────────────────────────────────────────────────────────
+function hitRate(legs: SlipLeg[]) {
+  const active = legs.filter(l => l.status !== 'dnp' && l.status !== 'void');
+  const hits   = active.filter(l => l.status === 'hit').length;
+  return { hits, total: active.length, rate: active.length ? hits / active.length : 0 };
+}
+
+function slipDate(slip: Slip) {
+  const iso = slip.settledAt || slip.createdAt;
+  return new Date(iso).toLocaleDateString('en-US', { timeZone: 'America/Chicago', month: 'short', day: 'numeric' });
+}
+
+function legMargin(leg: SlipLeg): string {
+  if (leg.actualValue == null) return '';
+  const diff = leg.direction === 'over'
+    ? leg.actualValue - leg.lineScore
+    : leg.lineScore - leg.actualValue;
+  return diff >= 0 ? `+${diff.toFixed(1)}` : diff.toFixed(1);
+}
+
+// ── History ───────────────────────────────────────────────────────────────────
 function HistoryView({ slips }: { slips: Slip[] }) {
   const [expanded, setExpanded] = useState<number | null>(null);
-
   const settled = slips.filter(s => s.status === 'settled_win' || s.status === 'settled_loss');
 
-  if (settled.length === 0) return (
+  if (!settled.length) return (
     <div className="empty-state">
       <div className="empty-icon">
         <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7">
@@ -37,64 +57,71 @@ function HistoryView({ slips }: { slips: Slip[] }) {
         </svg>
       </div>
       <h3>No Settled Slips</h3>
-      <p>Settled slips will appear here with full breakdown and analysis.</p>
+      <p>Settled slips will appear here once games finish.</p>
     </div>
   );
 
   return (
-    <div>
+    <div style={{ padding:'0 1rem', paddingBottom:'1rem' }}>
       <div className="section-title">Settled · {settled.length} slip{settled.length !== 1 ? 's' : ''}</div>
       {settled.map(slip => {
+        const legs = slip.legs || [];
         const isWin = slip.status === 'settled_win';
         const isOpen = expanded === slip.id;
-        const hits = (slip.legs || []).filter(l => l.status === 'hit').length;
-        const total = (slip.legs || []).length;
+        const { hits, total } = hitRate(legs);
+        const rate = total ? hits / total : 0;
+        const dnps = legs.filter(l => l.status === 'dnp' || l.status === 'void');
+        const demons = legs.filter(l => l.isDemon);
+        const missLegs = legs.filter(l => l.status === 'miss');
+        const worstMiss = missLegs.sort((a, b) => {
+          const da = a.actualValue != null ? Math.abs(a.actualValue - a.lineScore) : 0;
+          const db = b.actualValue != null ? Math.abs(b.actualValue - b.lineScore) : 0;
+          return da - db;
+        })[0];
 
         return (
           <div key={slip.id} className="game-card animate-in" style={{ marginBottom:0, marginTop:12 }}>
-            {/* Summary row */}
             <div style={{ display:'flex', alignItems:'flex-start', justifyContent:'space-between', gap:12 }}>
               <div style={{ flex:1 }}>
                 <div style={{ fontWeight:700, fontSize:'0.9375rem', marginBottom:4 }}>
-                  {slip.gameMatchup || slip.league + ' Slip'}
+                  {slip.gameMatchup || slip.league + ' Slip #' + slip.id}
                 </div>
                 <div style={{ display:'flex', gap:6, flexWrap:'wrap', alignItems:'center' }}>
                   <span className={`tag tag-${isWin ? 'won' : 'loss'}`}>
                     {isWin ? '✓ GOTit' : '✗ Miss'}
                   </span>
-                  {slip.scriptLabel && (
-                    <span style={{ fontSize:'0.6875rem', color:'hsl(var(--g-gold))', fontWeight:600 }}>
-                      {slip.scriptLabel}
-                    </span>
-                  )}
-                  {slip.settledAt && (
-                    <span style={{ fontSize:'0.6875rem', color:'hsl(var(--muted-foreground))', fontFamily:'Space Mono,monospace' }}>
-                      {new Date(slip.settledAt).toLocaleDateString('en-US', { timeZone: 'America/Chicago' })}
-                    </span>
-                  )}
+                  {slip.league && <span style={{ fontSize:'0.6rem', fontWeight:700, letterSpacing:'0.08em', color:'hsl(var(--muted-foreground))', textTransform:'uppercase' }}>{slip.league}</span>}
+                  {dnps.length > 0 && <span style={{ fontSize:'0.65rem', color:'hsl(var(--muted-foreground))' }}>{dnps.length} DNP voided</span>}
+                  <span style={{ fontSize:'0.6875rem', color:'hsl(var(--muted-foreground))', fontFamily:'Space Mono,monospace' }}>{slipDate(slip)}</span>
                 </div>
               </div>
-              <div style={{ display:'flex', alignItems:'center', gap:10, flexShrink:0 }}>
-                {/* Scores */}
-                {slip.qualityScore != null && (
-                  <div className="score-ring" style={{
-                    borderColor: slip.qualityScore >= 0.7 ? 'hsl(var(--g-green))' : slip.qualityScore >= 0.5 ? 'hsl(var(--g-gold))' : 'hsl(0 72% 51%)',
-                    color: slip.qualityScore >= 0.7 ? 'hsl(var(--g-green))' : slip.qualityScore >= 0.5 ? 'hsl(var(--g-gold))' : 'hsl(0 72% 60%)',
-                    boxShadow: slip.qualityScore >= 0.7 ? 'var(--shadow-green)' : undefined,
-                  }}>
-                    {Math.round(slip.qualityScore * 100)}
-                  </div>
-                )}
-                <div style={{ fontFamily:'Space Mono,monospace', fontSize:'0.875rem', fontWeight:700,
+              <div style={{ display:'flex', flexDirection:'column', alignItems:'flex-end', gap:4, flexShrink:0 }}>
+                <div style={{ fontFamily:'Space Mono,monospace', fontSize:'1rem', fontWeight:700,
                   color: isWin ? 'hsl(var(--g-green))' : 'hsl(0 72% 60%)' }}>
                   {hits}/{total}
+                </div>
+                <div style={{ fontSize:'0.65rem', color: rate >= 0.7 ? 'hsl(var(--g-green))' : rate >= 0.5 ? 'hsl(var(--g-gold))' : 'hsl(0 72% 60%)', fontWeight:700 }}>
+                  {Math.round(rate * 100)}%
                 </div>
               </div>
             </div>
 
-            {/* Expand toggle */}
+            {/* Weakest miss callout */}
+            {!isWin && worstMiss && (
+              <div style={{ marginTop:8, padding:'0.4rem 0.6rem', background:'hsl(0 72% 51%/0.07)', borderRadius:5, border:'1px solid hsl(0 72% 51%/0.18)', fontSize:'0.72rem', color:'hsl(0 72% 65%)' }}>
+                ↓ Missed: {worstMiss.playerName} {worstMiss.statType} {worstMiss.direction} {worstMiss.lineScore}
+                {worstMiss.actualValue != null && ` (actual ${worstMiss.actualValue})`}
+              </div>
+            )}
+
+            {demons.length > 0 && (
+              <div style={{ marginTop:6, fontSize:'0.68rem', color:'hsl(var(--g-gold))', fontWeight:600 }}>
+                🔥 {demons.length} demon leg{demons.length > 1 ? 's' : ''} included
+              </div>
+            )}
+
             <button className="expand-row" onClick={() => setExpanded(isOpen ? null : slip.id)}>
-              <span>{isOpen ? 'Hide breakdown' : 'Show breakdown'}</span>
+              <span>{isOpen ? 'Hide legs' : 'Show all legs'}</span>
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
                 style={{ transform: isOpen ? 'rotate(180deg)' : undefined, transition:'transform 200ms' }}>
                 <polyline points="6 9 12 15 18 9"/>
@@ -103,83 +130,43 @@ function HistoryView({ slips }: { slips: Slip[] }) {
 
             {isOpen && (
               <div style={{ marginTop:12, paddingTop:12, borderTop:'1px solid hsl(var(--g-border))' }}>
-                {/* Scores row */}
-                {(slip.qualityScore != null || slip.correlationScore != null) && (
-                  <div style={{ display:'flex', gap:20, marginBottom:14 }}>
-                    {slip.qualityScore != null && (
-                      <div className="stat-bar" style={{ flex:1, marginBottom:0 }}>
-                        <div className="stat-bar-label">
-                          <span style={{ color:'hsl(var(--muted-foreground))' }}>Quality Score</span>
-                          <span style={{ fontFamily:'Space Mono,monospace', fontWeight:700, color:'hsl(var(--g-gold))' }}>{Math.round(slip.qualityScore*100)}</span>
+                {legs.map(leg => {
+                  const margin = legMargin(leg);
+                  const isHit = leg.status === 'hit';
+                  const isMiss = leg.status === 'miss';
+                  const isDnp = leg.status === 'dnp' || leg.status === 'void';
+                  return (
+                    <div key={leg.id} className={`leg-row${isHit ? ' hit' : isMiss ? ' miss' : ''}`} style={{ opacity: isDnp ? 0.4 : 1 }}>
+                      <div>
+                        {isDnp
+                          ? <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="hsl(var(--muted-foreground))" strokeWidth="2"><circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg>
+                          : isHit
+                            ? <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="hsl(142 72% 46%)" strokeWidth="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+                            : <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="hsl(0 72% 51%)" strokeWidth="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                        }
+                      </div>
+                      <div style={{ flex:1 }}>
+                        <div style={{ fontWeight:700, fontSize:'0.8125rem' }}>
+                          {leg.playerName}
+                          {leg.isDemon && <span style={{ marginLeft:4, fontSize:'0.6rem', color:'hsl(var(--g-gold))', fontWeight:800 }}>DEMON</span>}
+                          {leg.isGoblin && <span style={{ marginLeft:4, fontSize:'0.6rem', color:'hsl(270 60% 70%)', fontWeight:800 }}>GOBLIN</span>}
                         </div>
-                        <div className="progress-track"><div className="progress-fill-gold" style={{ width:`${slip.qualityScore*100}%` }}/></div>
+                        <div style={{ fontSize:'0.7rem', color:'hsl(var(--muted-foreground))' }}>{leg.statType}</div>
                       </div>
-                    )}
-                    {slip.correlationScore != null && (
-                      <div className="stat-bar" style={{ flex:1, marginBottom:0 }}>
-                        <div className="stat-bar-label">
-                          <span style={{ color:'hsl(var(--muted-foreground))' }}>Correlation</span>
-                          <span style={{ fontFamily:'Space Mono,monospace', fontWeight:700, color:'hsl(var(--g-gold))' }}>{Math.round(slip.correlationScore*100)}</span>
+                      <div style={{ textAlign:'right', flexShrink:0 }}>
+                        <div style={{ fontSize:'0.8rem', fontWeight:700, color: isHit ? 'hsl(var(--g-green))' : isMiss ? 'hsl(0 72% 60%)' : 'hsl(var(--muted-foreground))' }}>
+                          {leg.direction === 'over' ? '↑' : '↓'} {leg.lineScore}
                         </div>
-                        <div className="progress-track"><div className="progress-fill-gold" style={{ width:`${slip.correlationScore*100}%` }}/></div>
+                        {leg.actualValue != null && (
+                          <div style={{ fontSize:'0.65rem', color:'hsl(var(--muted-foreground))', fontFamily:'Space Mono,monospace' }}>
+                            {leg.actualValue} <span style={{ color: isHit ? 'hsl(var(--g-green))' : 'hsl(0 72% 60%)' }}>{margin}</span>
+                          </div>
+                        )}
+                        {isDnp && <div style={{ fontSize:'0.6rem', color:'hsl(var(--muted-foreground))' }}>DNP</div>}
                       </div>
-                    )}
-                  </div>
-                )}
-
-                {/* Warnings */}
-                {(slip.warnings?.length ?? 0) > 0 && (
-                  <div style={{ marginBottom:10 }}>
-                    {slip.warnings!.map((w, i) => (
-                      <div key={i} style={{ display:'flex', gap:6, alignItems:'flex-start', fontSize:'0.75rem', color:'hsl(42 96% 70%)', marginBottom:4 }}>
-                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" style={{ flexShrink:0, marginTop:1 }}>
-                          <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
-                          <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
-                        </svg>
-                        {w}
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                {/* Weakest leg */}
-                {slip.weakestLeg && (
-                  <div style={{ marginBottom:12, padding:'0.5rem 0.75rem', background:'hsl(0 72% 51%/0.08)', borderRadius:6, border:'1px solid hsl(0 72% 51%/0.20)' }}>
-                    <div style={{ fontSize:'0.6875rem', fontWeight:700, letterSpacing:'0.07em', textTransform:'uppercase', color:'hsl(0 72% 60%)', marginBottom:2 }}>Weakest Leg</div>
-                    <div style={{ fontSize:'0.8125rem', color:'hsl(var(--foreground))' }}>{slip.weakestLeg}</div>
-                  </div>
-                )}
-
-                {/* Leg breakdown */}
-                {(slip.legs || []).map(leg => (
-                  <div key={leg.id} className={`leg-row${leg.status === 'hit' ? ' hit' : leg.status === 'miss' ? ' miss' : ''}`}>
-                    <div>
-                      {leg.status === 'hit'
-                        ? <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="hsl(142 72% 46%)" strokeWidth="2.5"><polyline points="20 6 9 17 4 12"/></svg>
-                        : <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="hsl(0 72% 51%)" strokeWidth="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-                      }
                     </div>
-                    <div style={{ flex:1 }}>
-                      <div style={{ fontWeight:700, fontSize:'0.875rem' }}>{leg.playerName}</div>
-                      <div style={{ fontSize:'0.75rem', color:'hsl(var(--muted-foreground))' }}>{leg.statType}</div>
-                      {(leg.hitExplanation || leg.missExplanation) && (
-                        <div style={{ fontSize:'0.75rem', color: leg.status === 'hit' ? 'hsl(var(--g-green))' : 'hsl(0 72% 65%)', marginTop:3, fontStyle:'italic' }}>
-                          {leg.hitExplanation || leg.missExplanation}
-                        </div>
-                      )}
-                    </div>
-                    <div style={{ textAlign:'right', flexShrink:0 }}>
-                      <div className="leg-line" style={{ color: leg.status === 'hit' ? 'hsl(var(--g-green))' : 'hsl(0 72% 60%)' }}>
-                        {leg.direction === 'over' ? '↑' : '↓'} {leg.lineScore}
-                      </div>
-                      {leg.actualValue != null && (
-                        <div style={{ fontSize:'0.6875rem', color:'hsl(var(--muted-foreground))', fontFamily:'Space Mono,monospace' }}>
-                          {leg.actualValue}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
           </div>
@@ -189,54 +176,84 @@ function HistoryView({ slips }: { slips: Slip[] }) {
   );
 }
 
-// ── Recaps tab ───────────────────────────────────────────────────────────────
+// ── Recaps ────────────────────────────────────────────────────────────────────
 function RecapsView({ slips }: { slips: Slip[] }) {
   const settled = slips.filter(s => s.status === 'settled_win' || s.status === 'settled_loss');
-  if (settled.length === 0) return (
+
+  if (!settled.length) return (
     <div className="empty-state">
       <div className="empty-icon">
         <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7">
           <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-          <polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/>
+          <polyline points="14 2 14 8 20 8"/>
         </svg>
       </div>
       <h3>No Recaps Yet</h3>
-      <p>Narrative summaries of settled slips will appear here.</p>
+      <p>Narrative summaries appear after slips settle.</p>
     </div>
   );
 
   return (
-    <div>
+    <div style={{ padding:'0 1rem', paddingBottom:'1rem' }}>
       <div className="section-title">Narrative Recaps</div>
       {settled.map(slip => {
+        const legs = slip.legs || [];
         const isWin = slip.status === 'settled_win';
-        const hits = (slip.legs || []).filter(l => l.status === 'hit').length;
-        const total = (slip.legs || []).length;
-        const hitLegs = (slip.legs || []).filter(l => l.status === 'hit');
-        const missLegs = (slip.legs || []).filter(l => l.status === 'miss');
+        const { hits, total } = hitRate(legs);
+        const hitLegs  = legs.filter(l => l.status === 'hit');
+        const missLegs = legs.filter(l => l.status === 'miss');
+        const dnpLegs  = legs.filter(l => l.status === 'dnp' || l.status === 'void');
+        const demons   = legs.filter(l => l.isDemon);
+
+        // Build narrative sentences
+        const sentences: string[] = [];
+
+        if (isWin) {
+          sentences.push(`GOTit went ${hits}/${total} on this slip — a clean win.`);
+          const topHit = hitLegs[0];
+          if (topHit) sentences.push(`${topHit.playerName} led the way: ${topHit.statType} ${topHit.direction} ${topHit.lineScore}${topHit.actualValue != null ? `, actual ${topHit.actualValue}` : ''}.`);
+          if (demons.length) sentences.push(`${demons.length} demon leg${demons.length > 1 ? 's' : ''} delivered.`);
+        } else {
+          sentences.push(`This slip finished ${hits}/${total}${dnpLegs.length ? ` (${dnpLegs.length} DNP voided)` : ''}.`);
+          const firstMiss = missLegs[0];
+          if (firstMiss) {
+            const margin = firstMiss.actualValue != null
+              ? ` — came in at ${firstMiss.actualValue} vs line of ${firstMiss.lineScore}`
+              : '';
+            sentences.push(`${firstMiss.playerName}'s ${firstMiss.statType} was the critical miss${margin}.`);
+          }
+          if (missLegs.length > 1) {
+            sentences.push(`Also missed: ${missLegs.slice(1).map(l => l.playerName).join(', ')}.`);
+          }
+          if (hitLegs.length) {
+            sentences.push(`${hitLegs.map(l => l.playerName).join(', ')} ${hitLegs.length === 1 ? 'hit' : 'all hit'}.`);
+          }
+        }
 
         return (
           <div key={slip.id} className="game-card animate-in" style={{ marginTop:12 }}>
-            <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:10 }}>
+            <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:8 }}>
               <span className={`tag tag-${isWin ? 'won' : 'loss'}`}>{isWin ? 'GOTit' : 'Miss'}</span>
-              <span style={{ fontWeight:700, fontSize:'0.875rem' }}>{slip.gameMatchup || slip.league + ' Slip'}</span>
+              <span style={{ fontWeight:700, fontSize:'0.875rem', flex:1 }}>{slip.gameMatchup || slip.league + ' Slip #' + slip.id}</span>
               <span style={{ fontFamily:'Space Mono,monospace', fontSize:'0.75rem', color:'hsl(var(--muted-foreground))' }}>{hits}/{total}</span>
             </div>
             <div className="g-divider-gold" style={{ marginBottom:10 }}/>
-            <p style={{ fontSize:'0.8125rem', lineHeight:1.65, color:'hsl(var(--muted-foreground))' }}>
-              {isWin
-                ? `GOTit nailed this ${total}-leg slip with ${hits}/${total} legs hitting. ${slip.scriptLabel ? `The "${slip.scriptLabel}" script played out exactly as projected. ` : ''}${hitLegs.slice(0,2).map(l => `${l.playerName} went ${l.direction} ${l.lineScore} on ${l.statType}`).join('; ')}.`
-                : `This ${total}-leg slip ended ${hits}/${total}. ${missLegs.slice(0,1).map(l => `${l.playerName}'s ${l.statType} was the critical miss — the line at ${l.lineScore} didn't land.`).join(' ')} ${slip.scriptLabel ? `The "${slip.scriptLabel}" script diverged from the actual game flow.` : ''}`
-              }
+
+            {/* Hit/miss bar */}
+            <div style={{ display:'flex', gap:2, marginBottom:10, height:4, borderRadius:4, overflow:'hidden' }}>
+              {legs.filter(l => l.status !== 'dnp' && l.status !== 'void').map(leg => (
+                <div key={leg.id} style={{ flex:1, background: leg.status === 'hit' ? 'hsl(142 72% 46%)' : 'hsl(0 72% 51%)' }}/>
+              ))}
+            </div>
+
+            <p style={{ fontSize:'0.8125rem', lineHeight:1.7, color:'hsl(var(--foreground)/0.85)', margin:0 }}>
+              {sentences.join(' ')}
             </p>
-            {slip.scriptLabel && (
-              <div style={{ marginTop:10, display:'flex', gap:6, alignItems:'center' }}>
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="hsl(var(--g-gold))" strokeWidth="2">
-                  <circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>
-                </svg>
-                <span style={{ fontSize:'0.6875rem', color:'hsl(var(--g-gold))', fontWeight:600 }}>Script: {slip.scriptLabel}</span>
-              </div>
-            )}
+
+            <div style={{ marginTop:8, fontSize:'0.68rem', color:'hsl(var(--muted-foreground))' }}>
+              {slip.league} · {slipDate(slip)}
+              {dnpLegs.length > 0 && ` · ${dnpLegs.map(l => l.playerName).join(', ')} DNP`}
+            </div>
           </div>
         );
       })}
@@ -244,75 +261,116 @@ function RecapsView({ slips }: { slips: Slip[] }) {
   );
 }
 
-// ── Errors tab ───────────────────────────────────────────────────────────────
-const ERROR_CATEGORIES = [
-  { key: 'game_script_divergence', label: 'Script Divergence', icon: '🎯', color: 'hsl(0 72% 60%)' },
-  { key: 'line_too_sharp', label: 'Line Too Sharp', icon: '⚡', color: 'hsl(42 96% 56%)' },
-  { key: 'injury_impact', label: 'Injury Impact', icon: '🩹', color: 'hsl(0 72% 60%)' },
-  { key: 'correlation_fail', label: 'Correlation Fail', icon: '🔗', color: 'hsl(270 60% 70%)' },
-  { key: 'small_sample', label: 'Small Sample', icon: '📊', color: 'hsl(var(--muted-foreground))' },
-  { key: 'variance_spike', label: 'Variance Spike', icon: '📈', color: 'hsl(42 96% 56%)' },
-  { key: 'prop_type_risk', label: 'Prop Type Risk', icon: '🎲', color: 'hsl(var(--muted-foreground))' },
-  { key: 'opponent_adjustment', label: 'Opponent Adjustment', icon: '🛡️', color: 'hsl(0 72% 60%)' },
-  { key: 'weather_environment', label: 'Weather/Environment', icon: '🌧️', color: 'hsl(188 35% 47%)' },
-];
-
+// ── Errors ────────────────────────────────────────────────────────────────────
 function ErrorsView({ slips }: { slips: Slip[] }) {
-  const missLegs = slips
-    .filter(s => s.status === 'settled_loss')
-    .flatMap(s => (s.legs || []).filter(l => l.status === 'miss'));
+  const settled = slips.filter(s => s.status === 'settled_win' || s.status === 'settled_loss');
+  const allLegs = settled.flatMap(s => (s.legs || []).map(l => ({ ...l, _slip: s })));
+  const missLegs = allLegs.filter(l => l.status === 'miss');
+  const dnpLegs  = allLegs.filter(l => l.status === 'dnp' || l.status === 'void');
+  const trackingErrors = allLegs.filter(l => (l as any).trackingError);
 
-  const total = missLegs.length;
-
-  if (total === 0) return (
+  if (!missLegs.length && !dnpLegs.length) return (
     <div className="empty-state">
       <div className="empty-icon">
         <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7">
           <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
-          <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+          <line x1="12" y1="9" x2="12" y2="13"/>
         </svg>
       </div>
       <h3>No Errors Yet</h3>
-      <p>Miss patterns and error categories will be grouped and shown here to improve GOTit over time.</p>
+      <p>Miss patterns and tracking errors will appear here.</p>
     </div>
   );
 
-  const catCounts: Record<string, number> = {};
-  ERROR_CATEGORIES.forEach(c => { catCounts[c.key] = Math.floor(Math.random() * total * 0.4); });
+  // Group misses by stat type
+  const byStatType: Record<string, typeof missLegs> = {};
+  missLegs.forEach(l => {
+    byStatType[l.statType] = byStatType[l.statType] || [];
+    byStatType[l.statType].push(l);
+  });
+  const statRanking = Object.entries(byStatType).sort((a,b) => b[1].length - a[1].length);
+
+  // Track which legs missed by a small margin (within 1 of line)
+  const closeMisses = missLegs.filter(l => {
+    if (l.actualValue == null) return false;
+    return Math.abs(l.actualValue - l.lineScore) <= 1;
+  });
 
   return (
-    <div>
-      <div className="section-title">{total} total miss leg{total !== 1 ? 's' : ''}</div>
+    <div style={{ padding:'0 1rem', paddingBottom:'1rem' }}>
+      {/* Summary row */}
+      <div className="section-title">{missLegs.length} misses · {dnpLegs.length} DNP voided</div>
 
-      <div style={{ padding:'0 1rem', display:'flex', flexDirection:'column', gap:10 }}>
-        {ERROR_CATEGORIES.map(cat => {
-          const count = catCounts[cat.key] || 0;
-          const pct = total > 0 ? (count / total) * 100 : 0;
-          return (
-            <div key={cat.key} className="g-card" style={{ padding:'0.75rem 1rem' }}>
-              <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:6 }}>
-                <div style={{ display:'flex', alignItems:'center', gap:8 }}>
-                  <span style={{ fontSize:'1rem' }}>{cat.icon}</span>
-                  <span style={{ fontWeight:700, fontSize:'0.875rem' }}>{cat.label}</span>
-                </div>
-                <span style={{ fontFamily:'Space Mono,monospace', fontSize:'0.8125rem', fontWeight:700, color:cat.color }}>{count}</span>
-              </div>
-              <div className="progress-track">
-                <div style={{ height:'100%', width:`${pct}%`, background:cat.color, borderRadius:'9999px', transition:'width 0.6s ease' }}/>
-              </div>
+      {/* Tracking errors */}
+      {trackingErrors.length > 0 && (
+        <div className="g-card" style={{ padding:'0.75rem 1rem', marginBottom:10, border:'1px solid hsl(0 72% 51%/0.3)' }}>
+          <div style={{ fontWeight:700, fontSize:'0.8rem', color:'hsl(0 72% 60%)', marginBottom:6 }}>⚠ Tracking Corrections ({trackingErrors.length})</div>
+          {trackingErrors.slice(0,5).map(l => (
+            <div key={l.id} style={{ fontSize:'0.72rem', color:'hsl(var(--muted-foreground))', marginBottom:3 }}>
+              {l.playerName} · {l.statType} — corrected during tracking
             </div>
-          );
-        })}
+          ))}
+        </div>
+      )}
+
+      {/* DNP legs */}
+      {dnpLegs.length > 0 && (
+        <div className="g-card" style={{ padding:'0.75rem 1rem', marginBottom:10 }}>
+          <div style={{ fontWeight:700, fontSize:'0.8rem', color:'hsl(var(--muted-foreground))', marginBottom:6 }}>DNP / Voided Legs</div>
+          {dnpLegs.map(l => (
+            <div key={l.id} style={{ display:'flex', justifyContent:'space-between', fontSize:'0.75rem', marginBottom:4 }}>
+              <span style={{ color:'hsl(var(--foreground))' }}>{l.playerName}</span>
+              <span style={{ color:'hsl(var(--muted-foreground))' }}>{l.statType} · {(l as any)._slip?.league}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Close misses */}
+      {closeMisses.length > 0 && (
+        <div className="g-card" style={{ padding:'0.75rem 1rem', marginBottom:10, border:'1px solid hsl(42 96% 56%/0.25)' }}>
+          <div style={{ fontWeight:700, fontSize:'0.8rem', color:'hsl(var(--g-gold))', marginBottom:6 }}>⚡ Close Misses ({closeMisses.length})</div>
+          {closeMisses.map(l => (
+            <div key={l.id} style={{ display:'flex', justifyContent:'space-between', fontSize:'0.75rem', marginBottom:4 }}>
+              <span>{l.playerName} · {l.statType}</span>
+              <span style={{ fontFamily:'Space Mono,monospace', color:'hsl(var(--g-gold))' }}>
+                {l.actualValue} vs {l.lineScore}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Miss breakdown by stat type */}
+      <div style={{ fontWeight:700, fontSize:'0.7rem', letterSpacing:'0.07em', textTransform:'uppercase', color:'hsl(var(--muted-foreground))', marginBottom:8, marginTop:4 }}>
+        Misses by Stat Type
       </div>
+      {statRanking.map(([stat, legs]) => {
+        const pct = missLegs.length > 0 ? (legs.length / missLegs.length) * 100 : 0;
+        return (
+          <div key={stat} className="g-card" style={{ padding:'0.6rem 0.85rem', marginBottom:8 }}>
+            <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:5 }}>
+              <span style={{ fontWeight:700, fontSize:'0.8125rem' }}>{stat}</span>
+              <span style={{ fontFamily:'Space Mono,monospace', fontSize:'0.8rem', fontWeight:700, color:'hsl(0 72% 60%)' }}>{legs.length}×</span>
+            </div>
+            <div className="progress-track">
+              <div style={{ height:'100%', width:`${pct}%`, background:'hsl(0 72% 51%)', borderRadius:'9999px', transition:'width 0.5s ease' }}/>
+            </div>
+            <div style={{ marginTop:5, fontSize:'0.68rem', color:'hsl(var(--muted-foreground))' }}>
+              {legs.slice(0,3).map(l => l.playerName).join(', ')}{legs.length > 3 ? ` +${legs.length-3}` : ''}
+            </div>
+          </div>
+        );
+      })}
     </div>
   );
 }
 
-// ── Script Audit tab ─────────────────────────────────────────────────────────
+// ── Script Audit ──────────────────────────────────────────────────────────────
 function ScriptAuditView({ slips }: { slips: Slip[] }) {
   const settled = slips.filter(s => s.status === 'settled_win' || s.status === 'settled_loss');
 
-  if (settled.length === 0) return (
+  if (!settled.length) return (
     <div className="empty-state">
       <div className="empty-icon">
         <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7">
@@ -320,55 +378,107 @@ function ScriptAuditView({ slips }: { slips: Slip[] }) {
         </svg>
       </div>
       <h3>No Script Data</h3>
-      <p>Script accuracy audits will appear after slips are settled and reconciled.</p>
+      <p>Script accuracy audits appear after slips settle.</p>
     </div>
   );
 
-  const wins = settled.filter(s => s.status === 'settled_win').length;
-  const scriptHitRate = settled.length > 0 ? Math.round((wins / settled.length) * 100) : 0;
+  const wins     = settled.filter(s => s.status === 'settled_win').length;
+  const allLegs  = settled.flatMap(s => s.legs || []);
+  const active   = allLegs.filter(l => l.status !== 'dnp' && l.status !== 'void');
+  const legHits  = active.filter(l => l.status === 'hit').length;
+  const slipRate = settled.length ? Math.round((wins / settled.length) * 100) : 0;
+  const legRate  = active.length  ? Math.round((legHits / active.length) * 100) : 0;
+
+  const demonLegs  = allLegs.filter(l => l.isDemon);
+  const goblinLegs = allLegs.filter(l => l.isGoblin);
+  const demonHits  = demonLegs.filter(l => l.status === 'hit').length;
+  const goblinHits = goblinLegs.filter(l => l.status === 'hit').length;
+  const demonRate  = demonLegs.length  ? Math.round((demonHits / demonLegs.length) * 100) : null;
+  const goblinRate = goblinLegs.length ? Math.round((goblinHits / goblinLegs.length) * 100) : null;
 
   return (
-    <div>
-      <div className="section-title">Script Performance</div>
-      <div style={{ padding:'0 1rem', display:'flex', flexDirection:'column', gap:12 }}>
-        {/* Overall */}
-        <div className="g-card-gold" style={{ padding:'1rem' }}>
-          <div style={{ textAlign:'center', marginBottom:12 }}>
-            <div style={{ fontFamily:'Space Mono,monospace', fontSize:'2rem', fontWeight:700, color:'hsl(var(--g-gold))' }}>{scriptHitRate}%</div>
-            <div style={{ fontSize:'0.75rem', color:'hsl(var(--muted-foreground))', letterSpacing:'0.06em', textTransform:'uppercase', fontWeight:600 }}>Script Hit Rate</div>
-          </div>
-          <div className="progress-track"><div className="progress-fill-gold" style={{ width:`${scriptHitRate}%` }}/></div>
-          <div style={{ display:'flex', justifyContent:'space-between', marginTop:8, fontSize:'0.75rem', color:'hsl(var(--muted-foreground))' }}>
-            <span>{wins} correct scripts</span>
-            <span>{settled.length - wins} diverged</span>
-          </div>
-        </div>
+    <div style={{ padding:'0 1rem', paddingBottom:'1rem' }}>
+      <div className="section-title">Script Performance · {settled.length} slips</div>
 
-        {/* Per-script breakdown */}
-        {settled.map(slip => {
-          const isWin = slip.status === 'settled_win';
-          return (
-            <div key={slip.id} className="g-card" style={{ padding:'0.75rem 1rem' }}>
-              <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', gap:8 }}>
-                <div>
-                  <div style={{ fontWeight:700, fontSize:'0.875rem', marginBottom:3 }}>{slip.scriptLabel || 'Unknown Script'}</div>
-                  <div style={{ fontSize:'0.75rem', color:'hsl(var(--muted-foreground))' }}>{slip.gameMatchup}</div>
+      {/* Top-level KPIs */}
+      <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:10, marginBottom:14 }}>
+        {[
+          { label: 'Slip Hit Rate', value: `${slipRate}%`, sub: `${wins}W–${settled.length - wins}L`, color: slipRate >= 50 ? 'hsl(var(--g-green))' : 'hsl(0 72% 60%)' },
+          { label: 'Leg Hit Rate',  value: `${legRate}%`,  sub: `${legHits}/${active.length} legs`, color: legRate >= 55 ? 'hsl(var(--g-green))' : legRate >= 45 ? 'hsl(var(--g-gold))' : 'hsl(0 72% 60%)' },
+        ].map(kpi => (
+          <div key={kpi.label} className="g-card-gold" style={{ padding:'0.875rem', textAlign:'center' }}>
+            <div style={{ fontFamily:'Space Mono,monospace', fontSize:'1.5rem', fontWeight:700, color:kpi.color }}>{kpi.value}</div>
+            <div style={{ fontSize:'0.65rem', fontWeight:700, letterSpacing:'0.07em', textTransform:'uppercase', color:'hsl(var(--muted-foreground))', marginTop:2 }}>{kpi.label}</div>
+            <div style={{ fontSize:'0.68rem', color:'hsl(var(--muted-foreground))', marginTop:2 }}>{kpi.sub}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Demon / Goblin rates */}
+      {(demonRate !== null || goblinRate !== null) && (
+        <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:10, marginBottom:14 }}>
+          {demonRate !== null && (
+            <div className="g-card" style={{ padding:'0.75rem', textAlign:'center' }}>
+              <div style={{ fontFamily:'Space Mono,monospace', fontSize:'1.1rem', fontWeight:700, color:'hsl(var(--g-gold))' }}>{demonRate}%</div>
+              <div style={{ fontSize:'0.65rem', fontWeight:700, letterSpacing:'0.06em', textTransform:'uppercase', color:'hsl(var(--muted-foreground))' }}>Demon Hit Rate</div>
+              <div style={{ fontSize:'0.68rem', color:'hsl(var(--muted-foreground))' }}>{demonHits}/{demonLegs.length}</div>
+            </div>
+          )}
+          {goblinRate !== null && (
+            <div className="g-card" style={{ padding:'0.75rem', textAlign:'center' }}>
+              <div style={{ fontFamily:'Space Mono,monospace', fontSize:'1.1rem', fontWeight:700, color:'hsl(270 60% 70%)' }}>{goblinRate}%</div>
+              <div style={{ fontSize:'0.65rem', fontWeight:700, letterSpacing:'0.06em', textTransform:'uppercase', color:'hsl(var(--muted-foreground))' }}>Goblin Hit Rate</div>
+              <div style={{ fontSize:'0.68rem', color:'hsl(var(--muted-foreground))' }}>{goblinHits}/{goblinLegs.length}</div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Per-slip breakdown */}
+      <div style={{ fontWeight:700, fontSize:'0.7rem', letterSpacing:'0.07em', textTransform:'uppercase', color:'hsl(var(--muted-foreground))', marginBottom:8 }}>
+        Slip Breakdown
+      </div>
+      {settled.map(slip => {
+        const legs    = slip.legs || [];
+        const { hits, total } = hitRate(legs);
+        const isWin   = slip.status === 'settled_win';
+        const rate    = total ? hits / total : 0;
+        const missL   = legs.filter(l => l.status === 'miss');
+        return (
+          <div key={slip.id} className="g-card" style={{ padding:'0.75rem 1rem', marginBottom:8 }}>
+            <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', gap:8, marginBottom:6 }}>
+              <div>
+                <div style={{ fontWeight:700, fontSize:'0.8125rem', marginBottom:2 }}>
+                  {slip.gameMatchup || slip.league + ' Slip #' + slip.id}
                 </div>
-                <div style={{ display:'flex', flexDirection:'column', alignItems:'flex-end', gap:4 }}>
-                  <span className={`tag tag-${isWin ? 'won' : 'loss'}`} style={{ fontSize:'0.6rem' }}>
-                    {isWin ? '✓ Hit' : '✗ Diverged'}
-                  </span>
-                  {slip.correlationScore != null && (
-                    <span style={{ fontFamily:'Space Mono,monospace', fontSize:'0.6875rem', color:'hsl(var(--g-gold))', fontWeight:700 }}>
-                      Corr: {Math.round(slip.correlationScore * 100)}
-                    </span>
-                  )}
-                </div>
+                <div style={{ fontSize:'0.68rem', color:'hsl(var(--muted-foreground))' }}>{slipDate(slip)} · {slip.league}</div>
+              </div>
+              <div style={{ display:'flex', flexDirection:'column', alignItems:'flex-end', gap:3 }}>
+                <span className={`tag tag-${isWin ? 'won' : 'loss'}`} style={{ fontSize:'0.6rem' }}>
+                  {isWin ? '✓ GOTit' : '✗ Miss'}
+                </span>
+                <span style={{ fontFamily:'Space Mono,monospace', fontSize:'0.75rem', fontWeight:700,
+                  color: rate >= 0.7 ? 'hsl(var(--g-green))' : rate >= 0.5 ? 'hsl(var(--g-gold))' : 'hsl(0 72% 60%)' }}>
+                  {hits}/{total}
+                </span>
               </div>
             </div>
-          );
-        })}
-      </div>
+
+            {/* Mini leg bar */}
+            <div style={{ display:'flex', gap:2, height:3, borderRadius:2, overflow:'hidden', marginBottom: missL.length ? 6 : 0 }}>
+              {legs.filter(l => l.status !== 'dnp' && l.status !== 'void').map(l => (
+                <div key={l.id} style={{ flex:1, background: l.status === 'hit' ? 'hsl(142 72% 46%)' : 'hsl(0 72% 51%)' }}/>
+              ))}
+            </div>
+
+            {missL.length > 0 && (
+              <div style={{ fontSize:'0.68rem', color:'hsl(0 72% 65%)' }}>
+                Missed: {missL.map(l => `${l.playerName} (${l.statType}${l.actualValue != null ? ' · ' + l.actualValue : ''})`).join(' · ')}
+              </div>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -382,9 +492,11 @@ export default function ResultsPage() {
     queryFn: () => apiRequest('GET', '/api/slips?status=all').then(r => r.json()),
   });
 
+  const settled = slips.filter(s => s.status === 'settled_win' || s.status === 'settled_loss');
+  const wins    = settled.filter(s => s.status === 'settled_win').length;
+
   return (
     <div style={{ minHeight:'100dvh' }}>
-      {/* Header */}
       <header className="app-header">
         <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between' }}>
           <div>
@@ -394,12 +506,11 @@ export default function ResultsPage() {
             </div>
           </div>
           <div style={{ fontFamily:'Space Mono,monospace', fontSize:'0.875rem', fontWeight:700, color:'hsl(var(--muted-foreground))' }}>
-            {slips.filter(s => s.status === 'settled_win').length}W–{slips.filter(s => s.status === 'settled_loss').length}L
+            {wins}W–{settled.length - wins}L
           </div>
         </div>
       </header>
 
-      {/* Result tabs */}
       <div className="result-tabs">
         {RESULT_TABS.map(tab => (
           <button
@@ -410,7 +521,6 @@ export default function ResultsPage() {
           >{tab}</button>
         ))}
       </div>
-
       <div className="g-divider" style={{ marginTop:0 }}/>
 
       {isLoading ? (
@@ -423,9 +533,9 @@ export default function ResultsPage() {
         </div>
       ) : (
         <div style={{ paddingBottom:'0.5rem' }}>
-          {activeTab === 'History' && <HistoryView slips={slips}/>}
-          {activeTab === 'Recaps' && <RecapsView slips={slips}/>}
-          {activeTab === 'Errors' && <ErrorsView slips={slips}/>}
+          {activeTab === 'History'      && <HistoryView     slips={slips}/>}
+          {activeTab === 'Recaps'       && <RecapsView       slips={slips}/>}
+          {activeTab === 'Errors'       && <ErrorsView       slips={slips}/>}
           {activeTab === 'Script Audit' && <ScriptAuditView slips={slips}/>}
         </div>
       )}
