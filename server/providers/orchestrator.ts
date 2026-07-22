@@ -239,7 +239,8 @@ export async function orchestratePull(league: string, forceRefresh = false): Pro
       let demonDowngraded = 0;
       const ppProps = ppPropsRaw
         .map((p: any) => {
-          // Goblins: always keep as-is
+          // Goblins: ALWAYS keep as-is — they are discount lines by design,
+          // line floors do NOT apply to goblins.
           if (p.isGoblin) return p;
           // Demons: apply minimum line gate — demote to standard if below floor
           if (p.isDemon) {
@@ -250,7 +251,7 @@ export async function orchestratePull(league: string, forceRefresh = false): Pro
             }
             return p;
           }
-          // Standard props: apply standard line floor
+          // Standard props only: apply standard line floor
           const floor = LINE_FLOORS[p.statType] ?? 1.0;
           if (p.lineScore < floor) return null;
           return p;

@@ -153,7 +153,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
       .filter(g => !!g.gameId)
       .map(g => ({
         ...g,
-        demons: (g.props as any[]).filter((p: any) => p.isDemon).slice(0, 2),
+        demons: (g.props as any[]).filter((p: any) => p.isDemon),  // optimizer picks top 2 at optimize time
         goblins: (g.props as any[]).filter((p: any) => p.isGoblin),
         standards: (g.props as any[]).filter((p: any) => !p.isDemon && !p.isGoblin),
       }))
