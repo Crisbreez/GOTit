@@ -193,7 +193,31 @@ export async function orchestratePull(league: string, forceRefresh = false): Pro
     state.pp.lastAttemptAt = now;
     try {
       console.log(`[Orchestrator] ${league}: attempting PrizePicks`);
-      const ppProps = await pullPrizePicks(league);
+      const ppPropsRaw = await pullPrizePicks(league);
+      // ── Line floor gate — applied at ingest so trash props never hit DB ──
+      // Mirrors _STANDARD_LINE_FLOOR in leg_selector.py. Demons/goblins exempted
+      // because their line is set by PP and we still want to show them.
+      const LINE_FLOORS: Record<string, number> = {
+        'Total Bases':          2.5,
+        'Hits+Runs+RBIs':       2.5,
+        'Pitcher Strikeouts':   3.5,
+        'Pitches Thrown':       70.0,
+        'Pitcher Fantasy Score': 25.0,
+        'Hitter Fantasy Score':  5.5,
+        'Significant Strikes':  25.0,
+        'Takedowns':             1.5,
+        'Fight Time (Mins)':     8.0,
+      };
+      const ppProps = ppPropsRaw.filter((p: any) => {
+        // Always keep demons and goblins — they are PP-designated, never filtered
+        if (p.isDemon || p.isGoblin) return true;
+        const floor = LINE_FLOORS[p.statType] ?? 1.0;  // default: block 0.5 lines
+        if (p.lineScore < floor) {
+          return false;
+        }
+        return true;
+      });
+      console.log(`[Orchestrator] ${league}: line-floor filter — ${ppPropsRaw.length} raw → ${ppProps.length} kept`);
       if (ppProps.length > 0) {
         state.pp.consecutiveFailures = 0;
         state.pp.rateLimited = false;
