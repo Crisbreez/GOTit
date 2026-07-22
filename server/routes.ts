@@ -121,6 +121,37 @@ export function registerRoutes(httpServer: Server, app: Express) {
   });
 
   // ── Slate ──────────────────────────────────────────────────────────────────
+  // ── Demon qualifier helper: runs qualify_demons.py for a single game ────────
+  async function pickTop2Demons(gameProps: any[]): Promise<any[]> {
+    return new Promise((resolve) => {
+      const scriptPath = path.resolve(process.cwd(), 'python', 'qualify_demons.py');
+      const python = process.env.PYTHON_BIN || 'python3';
+      let out = '', err = '';
+      const child = spawn(python, [scriptPath], { timeout: 20_000, cwd: process.cwd() });
+      child.stdin.write(JSON.stringify(gameProps));
+      child.stdin.end();
+      child.stdout.on('data', (d: Buffer) => { out += d.toString(); });
+      child.stderr.on('data', (d: Buffer) => { err += d.toString(); });
+      child.on('close', (code: number | null) => {
+        if (code !== 0) {
+          console.warn('[Demons] qualify_demons exited', code, err.slice(0, 200));
+          // Fallback: return top 2 raw demons sorted by lineScore desc
+          const raw = gameProps.filter((p: any) => p.isDemon)
+            .sort((a: any, b: any) => b.lineScore - a.lineScore)
+            .slice(0, 2);
+          return resolve(raw);
+        }
+        try {
+          const result = JSON.parse(out);
+          resolve(Array.isArray(result) ? result.slice(0, 2) : []);
+        } catch {
+          resolve([]);
+        }
+      });
+      child.on('error', () => resolve([]));
+    });
+  }
+
   app.get('/api/slate', async (req, res) => {
     const league = (req.query.league as string || 'MLB').toUpperCase();
     const rawProps = await storage.getProps(league);
@@ -129,7 +160,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
       return res.json({ league, props: [], games: [], pulledAt: null });
     }
 
-    // Group props by game — no scoring, no enrichment
+    // Group props by game
     const gameMap = new Map<string, any>();
     for (const p of rawProps) {
       const key = p.gameId || p.gameMatchup || 'unknown';
@@ -149,12 +180,17 @@ export function registerRoutes(httpServer: Server, app: Express) {
       g.props.push(p);
     }
 
-    const games = Array.from(gameMap.values())
-      .filter(g => !!g.gameId)
-      .map(g => ({
+    // Run qualify_demons for each game in parallel — picks exactly top 2
+    const rawGames = Array.from(gameMap.values()).filter(g => !!g.gameId);
+    const demonResults = await Promise.all(
+      rawGames.map(g => pickTop2Demons(g.props))
+    );
+
+    const games = rawGames
+      .map((g, i) => ({
         ...g,
-        demons: (g.props as any[]).filter((p: any) => p.isDemon),  // optimizer picks top 2 at optimize time
-        goblins: (g.props as any[]).filter((p: any) => p.isGoblin),
+        demons:    demonResults[i],   // exactly top 2 GOTit-qualified demons
+        goblins:   (g.props as any[]).filter((p: any) => p.isGoblin),
         standards: (g.props as any[]).filter((p: any) => !p.isDemon && !p.isGoblin),
       }))
       .sort((a, b) => {

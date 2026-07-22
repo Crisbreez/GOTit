@@ -556,37 +556,23 @@ function GameCard({ game, selectedIds, onToggle, atMax, onSave, isSaving }: {
               TOP {game.demons.length}
             </span>
           </div>
-          {/* Full DemonCard display — top 2 optimizer picks shown first */}
-          {(() => {
-            // Split: optimizer-selected demons (have demonScore) vs gate-qualified rest
-            const top2 = game.demons.filter((d: any) => d.demonScore != null)
-              .sort((a: any, b: any) => (b.demonScore?.composite ?? 0) - (a.demonScore?.composite ?? 0))
-              .slice(0, 2);
-            const top2Ids = new Set(top2.map((d: any) => d.id));
-            const rest = game.demons.filter((d: any) => !top2Ids.has(d.id));
-            const displayDemons = top2.length > 0 ? [...top2, ...rest] : game.demons;
-            return (
-              <>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginTop: 10, marginBottom: 8 }}>
-                  {displayDemons.map((d: any, i: number) => (
-                    <DemonCard key={d.id} prop={d} rank={i + 1} />
-                  ))}
-                </div>
-                {/* Selectable prop rows for demons — tap to add to slip */}
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 5, marginTop: 4 }}>
-                  {displayDemons.map((d: any) => (
-                    <PropRow
-                      key={`sel-${d.id}`}
-                      prop={d}
-                      isSelected={selectedIds.has(d.id)}
-                      onToggle={() => onToggle(d)}
-                      disabled={atMax && !selectedIds.has(d.id)}
-                    />
-                  ))}
-                </div>
-              </>
-            );
-          })()}
+          {/* Demon section — exactly top 2 GOTit-qualified demons from qualify_demons.py */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginTop: 10, marginBottom: 8 }}>
+            {game.demons.map((d: any, i: number) => (
+              <DemonCard key={d.id} prop={d} rank={i + 1} />
+            ))}
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 5, marginTop: 4 }}>
+            {game.demons.map((d: any) => (
+              <PropRow
+                key={`sel-${d.id}`}
+                prop={d}
+                isSelected={selectedIds.has(d.id)}
+                onToggle={() => onToggle(d)}
+                disabled={atMax && !selectedIds.has(d.id)}
+              />
+            ))}
+          </div>
         </div>
       )}
     </div>
