@@ -433,7 +433,7 @@ def _match_props(
             log.debug(
                 f"[sharp] matched {pp.player_name} {pp.stat_type} "
                 f"PP_line={pp_line} SGO_line={best['fair_line']} "
-                f"p_win_over={p_win:.3f}"
+                f"SGO_fair_line={best['fair_line']}"
             )
         else:
             # Fallback: calibration tier-delta (name not in SGO or stat not covered)
