@@ -788,7 +788,9 @@ export default function SlatePage() {
     // Collect all props across all games
     const allProps: any[] = [];
     for (const g of games) {
-      const gProps = [...(g.demons || []), ...(g.standards || []), ...(g.goblins || [])];
+      // Slate optimizer only receives standards + goblins.
+      // Demons are a separate pipeline (qualify_demons.py) — never mixed in here.
+      const gProps = [...(g.standards || []), ...(g.goblins || [])];
       for (const p of gProps) {
         allProps.push({
           propId: p.id,
@@ -797,7 +799,7 @@ export default function SlatePage() {
           teamAbbr: p.teamAbbr || '',
           statType: p.statType,
           lineScore: p.lineScore,
-          isDemon: p.isDemon || false,
+          isDemon: false,
           isGoblin: p.isGoblin || false,
           direction: p.direction || 'over',
           gameMatchup: p.gameMatchup || g.matchup || '',

@@ -247,6 +247,13 @@ def main():
         print(json.dumps({"error": "all props blocked by self-audit adjustments"}))
         sys.exit(0)
 
+    # Hard rule: demons never enter the slate optimizer.
+    # Demon picks are a separate pipeline (qualify_demons.py only).
+    props_data = [d for d in props_data if not d.get('isDemon')]
+    if not props_data:
+        print(json.dumps({"error": "no non-demon props to optimize"}))
+        sys.exit(0)
+
     # ── Load player performance (learning loop) ─────────────────────────────
     # Determine league from the first prop so we look up the right rows
     first_league = (props_data[0].get('league') or '').upper() if props_data else ''
