@@ -262,11 +262,24 @@ export async function pullPrizePicks(league: string): Promise<RawCanonicalProp[]
   // Leagues where synthetic under generation is active
   const SYNTHETIC_UNDER_LEAGUES = new Set(['MLB', 'MMA']);
 
-  // Synthetic unders are NOT stored in the DB as separate rows.
-  // PP gives us the threshold (the over line). GOTit derives both sides
-  // internally in leg_selector.py using the CDF — over and under are
-  // both evaluated from the same stored prop row, and the better-scoring
-  // direction wins. Storing both rows caused over+under to both appear
-  // in the slate for the same fighter/player, which makes no sense.
+  // Synthetic unders: store as separate rows so they appear in the slate.
+  // Only for standard props in MLB/MMA. Excluded stats (HR, Triples, SB, etc.)
+  // are near-certain unders and meaningless.
+  // Each under row gets a distinct id (original_id + ':under') and
+  // isSynthetic=true so the UI can distinguish them.
+  if (SYNTHETIC_UNDER_LEAGUES.has(league)) {
+    const overRows = results.filter(
+      (r: any) => !r.isDemon && !r.isGoblin && !UNDER_EXCLUDED_STATS.has(r.statType)
+    );
+    for (const row of overRows) {
+      results.push({
+        ...row,
+        id: `${row.id}:under`,
+        direction: 'under',
+        isSynthetic: true,
+      });
+    }
+  }
+
   return results;
 }

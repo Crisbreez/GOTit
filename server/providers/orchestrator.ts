@@ -251,7 +251,7 @@ export async function orchestratePull(league: string, forceRefresh = false): Pro
             }
             return p;
           }
-          // Standard props only: apply standard line floor
+          // Standard props (including synthetic unders): apply standard line floor
           const floor = LINE_FLOORS[p.statType] ?? 1.0;
           if (p.lineScore < floor) return null;
           return p;
