@@ -208,16 +208,56 @@ export async function orchestratePull(league: string, forceRefresh = false): Pro
         'Takedowns':             1.5,
         'Fight Time (Mins)':     8.0,
       };
-      const ppProps = ppPropsRaw.filter((p: any) => {
-        // Always keep demons and goblins — they are PP-designated, never filtered
-        if (p.isDemon || p.isGoblin) return true;
-        const floor = LINE_FLOORS[p.statType] ?? 1.0;  // default: block 0.5 lines
-        if (p.lineScore < floor) {
-          return false;
-        }
-        return true;
-      });
-      console.log(`[Orchestrator] ${league}: line-floor filter — ${ppPropsRaw.length} raw → ${ppProps.length} kept`);
+      // ── Demon line floor gate — PP designates thousands of 0.5 props as "demon".
+      // GOTit rule: PP is authority on demon identity BUT GOTit applies elimination
+      // gates. First gate: minimum line by stat type. Demons below floor are
+      // downgraded to standard (kept in DB but not shown in demon section).
+      const DEMON_LINE_FLOORS: Record<string, number> = {
+        'Home Runs':            1.5,
+        'Triples':              1.5,
+        'Stolen Bases':         1.5,
+        'Doubles':              1.5,
+        'Walks':                1.5,
+        'Singles':              1.5,
+        'RBIs':                 1.5,
+        'Runs':                 1.5,
+        'Hits':                 1.5,
+        'Total Bases':          2.5,
+        'Hits+Runs+RBIs':       2.5,
+        'Hitter Fantasy Score': 3.5,
+        'Hitter Strikeouts':    1.5,
+        'Pitcher Strikeouts':   3.5,
+        'Pitching Outs':        9.5,
+        'Pitches Thrown':       59.5,
+        'Earned Runs Allowed':  0.5,
+        'Hits Allowed':         2.5,
+        'Significant Strikes':  25.0,
+        'Takedowns':            1.5,
+        'Plate Appearances':    3.5,
+      };
+
+      let demonDowngraded = 0;
+      const ppProps = ppPropsRaw
+        .map((p: any) => {
+          // Goblins: always keep as-is
+          if (p.isGoblin) return p;
+          // Demons: apply minimum line gate — demote to standard if below floor
+          if (p.isDemon) {
+            const dfloor = DEMON_LINE_FLOORS[p.statType] ?? 1.5;
+            if (p.lineScore < dfloor) {
+              demonDowngraded++;
+              return { ...p, isDemon: false }; // demote — still stored, not in demon section
+            }
+            return p;
+          }
+          // Standard props: apply standard line floor
+          const floor = LINE_FLOORS[p.statType] ?? 1.0;
+          if (p.lineScore < floor) return null;
+          return p;
+        })
+        .filter(Boolean);
+
+      console.log(`[Orchestrator] ${league}: floor filter — ${ppPropsRaw.length} raw → ${ppProps.length} kept | ${demonDowngraded} demons downgraded`);
       if (ppProps.length > 0) {
         state.pp.consecutiveFailures = 0;
         state.pp.rateLimited = false;
