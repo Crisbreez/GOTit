@@ -1153,7 +1153,7 @@ def score_side(
     # ── Edge reason gate ───────────────────────────────────────────────
     # GOTit must produce a strong reason BEFORE it can rank this side.
     # If none fire → has_edge=False → excluded from picks entirely.
-    edge_reasons: List[str] = []
+    edge_reasons = []  # type: List[str]
 
     if is_real and abs(anchor_delta) >= _SHARP_GAP_STRONG:
         edge_reasons.append('sharp_line_gap')
