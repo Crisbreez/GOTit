@@ -1019,12 +1019,12 @@ EDGE_REASONS = {
 }
 
 # Thresholds that constitute a STRONG signal for each reason
-_SHARP_GAP_STRONG   = 0.40   # anchor_delta (in stat units) to call it a real gap
+_SHARP_GAP_STRONG   = 0.35   # anchor_delta (in stat units) to call it a real gap
 _SHADE_CONFIRMED    = True    # shade signal present (lean_over / lean_under)
 _LINE_MOVED_MIN     = 1       # at least 1 confirmed line move
-_HIGH_PWIN_FLOOR    = 0.57    # p_win >= this = strong statistical edge
-_STRONG_ROLE_FLOOR  = 0.80    # w4 >= this = very high role certainty
-_SCRIPT_FIT_FLOOR   = 0.65    # w3 >= this = script strongly favors
+_HIGH_PWIN_FLOOR    = 0.53    # p_win >= this = meaningful statistical edge
+_STRONG_ROLE_FLOOR  = 0.72    # w4 >= this = high role certainty
+_SCRIPT_FIT_FLOOR   = 0.58    # w3 >= this = script favors this stat type
 
 
 @dataclass
