@@ -274,7 +274,7 @@ export const storage: IStorage = {
     const BLOCKED_STANDARD_STATS = new Set([
       'Home Runs', 'Doubles', 'RBIs', 'Singles', 'Walks',
       'Triples', 'Stolen Bases', 'Hitter Strikeouts',
-      'Plate Appearances', 'Pitcher Fantasy Score',
+      'Plate Appearances', 'Pitcher Fantasy Score', 'Runs',
     ]);
     const PAGE = 1000;
     let all: any[] = [];
