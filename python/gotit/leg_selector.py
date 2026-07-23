@@ -1407,16 +1407,24 @@ def solve_game_milp(
         return None
     solver.SetTimeLimit(int(time_limit_sec * 1000))
 
-    lg_map = {lg.prop_id: lg for lg in candidates}
+    # Hard-exclude any candidate with win_score == 0 (no edge reason fired).
+    # These props failed the edge gate and must never enter the MILP.
+    eligible = [lg for lg in candidates if win_score_map.get(lg.prop_id, 0.0) > 0.0]
+    if not eligible:
+        log.info("[MILP] All candidates scored 0 — no edge on any prop, slip rejected")
+        return None
+    log.info("[MILP] %d/%d candidates have edge (score > 0)", len(eligible), len(candidates))
+
+    lg_map = {lg.prop_id: lg for lg in eligible}
     x: Dict[str, pywraplp.Variable] = {
-        lg.prop_id: solver.BoolVar(f"x_{lg.prop_id}") for lg in candidates
+        lg.prop_id: solver.BoolVar(f"x_{lg.prop_id}") for lg in eligible
     }
 
     # ── Must-Win Objective ────────────────────────────────────────────────────
     # Primary: maximize Σ log(p_win) * x   [maximizes product of p_wins]
     # Tiebreaker: + 0.10 * win_score       [market/distribution conviction]
     obj_coeffs = []
-    for lg in candidates:
+    for lg in eligible:
         log_pwin = math.log(max(lg.p_win, 0.001))
         ws = win_score_map.get(lg.prop_id, 0.0)
         obj_coeffs.append((lg.prop_id, log_pwin + 0.10 * ws))
@@ -1428,36 +1436,18 @@ def solve_game_milp(
     # ── Exactly 6 legs ────────────────────────────────────────────────────────
     solver.Add(solver.Sum(list(x.values())) == 6)
 
-    # ── Demon legs: AT MOST 2, gate survivors only, no substitutions ──────────
+    # ── Demon legs: AT MOST 1 per slip, gate survivors only, no substitutions ──
     # Rule: PP is the only authority on demon identity. GOTit applies 4 gates
     # (line floor, sharp sanity, hit-rate floor, role/script quality) and ranks
-    # survivors. Top 2 distinct-player demons enter. If fewer than 2 survive,
-    # we use fewer than 2. NEVER force a bad demon to fill the second slot.
-    demon_vars = [x[lg.prop_id] for lg in candidates if lg.tier == Tier.DEMON]
-    n_qual = len(demon_vars)
-
-    if n_qual == 0:
-        pass  # No demons survived gates — slip has 0 demons, that is correct
-    elif n_qual == 1:
-        solver.Add(solver.Sum(demon_vars) == 1)  # lock the one survivor in
-    else:
-        # 2+ survived — pick exactly 2 distinct players
-        solver.Add(solver.Sum(demon_vars) == 2)
-        demon_player_vars: Dict[str, List] = {}
-        for lg in candidates:
-            if lg.tier == Tier.DEMON:
-                demon_player_vars.setdefault(lg.player_id, []).append(x[lg.prop_id])
-        y_demon: Dict[str, pywraplp.Variable] = {}
-        for pid, vars_ in demon_player_vars.items():
-            y = solver.BoolVar(f"y_demon_{pid}")
-            solver.Add(solver.Sum(vars_) >= y)
-            solver.Add(solver.Sum(vars_) <= 2 * y)
-            y_demon[pid] = y
-        solver.Add(solver.Sum(list(y_demon.values())) == 2)
+    # survivors. Top 1 demon enters the slip. If none survive, slip has 0 demons.
+    # NEVER force a demon to fill the slot.
+    demon_vars = [x[lg.prop_id] for lg in eligible if lg.tier == Tier.DEMON]
+    if demon_vars:
+        solver.Add(solver.Sum(demon_vars) <= 1)  # max 1 demon per slip
 
     # ── ≤ 3 legs per player ───────────────────────────────────────────────────
     player_vars: Dict[str, List] = {}
-    for lg in candidates:
+    for lg in eligible:
         player_vars.setdefault(lg.player_id, []).append(x[lg.prop_id])
     for vars_ in player_vars.values():
         solver.Add(solver.Sum(vars_) <= 3)
@@ -1466,8 +1456,8 @@ def solve_game_milp(
     # Skip direction cap when candidates are mostly one-directional (e.g. MLB
     # fantasy score boards that are all OVER). Enforce cap only when at least
     # 4 candidates exist in the minority direction.
-    over_vars  = [x[lg.prop_id] for lg in candidates if lg.direction == Direction.OVER]
-    under_vars = [x[lg.prop_id] for lg in candidates if lg.direction == Direction.UNDER]
+    over_vars  = [x[lg.prop_id] for lg in eligible if lg.direction == Direction.OVER]
+    under_vars = [x[lg.prop_id] for lg in eligible if lg.direction == Direction.UNDER]
     if over_vars and len(under_vars) >= 4:
         solver.Add(solver.Sum(over_vars) <= 5)   # allow up to 5 of 6 same direction
     if under_vars and len(over_vars) >= 4:
@@ -1475,7 +1465,7 @@ def solve_game_milp(
 
     # ── ≥ 2 distinct stat categories ──────────────────────────────────────────
     stat_vars: Dict[str, List] = {}
-    for lg in candidates:
+    for lg in eligible:
         stat_vars.setdefault(lg.stat_type, []).append(x[lg.prop_id])
     z_stat: Dict[str, pywraplp.Variable] = {}
     for stat, vars_ in stat_vars.items():
@@ -1488,11 +1478,11 @@ def solve_game_milp(
     # ── Stat-type caps: prevent any single stat from dominating the slip ──────
     # HFS and Significant Strikes are composite stats with correlated failure modes.
     # Cap them at 2 per slip to force diversification across stat types.
-    hfs_vars = [x[lg.prop_id] for lg in candidates if lg.stat_type == 'Hitter Fantasy Score']
+    hfs_vars = [x[lg.prop_id] for lg in eligible if lg.stat_type == 'Hitter Fantasy Score']
     if len(hfs_vars) > 2:
         solver.Add(solver.Sum(hfs_vars) <= 2)
 
-    sig_vars = [x[lg.prop_id] for lg in candidates if lg.stat_type == 'Significant Strikes']
+    sig_vars = [x[lg.prop_id] for lg in eligible if lg.stat_type == 'Significant Strikes']
     if len(sig_vars) > 2:
         solver.Add(solver.Sum(sig_vars) <= 2)
 
@@ -1505,7 +1495,7 @@ def solve_game_milp(
     # Standard legs: must clear the must-win floor (0.57).
     # Demon legs already passed qualify_demons 4-gate chain; use demon floor (0.53).
     # Goblin legs: treated as lower-tier standards — use r_star_6 floor.
-    for lg in candidates:
+    for lg in eligible:
         if lg.tier == Tier.STANDARD:
             if lg.p_win < STANDARD_PWIN_FLOOR:
                 solver.Add(x[lg.prop_id] == 0)

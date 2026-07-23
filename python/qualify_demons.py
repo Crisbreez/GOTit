@@ -209,28 +209,46 @@ def main():
     # Sort by composite descending
     scored.sort(key=lambda t: t[0], reverse=True)
 
-    # Top 2 distinct players only
+    # Top 1 distinct player only (MILP enforces max 1 demon per slip)
     seen_players: set = set()
-    top2 = []
+    top1 = []
     for composite, d in scored:
         player = d.get('playerName', '')
         if player in seen_players:
             continue
         seen_players.add(player)
-        top2.append({
+        p_win = round(_estimate_p_win(float(d.get('lineScore') or 0), d.get('statType', '')), 4)
+        # Demon justification — must log a reason before the demon is eligible
+        stat  = d.get('statType', '')
+        line  = d.get('lineScore', 0)
+        reasons = []
+        if p_win >= 0.60:
+            reasons.append('high_demon_pwin')
+        if composite >= 0.65:
+            reasons.append('strong_composite')
+        if float(line) >= DEMON_LINE_FLOORS.get(stat, DEMON_LINE_FLOORS.get('_default', 1.0)) * 1.5:
+            reasons.append('line_well_above_floor')
+        if not reasons:
+            # No strong justification — skip this demon
+            import sys as _sys
+            print(f"[qualify_demons] SKIP {player} {stat} {line} — no strong demon justification", file=_sys.stderr)
+            continue
+        print(f"[qualify_demons] ACCEPT {player} {stat} {line} composite={composite} reasons={reasons}", file=__import__('sys').stderr)
+        top1.append({
             **d,
             'isDemon': True,
             'demonScore': {
                 'composite': composite,
-                'p_win': round(_estimate_p_win(float(d.get('lineScore') or 0), d.get('statType', '')), 4),
-                'line': d.get('lineScore'),
-                'stat': d.get('statType'),
+                'p_win': p_win,
+                'line': line,
+                'stat': stat,
+                'reasons': reasons,
             }
         })
-        if len(top2) == 2:
+        if len(top1) == 1:
             break
 
-    print(json.dumps(top2))
+    print(json.dumps(top1))
 
 
 if __name__ == '__main__':
