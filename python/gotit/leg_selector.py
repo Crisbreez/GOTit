@@ -420,6 +420,7 @@ class LegCandidate:
     sharp_fair_line:  Optional[float] = None  # SGO fair line if available
     line_move_count:  int = 0                 # how many times PP moved this line
     first_seen_line:  Optional[float] = None  # line when first pulled this session
+    edge_reasons:     List[str] = field(default_factory=list)  # populated by score_side
 
     @property
     def family(self) -> DistFamily:
@@ -1005,6 +1006,27 @@ def adjust_distribution(
     return mu_star, sigma_star
 
 
+# ── Edge reason codes ───────────────────────────────────────────────────────
+# A prop must produce at least ONE strong reason to move off 50/50.
+# If none fire, the prop is no_edge and excluded from picks.
+EDGE_REASONS = {
+    'sharp_line_gap':   'Sharp market sets fair line well away from PP line',
+    'shade_confirmed':  'PP shaded this line — market agrees direction',
+    'line_moved':       'PP moved this line confirming our direction',
+    'high_p_win':       'Statistical model gives strong win probability',
+    'strong_role':      'Player role certainty is very high',
+    'script_fit':       'Game script strongly favors this stat type',
+}
+
+# Thresholds that constitute a STRONG signal for each reason
+_SHARP_GAP_STRONG   = 0.40   # anchor_delta (in stat units) to call it a real gap
+_SHADE_CONFIRMED    = True    # shade signal present (lean_over / lean_under)
+_LINE_MOVED_MIN     = 1       # at least 1 confirmed line move
+_HIGH_PWIN_FLOOR    = 0.57    # p_win >= this = strong statistical edge
+_STRONG_ROLE_FLOOR  = 0.80    # w4 >= this = very high role certainty
+_SCRIPT_FIT_FLOOR   = 0.65    # w3 >= this = script strongly favors
+
+
 @dataclass
 class ScriptedCandidate:
     """Output of score_side() — one evaluated direction for a standard/goblin leg."""
@@ -1020,6 +1042,8 @@ class ScriptedCandidate:
     line_value:           float   # W5
     payout_boost:         float   # W6
     scripted_winner_score: float  # final 0-1
+    edge_reasons:         List[str] = field(default_factory=list)  # reasons this side has edge
+    has_edge:             bool = True   # False = no strong reason found, excluded from picks
 
 
 @dataclass
@@ -1126,6 +1150,30 @@ def score_side(
         0.0, 1.0,
     ))
 
+    # ── Edge reason gate ───────────────────────────────────────────────
+    # GOTit must produce a strong reason BEFORE it can rank this side.
+    # If none fire → has_edge=False → excluded from picks entirely.
+    edge_reasons: List[str] = []
+
+    if is_real and abs(anchor_delta) >= _SHARP_GAP_STRONG:
+        edge_reasons.append('sharp_line_gap')
+    if not is_real and cand.pp_shade_signal in ('lean_over', 'lean_under'):
+        edge_reasons.append('shade_confirmed')
+    if cand.line_move_count >= _LINE_MOVED_MIN and cand.first_seen_line is not None:
+        moved_up = cand.line > cand.first_seen_line
+        move_confirms = (moved_up and direction == Direction.OVER) or \
+                        (not moved_up and direction == Direction.UNDER)
+        if move_confirms:
+            edge_reasons.append('line_moved')
+    if p_win >= _HIGH_PWIN_FLOOR:
+        edge_reasons.append('high_p_win')
+    if w4 >= _STRONG_ROLE_FLOOR:
+        edge_reasons.append('strong_role')
+    if w3 >= _SCRIPT_FIT_FLOOR:
+        edge_reasons.append('script_fit')
+
+    has_edge = len(edge_reasons) > 0
+
     return ScriptedCandidate(
         prop_id=cand.prop_id,
         player_name=cand.player_name,
@@ -1139,6 +1187,8 @@ def score_side(
         line_value=round(w5, 4),
         payout_boost=round(w6, 4),
         scripted_winner_score=round(score, 4),
+        edge_reasons=edge_reasons,
+        has_edge=has_edge,
     )
 
 
@@ -1721,10 +1771,20 @@ def select_legs_for_slate(
             else:
                 if sc_c:
                     sc_result = score_side(c, c.direction, sc_c, dnp_p, game_script, family, {})
-                    win_score_map[c.prop_id] = sc_result.scripted_winner_score
-                    c.ev_corr_adj = sc_result.scripted_winner_score
-                    # Update p_win with script-adjusted value
-                    c.p_win = sc_result.p_win
+                    # Edge gate: if GOTit cannot produce a strong reason, score=0
+                    # so MILP will never select this leg.
+                    if not sc_result.has_edge:
+                        log.info("[no_edge] %s %s %.1f %s — no strong reason, excluded",
+                                 c.player_name, c.stat_type, c.line, c.direction.value)
+                        win_score_map[c.prop_id] = 0.0
+                        c.ev_corr_adj = 0.0
+                    else:
+                        win_score_map[c.prop_id] = sc_result.scripted_winner_score
+                        c.ev_corr_adj = sc_result.scripted_winner_score
+                        # Update p_win with script-adjusted value
+                        c.p_win = sc_result.p_win
+                    # Always store reasons for transparency
+                    c.edge_reasons = sc_result.edge_reasons
                 else:
                     win_score_map[c.prop_id] = 0.0
 
@@ -1758,6 +1818,7 @@ def select_legs_for_slate(
                 "p_win":       round(lg.p_win, 4),
                 "ev_marginal": round(lg.ev_marginal, 6),
                 "ev_corr_adj": round(lg.ev_corr_adj, 6),
+                "edge_reasons": lg.edge_reasons,  # why GOTit picked this side
             }
             # For demons, attach the 5-layer qualification score
             if lg.tier == Tier.DEMON:

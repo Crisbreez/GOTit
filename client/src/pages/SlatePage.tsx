@@ -335,6 +335,28 @@ function PropRow({ prop, isSelected, onToggle, disabled }: {
             </div>
           );
         })()}
+        {/* Edge reasons — why GOTit picked this side */}
+        {(() => {
+          const reasons: string[] = (prop as any).edgeReasons ?? [];
+          if (reasons.length === 0) return null;
+          const labelMap: Record<string, string> = {
+            sharp_line_gap:  'Sharp Gap',
+            shade_confirmed: 'Shade Confirmed',
+            line_moved:      'Line Moved',
+            high_p_win:      'High Win %',
+            strong_role:     'Strong Role',
+            script_fit:      'Script Fit',
+          };
+          return (
+            <div style={{ display: 'flex', gap: 3, marginTop: 2, flexWrap: 'wrap' }}>
+              {reasons.map(r => (
+                <span key={r} style={{ fontSize: '0.50rem', fontWeight: 700, letterSpacing: '0.05em', textTransform: 'uppercase', color: 'hsl(45 90% 65%)', background: 'hsl(45 90% 60% / 0.10)', padding: '1px 4px', borderRadius: 5, border: '1px solid hsl(45 90% 60% / 0.25)' }}>
+                  {labelMap[r] ?? r}
+                </span>
+              ))}
+            </div>
+          );
+        })()}
       </div>
 
       {/* Line + direction badge */}
