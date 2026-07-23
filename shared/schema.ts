@@ -30,6 +30,16 @@ export const props = sqliteTable("props", {
   ppDisplayStat: text("pp_display_stat"),         // stat type exactly as PP returns it
   ppDisplayTeam: text("pp_display_team"),         // team abbr/name exactly as PP returns it
   ppEventTitle: text("pp_event_title"),           // event title from PP (MMA event name etc)
+  // Line movement tracking
+  firstSeenLine: real("first_seen_line"),          // line when first pulled
+  firstSeenAt: text("first_seen_at"),              // ISO timestamp of first pull
+  lastSeenAt: text("last_seen_at"),               // ISO timestamp of most recent pull
+  lineMoveCount: integer("line_move_count").default(0), // how many times line changed
+  // Sharp market signals (written by sharp_pull.py)
+  sharpFairLine: real("sharp_fair_line"),          // SGO fair line
+  sharpOverJuice: real("sharp_over_juice"),        // SGO juice on over side
+  sharpUnderJuice: real("sharp_under_juice"),      // SGO juice on under side
+  ppShadeSignal: text("pp_shade_signal"),          // 'lean_over' | 'lean_under' | 'neutral' | 'no_data'
 });
 
 // ── Slips ────────────────────────────────────────────────────────────────────

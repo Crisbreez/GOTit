@@ -27,17 +27,40 @@ function spawnSharpPull(league: string, props: any[]): void {
   child.stdin.write(payload);
   child.stdin.end();
 
-  child.on('close', (code: number | null) => {
+  child.on('close', async (code: number | null) => {
     if (code !== 0) {
       console.error(`[sharp] pull exited ${code}:`, err.slice(0, 300));
       return;
     }
     try {
       const result = JSON.parse(out);
-      if (result.ok) {
-        console.log(`[sharp] ${result.matched}/${result.total} props matched for ${result.league}`);
-      } else {
+      if (!result.ok) {
         console.error('[sharp] pull failed:', result.error);
+        return;
+      }
+      console.log(`[sharp] ${result.matched}/${result.total} props matched for ${result.league}`);
+
+      // Stamp sharp signals onto props and re-upsert so DB has sharpFairLine + ppShadeSignal
+      const enrichments: Array<{id:string; sharpFairLine?:number; ppShadeSignal:string; marketDelta?:number}>
+        = result.enrichments || [];
+      if (enrichments.length > 0) {
+        const enrichMap = new Map(enrichments.map((e: any) => [e.id, e]));
+        const enrichedProps = props.map((p: any) => {
+          const e = enrichMap.get(p.id);
+          if (!e) return p;
+          return {
+            ...p,
+            sharpFairLine:  e.sharpFairLine  ?? null,
+            ppShadeSignal:  e.ppShadeSignal  ?? 'no_data',
+            marketDelta:    e.marketDelta    ?? null,
+          };
+        });
+        try {
+          await storage.upsertProps(enrichedProps);
+          console.log(`[sharp] stamped sharp signals on ${enrichedProps.length} props`);
+        } catch (e: any) {
+          console.error('[sharp] re-upsert failed:', e.message);
+        }
       }
     } catch {
       console.error('[sharp] non-JSON output:', out.slice(0, 200));

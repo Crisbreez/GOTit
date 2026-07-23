@@ -215,6 +215,11 @@ def build_pp_prop(d: dict) -> PPProp:
         correlation_partners=[],
         stored_direction=stored_dir,
         perf=d.get('_perf'),  # injected by main() from player_performance
+        # Sharp market signals from DB
+        pp_shade_signal=d.get('ppShadeSignal') or d.get('pp_shade_signal') or 'no_data',
+        sharp_fair_line=d.get('sharpFairLine') or d.get('sharp_fair_line') or None,
+        line_move_count=int(d.get('lineMoveCount') or d.get('line_move_count') or 0),
+        first_seen_line=d.get('firstSeenLine') or d.get('first_seen_line') or None,
     )
 
 

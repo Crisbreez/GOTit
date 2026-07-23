@@ -224,6 +224,11 @@ class PPProp:
     stored_direction:     Direction = Direction.OVER
     # Learning loop: injected by optimize.py from player_performance table
     perf: Optional[Dict] = None  # {hitCount, missCount, last5, avgMargin} or None
+    # Sharp market signals — injected from DB at optimize time
+    pp_shade_signal:  str = 'no_data'   # 'lean_over' | 'lean_under' | 'neutral' | 'no_data'
+    sharp_fair_line:  Optional[float] = None
+    line_move_count:  int = 0
+    first_seen_line:  Optional[float] = None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -410,6 +415,11 @@ class LegCandidate:
     perf_hit_rate:    Optional[float] = None  # lifetime hit rate (0.0-1.0), None = no history
     perf_last5_hits:  int = 0                 # hits in last 5 settled legs
     perf_sample_size: int = 0                 # total settled legs (hit+miss)
+    # PP shade signal from sharp comparison (set at ingest)
+    pp_shade_signal:  str = 'no_data'         # 'lean_over' | 'lean_under' | 'neutral' | 'no_data'
+    sharp_fair_line:  Optional[float] = None  # SGO fair line if available
+    line_move_count:  int = 0                 # how many times PP moved this line
+    first_seen_line:  Optional[float] = None  # line when first pulled this session
 
     @property
     def family(self) -> DistFamily:
@@ -1049,12 +1059,36 @@ def score_side(
 
     # W1 is embedded in p_win itself (p_win IS the primary win signal)
     # W2: market agreement — anchor delta after script adjustment
+    # Start from 50/50 baseline. Shift based on:
+    #   1. Sharp median vs PP line (real SGO data when available)
+    #   2. Stored pp_shade_signal as fallback when no fresh sharp data
     if direction == Direction.OVER:
         anchor_delta = sc.median - cand.line
     else:
         anchor_delta = cand.line - sc.median
     is_real = sc.freshness_sec < 9000.0
-    w2 = float(np.clip(0.5 + anchor_delta / 1.0, 0.0, 1.0)) if is_real else 0.40
+
+    if is_real:
+        # Real sharp data — use it directly
+        w2 = float(np.clip(0.5 + anchor_delta / 1.0, 0.0, 1.0))
+    else:
+        # No fresh sharp data — use stored pp_shade_signal as market proxy
+        shade = cand.pp_shade_signal
+        if shade == 'lean_over':
+            w2 = 0.62 if direction == Direction.OVER else 0.38
+        elif shade == 'lean_under':
+            w2 = 0.38 if direction == Direction.OVER else 0.62
+        else:
+            w2 = 0.50  # true 50/50 baseline when no signal
+
+    # Line movement boost: if PP moved the line in the direction we're betting,
+    # that's confirmation. +0.03 per move, capped at +0.09.
+    if cand.line_move_count > 0 and cand.first_seen_line is not None:
+        moved_up = cand.line > cand.first_seen_line
+        move_confirms = (moved_up and direction == Direction.OVER) or \
+                        (not moved_up and direction == Direction.UNDER)
+        move_bonus = min(cand.line_move_count * 0.03, 0.09)
+        w2 = float(np.clip(w2 + (move_bonus if move_confirms else -move_bonus), 0.0, 1.0))
 
     # W3: script_fit — how well this stat type benefits from today's environment
     pace_sign  = _STAT_PACE_SIGN.get(cand.stat_type, +1)
@@ -1571,6 +1605,11 @@ def select_legs_for_slate(
                     perf_hit_rate=lifetime_rate,
                     perf_last5_hits=last5_hits,
                     perf_sample_size=total_s,
+                    # Sharp market signals from PPProp
+                    pp_shade_signal=pp.pp_shade_signal,
+                    sharp_fair_line=pp.sharp_fair_line,
+                    line_move_count=pp.line_move_count,
+                    first_seen_line=pp.first_seen_line,
                 )
 
                 # Score UNDER standard legs; drop those that fail keep gate

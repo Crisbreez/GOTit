@@ -307,6 +307,34 @@ function PropRow({ prop, isSelected, onToggle, disabled }: {
           {prop.statType}
           {isGoblin && <span style={{ marginLeft: 6, fontSize: '0.55rem', fontWeight: 800, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'hsl(270 60% 70%)', background: 'hsl(270 60% 60% / 0.15)', padding: '1px 5px', borderRadius: 8 }}>GOB</span>}
         </div>
+        {/* PP Shade Signal label */}
+        {(() => {
+          const shade = (prop as any).ppShadeSignal;
+          const moveCount = (prop as any).lineMoveCount ?? 0;
+          const firstLine = (prop as any).firstSeenLine;
+          const currentLine = prop.lineScore;
+          const moved = firstLine != null && firstLine !== currentLine;
+          if (!shade || shade === 'no_data') return null;
+          const shadeConfig: Record<string, {label: string; color: string; bg: string}> = {
+            lean_over:  { label: 'PP Shaded Over',  color: 'hsl(142 72% 50%)', bg: 'hsl(142 72% 46% / 0.12)' },
+            lean_under: { label: 'PP Shaded Under', color: 'hsl(210 80% 65%)', bg: 'hsl(210 80% 60% / 0.12)' },
+            neutral:    { label: 'PP Neutral',       color: 'hsl(var(--muted-foreground))', bg: 'hsl(var(--g-surface-2))' },
+          };
+          const cfg = shadeConfig[shade];
+          if (!cfg) return null;
+          return (
+            <div style={{ display: 'flex', gap: 4, marginTop: 2, flexWrap: 'wrap' }}>
+              <span style={{ fontSize: '0.52rem', fontWeight: 800, letterSpacing: '0.06em', textTransform: 'uppercase', color: cfg.color, background: cfg.bg, padding: '1px 5px', borderRadius: 6, border: `1px solid ${cfg.color}30` }}>
+                {cfg.label}
+              </span>
+              {moved && (
+                <span style={{ fontSize: '0.52rem', fontWeight: 800, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'hsl(45 90% 60%)', background: 'hsl(45 90% 60% / 0.12)', padding: '1px 5px', borderRadius: 6, border: '1px solid hsl(45 90% 60% / 0.3)' }}>
+                  {currentLine > firstLine ? '↑ Moved Up' : '↓ Moved Down'} ×{moveCount}
+                </span>
+              )}
+            </div>
+          );
+        })()}
       </div>
 
       {/* Line + direction badge */}

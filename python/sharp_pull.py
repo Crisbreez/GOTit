@@ -64,11 +64,37 @@ def main():
         if sc.freshness_sec < 9999.0
     )
 
+    # Build per-prop sharp enrichment to send back to Express.
+    # Express will stamp sharpFairLine / ppShadeSignal on each prop before upsert.
+    prop_enrichments = []
+    for d in props_data:
+        prop_id = d.get('id', '')
+        sc = consensus.get(prop_id)
+        if sc and sc.freshness_sec < 9999.0:
+            pp_line = float(d.get('lineScore') or 0)
+            fair_line = sc.median
+            delta = pp_line - fair_line
+            if delta > 0.3:
+                shade = 'lean_under'
+            elif delta < -0.3:
+                shade = 'lean_over'
+            else:
+                shade = 'neutral'
+            prop_enrichments.append({
+                'id': prop_id,
+                'sharpFairLine': round(fair_line, 3),
+                'ppShadeSignal': shade,
+                'marketDelta': round(delta, 3),
+            })
+        else:
+            prop_enrichments.append({'id': prop_id, 'ppShadeSignal': 'no_data'})
+
     print(json.dumps({
         "ok": True,
         "league": league,
         "matched": matched,
         "total": len(pp_props),
+        "enrichments": prop_enrichments,
     }))
 
 

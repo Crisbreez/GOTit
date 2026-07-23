@@ -172,32 +172,78 @@ export const storage: IStorage = {
     console.log(`[storage] upsertProps: ${rows.length} raw → ${deduped.length} after dedup (pass1=${exactMap.size})`);
     rows = deduped;
 
-    const dbRows = rows.map(r => ({
-      id: r.id,
-      league: r.league,
-      player_name: r.playerName,
-      team_abbr: r.teamAbbr ?? null,
-      stat_type: r.statType,
-      line_score: r.lineScore,
-      direction: r.direction,
-      is_demon: r.isDemon ?? false,
-      is_goblin: r.isGoblin ?? false,
-      is_synthetic: r.isSynthetic ?? false,
-      game_id: r.gameId ?? null,
-      game_matchup: r.gameMatchup ?? null,
-      game_start_time: r.gameStartTime ?? null,
-      confidence_level: r.confidenceLevel ?? 3,
-      prop_score: r.propScore ?? 0,
-      reject_reason: r.rejectReason ?? null,
-      script_label: r.scriptLabel ?? null,
-      pulled_at: r.pulledAt ?? null,
-      source: r.source ?? null,
-      pp_display_matchup: r.ppDisplayMatchup ?? null,
-      pp_display_player: r.ppDisplayPlayer ?? null,
-      pp_display_stat: r.ppDisplayStat ?? null,
-      pp_display_team: r.ppDisplayTeam ?? null,
-      pp_event_title: r.ppEventTitle ?? null,
-    }));
+    // ── Line movement tracking ────────────────────────────────────────────────
+    // For each prop, check if it already exists in DB. If it does:
+    //   - preserve firstSeenLine and firstSeenAt
+    //   - increment lineMoveCount if line changed
+    // If it's new: set firstSeenLine = lineScore, firstSeenAt = now
+    const now = new Date().toISOString();
+    const existingIds = rows.map(r => r.id);
+    let existingMap: Map<string, any> = new Map();
+    if (existingIds.length > 0) {
+      try {
+        const { data: existingRows } = await db
+          .from('props')
+          .select('id, first_seen_line, first_seen_at, line_score, line_move_count')
+          .in('id', existingIds.slice(0, 500));
+        for (const ex of (existingRows || [])) existingMap.set(ex.id, ex);
+      } catch (_) { /* non-critical — skip tracking if lookup fails */ }
+    }
+
+    const dbRows = rows.map(r => {
+      const ex = existingMap.get(r.id);
+      const firstSeenLine = ex?.first_seen_line ?? r.lineScore;
+      const firstSeenAt   = ex?.first_seen_at   ?? now;
+      const prevLine      = ex?.line_score ?? r.lineScore;
+      const lineChanged   = ex && (prevLine !== r.lineScore);
+      const lineMoveCount = (ex?.line_move_count ?? 0) + (lineChanged ? 1 : 0);
+
+      // PP shade signal: compare PP line to sharp fair line
+      let ppShadeSignal: string = 'no_data';
+      if (r.sharpFairLine != null) {
+        const delta = r.lineScore - r.sharpFairLine;
+        if (delta > 0.3)       ppShadeSignal = 'lean_under'; // PP line high vs sharp → under has edge
+        else if (delta < -0.3) ppShadeSignal = 'lean_over';  // PP line low vs sharp → over has edge
+        else                   ppShadeSignal = 'neutral';
+      }
+
+      return {
+        id: r.id,
+        league: r.league,
+        player_name: r.playerName,
+        team_abbr: r.teamAbbr ?? null,
+        stat_type: r.statType,
+        line_score: r.lineScore,
+        direction: r.direction,
+        is_demon: r.isDemon ?? false,
+        is_goblin: r.isGoblin ?? false,
+        is_synthetic: r.isSynthetic ?? false,
+        game_id: r.gameId ?? null,
+        game_matchup: r.gameMatchup ?? null,
+        game_start_time: r.gameStartTime ?? null,
+        confidence_level: r.confidenceLevel ?? 3,
+        prop_score: r.propScore ?? 0,
+        reject_reason: r.rejectReason ?? null,
+        script_label: r.scriptLabel ?? null,
+        pulled_at: r.pulledAt ?? null,
+        source: r.source ?? null,
+        pp_display_matchup: r.ppDisplayMatchup ?? null,
+        pp_display_player: r.ppDisplayPlayer ?? null,
+        pp_display_stat: r.ppDisplayStat ?? null,
+        pp_display_team: r.ppDisplayTeam ?? null,
+        pp_event_title: r.ppEventTitle ?? null,
+        // Line movement
+        first_seen_line: firstSeenLine,
+        first_seen_at:   firstSeenAt,
+        last_seen_at:    now,
+        line_move_count: lineMoveCount,
+        // Sharp signals
+        sharp_fair_line:  r.sharpFairLine  ?? null,
+        sharp_over_juice: r.sharpOverJuice ?? null,
+        sharp_under_juice:r.sharpUnderJuice?? null,
+        pp_shade_signal:  ppShadeSignal,
+      };
+    });
 
     const CHUNK = 500;
     for (let i = 0; i < dbRows.length; i += CHUNK) {
