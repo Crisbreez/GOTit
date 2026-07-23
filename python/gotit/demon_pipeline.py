@@ -118,9 +118,14 @@ PROB_CEILING = 0.92
 
 # Locked-role stat types (role_pass auto-passes with no role data)
 LOCKED_ROLE_STATS = {
+    # Pitching stats — starter role locked by definition
     'Pitcher Strikeouts', 'Pitches Thrown', 'Pitching Outs',
     'Hits Allowed', 'Earned Runs Allowed', 'Pitcher Fantasy Score',
-    'Significant Strikes', 'Fight Time', 'Takedowns',
+    'Significant Strikes', 'Walks Allowed',
+    # Hitting stats — requires a starting lineup spot (locked role)
+    'Total Bases', 'Hitter Fantasy Score',
+    # Combat sports — fighter always participates
+    'Fight Time', 'Takedowns',
 }
 
 SCORE_FLOOR = 0.001
