@@ -254,6 +254,39 @@ def main():
         print(json.dumps({"error": "no non-demon props to optimize"}))
         sys.exit(0)
 
+    # Hard line floor gate — second check at optimize time.
+    # Goblins bypass floors. Everything else must clear the floor.
+    STD_FLOORS = {
+        'Total Bases': 2.5, 'Hits+Runs+RBIs': 2.5, 'Pitcher Strikeouts': 3.5,
+        'Pitches Thrown': 70.0, 'Pitcher Fantasy Score': 25.0,
+        'Hitter Fantasy Score': 5.5, 'Significant Strikes': 25.0,
+        'Takedowns': 1.5, 'Fight Time': 8.0,
+        'Singles': 1.0, 'Hits': 1.0, 'Runs': 1.0, 'RBIs': 1.0,
+        'Walks': 1.0, 'Hitter Strikeouts': 1.0,
+        'Plate Appearances': 999.0,  # never pick PA over — excluded stat
+        '_default': 1.0,
+    }
+    # Also block PA unders — they're excluded entirely
+    EXCLUDED_UNDER_STATS = {
+        'Plate Appearances', 'Singles', 'Runs', 'RBIs', 'Walks',
+        'Hitter Strikeouts', 'Home Runs', 'Triples', 'Stolen Bases',
+    }
+    def _passes_floor(d: dict) -> bool:
+        if d.get('isGoblin'):
+            return True  # goblins bypass floors
+        stat = d.get('statType', '')
+        direction = d.get('direction', 'over')
+        line = float(d.get('lineScore') or 0)
+        if direction == 'under' and stat in EXCLUDED_UNDER_STATS:
+            return False
+        floor = STD_FLOORS.get(stat, STD_FLOORS['_default'])
+        return line >= floor
+
+    props_data = [d for d in props_data if _passes_floor(d)]
+    if not props_data:
+        print(json.dumps({"error": "no props passed line floor gate"}))
+        sys.exit(0)
+
     # ── Load player performance (learning loop) ─────────────────────────────
     # Determine league from the first prop so we look up the right rows
     first_league = (props_data[0].get('league') or '').upper() if props_data else ''
