@@ -50,7 +50,7 @@ def main() -> None:
     result = run_demon_pipeline(
         raw_props=props_data,
         sharp_map=sharp_map,
-        max_demons=1,   # MILP enforces max 1 demon per slip
+        max_demons=2,   # always return 2 distinct-player demons
     )
 
     print(json.dumps(result))
