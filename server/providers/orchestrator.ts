@@ -195,6 +195,14 @@ export async function orchestratePull(league: string, forceRefresh = false): Pro
       console.log(`[Orchestrator] ${league}: attempting PrizePicks`);
       const ppPropsRaw = await pullPrizePicks(league);
       // ── Line floor gate — applied at ingest so trash props never hit DB ──
+      // Stats blocked entirely from standard picks — proven losers or no-edge stats.
+      // Goblins bypass this (discount lines are fine). Demons are separate pipeline.
+      const BLOCKED_STANDARD_STATS = new Set([
+        'Home Runs', 'Doubles', 'RBIs', 'Singles', 'Walks',
+        'Triples', 'Stolen Bases', 'Hitter Strikeouts',
+        'Plate Appearances', 'Pitcher Fantasy Score',
+      ]);
+
       // Mirrors _STANDARD_LINE_FLOOR in leg_selector.py. Demons/goblins exempted
       // because their line is set by PP and we still want to show them.
       const LINE_FLOORS: Record<string, number> = {
@@ -251,7 +259,8 @@ export async function orchestratePull(league: string, forceRefresh = false): Pro
             }
             return p;
           }
-          // Standard props (including synthetic unders): apply standard line floor
+          // Standard props: block trash stats entirely, then apply line floor
+          if (BLOCKED_STANDARD_STATS.has(p.statType)) return null;
           const floor = LINE_FLOORS[p.statType] ?? 1.0;
           if (p.lineScore < floor) return null;
           return p;
