@@ -34,6 +34,10 @@ DEMON_EXCLUDED_STATS = {
     'Pitcher Strikeouts (Combo)',
     '1st Inning Walks Allowed',
     'Triples',
+    # Proven losers from 14-slip audit
+    'RBIs',          # 100% miss rate
+    'Singles',        # 100% miss rate as demon
+    'Hits+Runs+RBIs', # 100% miss rate as demon
 }
 
 # ── Min line floors per stat (gate 1) ────────────────────────────────────────
@@ -49,7 +53,7 @@ DEMON_LINE_FLOOR: Dict[str, float] = {
     'Hits':                 1.5,
     'Total Bases':          2.5,
     'Hits+Runs+RBIs':       2.5,
-    'Hitter Fantasy Score': 5.5,
+    'Hitter Fantasy Score': 25.0,  # only elite HFS demons qualify (Ohtani/Judge tier)
     'Hitter Strikeouts':    1.5,
     'Pitcher Strikeouts':   3.5,
     'Pitching Outs':        9.5,
