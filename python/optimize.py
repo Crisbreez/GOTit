@@ -267,13 +267,16 @@ def main():
         'Fight Time':           8.0,
         'Hits':                 1.0,
         'Runs':                 1.0,
-        'Walks':                1.0,
-        'Hitter Strikeouts':    1.0,
-        # Blocked entirely — miss rates too high across all samples
+        # Blocked entirely — excluded or proven losers
         'Plate Appearances':    999.0,  # excluded stat
         'Singles':              999.0,  # 83% miss rate
         'RBIs':                 999.0,  # 100% miss rate
         'Pitcher Fantasy Score':999.0,  # 100% miss rate
+        'Home Runs':            999.0,  # near-impossible to guarantee
+        'Walks':                999.0,  # too pitcher-dependent, high variance
+        'Triples':              999.0,  # rarest hit in baseball
+        'Stolen Bases':         999.0,  # situational, unpredictable
+        'Hitter Strikeouts':    999.0,  # pitcher-dependent, not player skill
         '_default':             1.0,
     }
     # Also block PA unders — they're excluded entirely
