@@ -257,14 +257,24 @@ def main():
     # Hard line floor gate — second check at optimize time.
     # Goblins bypass floors. Everything else must clear the floor.
     STD_FLOORS = {
-        'Total Bases': 2.5, 'Hits+Runs+RBIs': 2.5, 'Pitcher Strikeouts': 3.5,
-        'Pitches Thrown': 70.0, 'Pitcher Fantasy Score': 25.0,
-        'Hitter Fantasy Score': 5.5, 'Significant Strikes': 25.0,
-        'Takedowns': 1.5, 'Fight Time': 8.0,
-        'Singles': 1.0, 'Hits': 1.0, 'Runs': 1.0, 'RBIs': 1.0,
-        'Walks': 1.0, 'Hitter Strikeouts': 1.0,
-        'Plate Appearances': 999.0,  # never pick PA over — excluded stat
-        '_default': 1.0,
+        'Total Bases':          2.5,
+        'Hits+Runs+RBIs':       2.5,
+        'Pitcher Strikeouts':   3.5,
+        'Pitches Thrown':       70.0,
+        'Hitter Fantasy Score': 7.0,   # raised from 5.5 — 60%+ miss at 5.5-6.5
+        'Significant Strikes':  25.0,
+        'Takedowns':            1.5,
+        'Fight Time':           8.0,
+        'Hits':                 1.0,
+        'Runs':                 1.0,
+        'Walks':                1.0,
+        'Hitter Strikeouts':    1.0,
+        # Blocked entirely — miss rates too high across all samples
+        'Plate Appearances':    999.0,  # excluded stat
+        'Singles':              999.0,  # 83% miss rate
+        'RBIs':                 999.0,  # 100% miss rate
+        'Pitcher Fantasy Score':999.0,  # 100% miss rate
+        '_default':             1.0,
     }
     # Also block PA unders — they're excluded entirely
     EXCLUDED_UNDER_STATS = {
