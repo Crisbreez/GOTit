@@ -1608,12 +1608,12 @@ def select_legs_for_slate(
             # (Checks all props for this player in the same game batch, not just current.)
             if tier == Tier.STANDARD:
                 all_player_props = [
-                    p for p in props
+                    p for p in pp_props
                     if p.player_id == pp.player_id
-                    and not p.is_demon and not p.is_goblin
+                    and Tier.STANDARD in p.tiers_offered
                 ]
                 has_meaningful = any(
-                    p.line_score >= _STANDARD_LINE_FLOOR.get(p.stat_type, _STANDARD_LINE_FLOOR["_default"])
+                    p.lines.get(Tier.STANDARD, 0) >= _STANDARD_LINE_FLOOR.get(p.stat_type, _STANDARD_LINE_FLOOR["_default"])
                     for p in all_player_props
                 )
                 if not has_meaningful:
