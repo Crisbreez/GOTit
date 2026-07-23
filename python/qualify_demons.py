@@ -35,9 +35,15 @@ DEMON_EXCLUDED_STATS = {
     '1st Inning Walks Allowed',
     'Triples',
     # Proven losers from 14-slip audit
-    'RBIs',          # 100% miss rate
-    'Singles',        # 100% miss rate as demon
-    'Hits+Runs+RBIs', # 100% miss rate as demon
+    'RBIs',             # 100% miss rate
+    'Singles',          # 100% miss rate as demon
+    'Hits+Runs+RBIs',   # 100% miss rate as demon
+    'Hits',             # 1.5 line = too volatile, high miss rate
+    'Hitter Strikeouts', # blocked stat across all pipelines
+    'Doubles',          # insufficient edge at demon lines
+    'Walks',            # insufficient edge at demon lines
+    'Home Runs',        # 0.5 demon lines are coinflips
+    'Stolen Bases',     # 0.5 demon lines are coinflips
 }
 
 # ── Min line floors per stat (gate 1) ────────────────────────────────────────
