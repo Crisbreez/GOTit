@@ -299,6 +299,26 @@ export const storage: IStorage = {
       .filter((p: any) => {
         // Block trash stats at read time — catches any stale DB rows
         if (!p.isGoblin && !p.isDemon && BLOCKED_STANDARD_STATS.has(p.statType)) return false;
+        // Enforce line floors at read time for standard props
+        if (!p.isGoblin && !p.isDemon) {
+          const LINE_FLOORS: Record<string, number> = {
+            'Total Bases': 2.5,
+            'Hits+Runs+RBIs': 2.5,
+            'Pitcher Strikeouts': 3.5,
+            'Pitches Thrown': 70.0,
+            'Hitter Fantasy Score': 7.0,
+            'Hits Allowed': 2.5,
+            'Significant Strikes': 25.0,
+            'Takedowns': 1.5,
+            'Fight Time': 8.0,
+            'Hits': 1.0,
+            'Earned Runs Allowed': 1.0,
+            'Pitching Outs': 10.0,
+            'Walks Allowed': 1.0,
+          };
+          const floor = LINE_FLOORS[p.statType] ?? 1.0;
+          if ((p.lineScore ?? 0) < floor) return false;
+        }
         return (
           p.ppDisplayMatchup ||
           (p.gameMatchup && (
