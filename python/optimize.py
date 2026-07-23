@@ -38,6 +38,7 @@ from gotit.leg_selector import (
     select_legs_for_slate,
 )
 from gotit.sharp_consensus import load_sharp_consensus
+from gotit.nondemon_pipeline import run_nondemon_pipeline, NonDemonRecord
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -349,14 +350,40 @@ def main():
         pp_props=pp_props,
         sharp_consensus=sc_map,
         calibration=cal,
-        game_scripts={},    # no game-script model yet
-        rho_map={},         # no correlation map yet — defaults to 0 (independent)
-        dnp_model={},       # no DNP model yet — all props pass 0.15 gate
+        game_scripts={},
+        rho_map={},
+        dnp_model={},
     )
 
     if not output:
         print(json.dumps({"error": "no feasible games — need ≥6 candidates + ≥2 demon players per game"}))
         sys.exit(0)
+
+    # ── Run nondemon pipeline for eligibility metadata ────────────────────────
+    # Builds a lookup of per-prop eligibility, edge reasons, stability reasons.
+    # Does NOT replace the MILP output — enriches each leg with debug metadata.
+    sharp_map: Dict[str, dict] = {
+        prop_id: {'fair_line': getattr(sc, 'median', None), 'over_juice': None}
+        for prop_id, sc in sc_map.items()
+    }
+    _nd_selected, nd_all_records = run_nondemon_pipeline(
+        raw_props=props_data,
+        n_legs=6,
+        sharp_map=sharp_map,
+    )
+    nd_lookup = {r.prop_id: r for r in nd_all_records}
+
+    # Enrich each output leg with nondemon pipeline metadata
+    for game_id, game_data in output.items():
+        for leg in game_data.get('legs', []):
+            pid = leg.get('prop_id') or leg.get('propId') or ''
+            nd = nd_lookup.get(pid)
+            if nd:
+                leg['edgeReasons']      = nd.strong_reasons_hit
+                leg['stabilityReasons'] = nd.stability_reasons_hit
+                leg['rejectReasons']    = nd.reject_reasons
+                leg['ndScore']          = nd.nondemon_score
+                leg['eligible']         = nd.eligible_nondemon
 
     print(json.dumps(output))
 
