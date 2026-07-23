@@ -270,6 +270,12 @@ export const storage: IStorage = {
   },
 
   async getProps(league) {
+    // Stats permanently blocked from standard slate — blocked at both ingest AND read time
+    const BLOCKED_STANDARD_STATS = new Set([
+      'Home Runs', 'Doubles', 'RBIs', 'Singles', 'Walks',
+      'Triples', 'Stolen Bases', 'Hitter Strikeouts',
+      'Plate Appearances', 'Pitcher Fantasy Score',
+    ]);
     const PAGE = 1000;
     let all: any[] = [];
     let from = 0;
@@ -290,14 +296,18 @@ export const storage: IStorage = {
     }
     return all
       .map(mapProp)
-      .filter((p: any) =>
-        p.ppDisplayMatchup ||
-        (p.gameMatchup && (
-          p.gameMatchup.includes(' vs ') ||
-          p.gameMatchup.includes('/') ||
-          p.gameMatchup.includes(' @ ')
-        ))
-      );
+      .filter((p: any) => {
+        // Block trash stats at read time — catches any stale DB rows
+        if (!p.isGoblin && !p.isDemon && BLOCKED_STANDARD_STATS.has(p.statType)) return false;
+        return (
+          p.ppDisplayMatchup ||
+          (p.gameMatchup && (
+            p.gameMatchup.includes(' vs ') ||
+            p.gameMatchup.includes('/') ||
+            p.gameMatchup.includes(' @ ')
+          ))
+        );
+      });
   },
 
   async deletePropsForLeague(league) {
