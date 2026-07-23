@@ -196,8 +196,10 @@ function resolveStatValue(
 const ABBR_MAP: Record<string, string> = {
   CHC: 'CUBS',
   CWS: 'WHITE SOX',
+  CHW: 'WHITE SOX',
   KCR: 'ROYALS',
   KCA: 'ROYALS',
+  KC:  'ROYALS',
   SDP: 'PADRES',
   SD:  'PADRES',
   SFG: 'GIANTS',
@@ -222,7 +224,6 @@ const ABBR_MAP: Record<string, string> = {
   BAL: 'ORIOLES',
   TOR: 'BLUE JAYS',
   MIL: 'BREWERS',
-  CHW: 'WHITE SOX',
   MIA: 'MARLINS',
   COL: 'ROCKIES',
   ARI: 'DIAMONDBACKS',
@@ -233,18 +234,6 @@ const ABBR_MAP: Record<string, string> = {
   TEX: 'RANGERS',
   PIT: 'PIRATES',
   CIN: 'REDS',
-  KC:  'ROYALS',
-  LAD: 'DODGERS',
-  NYY: 'YANKEES',
-  NYM: 'METS',
-  OAK: 'ATHLETICS',
-  ATH: 'ATHLETICS',
-  AZ:  'DIAMONDBACKS',
-  ARI: 'DIAMONDBACKS',
-  MIL: 'BREWERS',
-  CLE: 'GUARDIANS',
-  // Two-letter abbrs that don't substring-match full team names
-  KC:  'ROYALS',
 };
 
 // ── Parse matchup string into search tokens ───────────────────────────────────
