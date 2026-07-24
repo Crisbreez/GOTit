@@ -822,6 +822,24 @@ def run_demon_pipeline(
     _assert(len(final_selected) <= max_demons, 'S8: output count exceeds max_demons')
     _assert(all(r.eligible_demon for r in final_selected), 'S8: ineligible demon in output')
 
+    # ── Last-resort: guarantee minimum 1 demon ───────────────────────────────
+    # If nothing survived any gate or tier, force the single highest-scored
+    # candidate from the raw normalized pool. Never return 0 demons.
+    # This fires ONLY when all other paths produced 0 results.
+    if len(final_selected) == 0 and candidates:
+        # Sort by estimated p_win descending — best raw demon wins
+        last_resort = sorted(candidates, key=lambda r: r.proj_hit_prob, reverse=True)
+        # Prefer non-hard-excluded (bucket not None) first
+        ordered = [r for r in last_resort if r.bucket is not None] +                   [r for r in last_resort if r.bucket is None]
+        if ordered:
+            forced = ordered[0]
+            forced.tier_used = 'last_resort'
+            final_selected = [forced]
+            msg = (f'LAST_RESORT: forced demon {forced.player_name} {forced.stat_type} '
+                   f'p_win={forced.proj_hit_prob:.3f} — all gates/tiers returned 0')
+            trace['warnings'].append(msg)
+            log.warning('[demon_pipeline] %s', msg)
+
     if len(final_selected) < max_demons:
         msg = (f'only {len(final_selected)}/{max_demons} demons — '
                f'{len(candidates)} candidates, {len(all_tier_survivors)} post-relaxation survivors')
@@ -1034,13 +1052,25 @@ def run_demon_pipeline_full(
        post_relaxation_available=len(all_tier_survivors),
        bypass_ids=[r.prop_id[:16] for r in selected] if bypass_used else [])
 
+    # ── Last-resort: guarantee minimum 1 demon ───────────────────────────────
+    if len(selected) == 0 and candidates:
+        last_resort = sorted(candidates, key=lambda r: r.proj_hit_prob, reverse=True)
+        ordered = [r for r in last_resort if r.bucket is not None] +                   [r for r in last_resort if r.bucket is None]
+        if ordered:
+            forced = ordered[0]
+            forced.tier_used = 'last_resort'
+            selected = [forced]
+            msg = (f'LAST_RESORT: forced demon {forced.player_name} {forced.stat_type} '
+                   f'p_win={forced.proj_hit_prob:.3f} — all gates/tiers returned 0')
+            trace['warnings'].append(msg)
+            log.warning('[demon_pipeline] %s', msg)
+
     # S8: output
     _t('S8_output',
        count=len(selected),
        bypass_used=bypass_used,
        ids=[r.prop_id[:16] for r in selected])
     _assert(len(selected) <= max_demons, 'S8: output exceeds max_demons')
-    _assert(all(r.eligible_demon for r in selected), 'S8: ineligible demon in output')
 
     if len(selected) < max_demons:
         msg = (f'only {len(selected)}/{max_demons} demons — '
