@@ -53,7 +53,12 @@ interface Prop {
     game_script_fit: number;
     role_certainty: number;
     pair_diversity: number;
+    tier?: string;
+    gates_passed?: string[];
+    gates_failed?: string[];
+    p_win?: number;
   };
+  fallback_render_used?: boolean;
 }
 
 interface OptimizerLeg {
@@ -224,6 +229,18 @@ function DemonCard({ prop, rank }: { prop: Prop; rank: number }) {
           fontStyle: 'italic',
         }}>
           {prop.reason}
+        </div>
+      )}
+
+      {/* Diagnostic: pipeline path info */}
+      {prop.demonScore?.tier && (
+        <div style={{ marginTop: 6, fontSize: '0.55rem', fontWeight: 700, color: 'hsl(220 60% 65%)', letterSpacing: '0.06em', fontFamily: 'Space Mono, monospace' }}>
+          tier={prop.demonScore.tier} p_win={prop.demonScore.p_win != null ? (prop.demonScore.p_win * 100).toFixed(1) + '%' : 'n/a'}
+        </div>
+      )}
+      {prop.fallback_render_used && (
+        <div style={{ marginTop: 2, fontSize: '0.55rem', fontWeight: 700, color: 'hsl(40 90% 60%)', letterSpacing: '0.06em' }}>
+          ⚠ DIRECT PATH
         </div>
       )}
     </div>
@@ -606,6 +623,12 @@ function GameCard({ game, selectedIds, onToggle, atMax, onSave, isSaving }: {
               TOP {game.demons.length}
             </span>
           </div>
+          {/* Fallback render diagnostic tag */}
+          {game.demons.some((d: any) => d.fallback_render_used) && (
+            <div style={{ fontSize: '0.55rem', fontWeight: 700, color: 'hsl(40 90% 60%)', letterSpacing: '0.08em', marginTop: 4, textTransform: 'uppercase' }}>
+              ⚠ DIRECT PATH (fallback_render_used) — MILP bypassed
+            </div>
+          )}
           {/* Demon section — exactly top 2 GOTit-qualified demons from qualify_demons.py */}
           <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginTop: 10, marginBottom: 8 }}>
             {game.demons.map((d: any, i: number) => (

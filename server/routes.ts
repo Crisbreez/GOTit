@@ -158,18 +158,45 @@ export function registerRoutes(httpServer: Server, app: Express) {
       child.on('close', (code: number | null) => {
         if (code !== 0) {
           console.warn('[Demons] qualify_demons exited', code, err.slice(0, 200));
-          // Fallback: return top 2 raw demons sorted by lineScore desc
+          // Process-level crash — fallback to raw demons sorted by lineScore
           const raw = gameProps.filter((p: any) => p.isDemon)
             .sort((a: any, b: any) => b.lineScore - a.lineScore)
             .slice(0, 2);
           return resolve(raw);
         }
+        let pipeline_result: any[] = [];
         try {
-          const result = JSON.parse(out);
-          resolve(Array.isArray(result) ? result.slice(0, 2) : []);
+          const parsed = JSON.parse(out);
+          pipeline_result = Array.isArray(parsed) ? parsed : [];
         } catch {
-          resolve([]);
+          pipeline_result = [];
         }
+
+        // ── Fallback render patch ─────────────────────────────────────────────
+        // If pipeline returned 0 demons (MILP/solver blocked them) but
+        // at least 2 survivors exist in the raw pipeline output, bypass
+        // MILP and hard-emit the top 2 by demonScore.composite.
+        // fallback_render_used=true is logged so we can trace the code path.
+        if (pipeline_result.length === 0) {
+          // Re-run pipeline synchronously is not available here — instead,
+          // use any demons that came back with a demonScore (they survived gating)
+          // vs raw demons that have no demonScore (pipeline rejected them).
+          // The pipeline emits only survivors, so if pipeline_result is empty,
+          // all candidates were hard-rejected. Check raw demon pool size.
+          const rawDemons = gameProps.filter((p: any) => p.isDemon);
+          if (rawDemons.length >= 2) {
+            // Direct path: sort raw demons by lineScore as survival proxy.
+            // This surfaces the best options when the pipeline itself returns 0.
+            const directTop2 = rawDemons
+              .sort((a: any, b: any) => (b.lineScore ?? 0) - (a.lineScore ?? 0))
+              .slice(0, 2)
+              .map((d: any) => ({ ...d, fallback_render_used: true }));
+            console.warn('[Demons] fallback_render_used=true — pipeline returned 0, direct-emit top 2 by lineScore for game');
+            return resolve(directTop2);
+          }
+        }
+
+        resolve(pipeline_result.slice(0, 2));
       });
       child.on('error', () => resolve([]));
     });
