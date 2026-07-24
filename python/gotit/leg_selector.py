@@ -1711,7 +1711,7 @@ def select_legs_for_slate(
     # ── PRE-FILTER before Shapley: cap per game so Shapley stays O(N*C(15,5)) ──
     # Shapley is exact for N≤15 but blows up beyond ~20. Pre-rank by p_win,
     # reserve demon slots, and keep top MAX_SHAPLEY per game.
-    MAX_SHAPLEY = 15
+    MAX_SHAPLEY = 40  # raised from 15 — ensures enough unique-player candidates survive dedup
 
     filtered: List[LegCandidate] = []
     by_game: Dict[str, List[LegCandidate]] = {}
@@ -1735,9 +1735,14 @@ def select_legs_for_slate(
         # ── Standard admission floor: drop before Shapley ─────────────────────
         # Standards that can't clear STANDARD_PWIN_FLOOR have no path to selection;
         # excluding them keeps Shapley fast and clean.
+        # Pre-filter: soft floor to keep candidates alive for dedup + MILP.
+        # Using a soft 0.45 cutoff here so props with sparse sharp data (p_win ~0.50)
+        # still reach the MILP, which applies the authoritative 0.57 hard floor per leg.
+        # Goblins always bypass — they use r_star_6 in the MILP.
+        PRE_FILTER_FLOOR = 0.45
         s_cands_admitted = [
             c for c in s_cands
-            if c.tier == Tier.GOBLIN or c.p_win >= STANDARD_PWIN_FLOOR
+            if c.tier == Tier.GOBLIN or c.p_win >= PRE_FILTER_FLOOR
         ]
 
         # ── One-player-max dedup for non-demon pool ───────────────────────────
