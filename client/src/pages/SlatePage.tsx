@@ -611,8 +611,8 @@ function GameCard({ game, selectedIds, onToggle, atMax, onSave, isSaving }: {
         </button>
       )}
 
-      {/* Demon Picks — hidden until selector activated; each demon is selectable */}
-      {isActivated && game.demons.length > 0 && (
+      {/* Demon Picks — force-render even when empty for diagnostic visibility */}
+      {isActivated && (
         <div className="demon-section">
           <div className="demon-section-header">
             <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor">
@@ -630,11 +630,17 @@ function GameCard({ game, selectedIds, onToggle, atMax, onSave, isSaving }: {
             </div>
           )}
           {/* Demon section — exactly top 2 GOTit-qualified demons from qualify_demons.py */}
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginTop: 10, marginBottom: 8 }}>
-            {game.demons.map((d: any, i: number) => (
-              <DemonCard key={d.id} prop={d} rank={i + 1} />
-            ))}
-          </div>
+          {game.demons.length === 0 ? (
+            <div style={{ fontSize: '0.65rem', color: 'hsl(0 60% 55%)', fontWeight: 600, padding: '10px 0 6px', letterSpacing: '0.04em' }}>
+              ⚠ PIPELINE RETURNED 0 DEMONS — all candidates failed gating for this game
+            </div>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginTop: 10, marginBottom: 8 }}>
+              {game.demons.map((d: any, i: number) => (
+                <DemonCard key={d.id} prop={d} rank={i + 1} />
+              ))}
+            </div>
+          )}
           <div style={{ display: 'flex', flexDirection: 'column', gap: 5, marginTop: 4 }}>
             {game.demons.map((d: any) => (
               <PropRow

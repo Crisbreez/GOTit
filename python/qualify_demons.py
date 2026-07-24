@@ -17,7 +17,7 @@ If any gate fails, the Demon is rejected and the reason is logged.
 MILP only sees survivors.
 """
 from __future__ import annotations
-import sys, json, logging
+import sys, json, logging, os
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
@@ -47,10 +47,12 @@ def main() -> None:
                 'fair_line': float(d.get('sharpFairLine') or d.get('sharp_fair_line'))
             }
 
+    bypass_test = os.environ.get('DEMON_BYPASS_TEST', '').strip() == '1'
     result = run_demon_pipeline(
         raw_props=props_data,
         sharp_map=sharp_map,
         max_demons=2,   # always return 2 distinct-player demons
+        bypass_test=bypass_test,
     )
 
     print(json.dumps(result))

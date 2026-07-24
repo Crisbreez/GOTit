@@ -208,6 +208,64 @@ export function registerRoutes(httpServer: Server, app: Express) {
     });
   }
 
+  // ── Bypass test endpoint ───────────────────────────────────────────────────
+  // GET /api/demons/bypass-test?league=MLB&gameId=<id>
+  // Runs qualify_demons.py with bypass_test=true, returns pipeline_trace +
+  // selected=top2(post_relaxation) directly without MILP path.
+  // Compare this output to /api/slate demons to isolate wiring bugs.
+  app.get('/api/demons/bypass-test', async (req, res) => {
+    const league  = ((req.query.league  as string) || 'MLB').toUpperCase();
+    const gameId  =  (req.query.gameId  as string) || '';
+    const rawProps = await storage.getProps(league);
+    const gameProps = gameId
+      ? rawProps.filter((p: any) => p.gameId === gameId)
+      : rawProps.filter((p: any) => p.isDemon);
+
+    if (gameProps.length === 0) {
+      return res.json({ error: 'no props found for gameId=' + gameId + ' league=' + league });
+    }
+
+    return new Promise<void>((done) => {
+      const scriptPath = path.resolve(process.cwd(), 'python', 'qualify_demons.py');
+      const python = process.env.PYTHON_BIN || 'python3';
+      let out = '', err = '';
+      // Pass bypass_test flag via env var — qualify_demons.py reads it
+      const child = spawn(python, [scriptPath], {
+        timeout: 30_000,
+        cwd: process.cwd(),
+        env: { ...process.env, DEMON_BYPASS_TEST: '1' },
+      });
+      child.stdin.write(JSON.stringify(gameProps));
+      child.stdin.end();
+      child.stdout.on('data', (d: Buffer) => { out += d.toString(); });
+      child.stderr.on('data', (d: Buffer) => { err += d.toString(); });
+      child.on('close', (code: number | null) => {
+        let selected: any[] = [];
+        let trace: any = null;
+        try {
+          const parsed = JSON.parse(out);
+          selected = Array.isArray(parsed) ? parsed : [];
+          if (selected.length > 0 && selected[0].pipelineTrace) {
+            trace = selected[0].pipelineTrace;
+          }
+        } catch { /* parse error */ }
+        res.json({
+          bypass_test: true,
+          league,
+          gameId: gameId || '(all)',
+          props_sent: gameProps.length,
+          selected_count: selected.length,
+          selected,
+          pipeline_trace: trace,
+          stderr_tail: err.slice(-1000),
+          exit_code: code,
+        });
+        done();
+      });
+      child.on('error', (e: Error) => { res.json({ error: e.message }); done(); });
+    });
+  });
+
   app.get('/api/slate', async (req, res) => {
     const league = (req.query.league as string || 'MLB').toUpperCase();
     const rawProps = await storage.getProps(league);
