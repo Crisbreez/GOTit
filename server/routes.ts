@@ -177,23 +177,29 @@ export function registerRoutes(httpServer: Server, app: Express) {
         // at least 2 survivors exist in the raw pipeline output, bypass
         // MILP and hard-emit the top 2 by demonScore.composite.
         // fallback_render_used=true is logged so we can trace the code path.
-        if (pipeline_result.length === 0) {
-          // Re-run pipeline synchronously is not available here — instead,
-          // use any demons that came back with a demonScore (they survived gating)
-          // vs raw demons that have no demonScore (pipeline rejected them).
-          // The pipeline emits only survivors, so if pipeline_result is empty,
-          // all candidates were hard-rejected. Check raw demon pool size.
-          const rawDemons = gameProps.filter((p: any) => p.isDemon);
-          if (rawDemons.length >= 2) {
-            // Direct path: sort raw demons by lineScore as survival proxy.
-            // This surfaces the best options when the pipeline itself returns 0.
-            const directTop2 = rawDemons
-              .sort((a: any, b: any) => (b.lineScore ?? 0) - (a.lineScore ?? 0))
-              .slice(0, 2)
-              .map((d: any) => ({ ...d, fallback_render_used: true }));
-            console.warn('[Demons] fallback_render_used=true — pipeline returned 0, direct-emit top 2 by lineScore for game');
-            return resolve(directTop2);
+        // Always return 2 demons per game.
+        // If pipeline returned fewer than 2, fill remaining slots from raw demons
+        // sorted by lineScore (distinct players only). fallback_render_used=true marks them.
+        if (pipeline_result.length < 2) {
+          const usedPlayers = new Set(pipeline_result.map((d: any) => d.playerName));
+          const rawDemons = gameProps
+            .filter((p: any) => p.isDemon && !usedPlayers.has(p.playerName))
+            .sort((a: any, b: any) => (b.lineScore ?? 0) - (a.lineScore ?? 0));
+
+          const needed = 2 - pipeline_result.length;
+          const seenFill = new Set<string>();
+          const filled: any[] = [];
+          for (const d of rawDemons) {
+            if (seenFill.has(d.playerName)) continue;
+            seenFill.add(d.playerName);
+            filled.push({ ...d, fallback_render_used: true });
+            if (filled.length >= needed) break;
           }
+
+          if (filled.length > 0) {
+            console.warn('[Demons] fallback_render_used=true — pipeline gave ' + pipeline_result.length + ', filled ' + filled.length + ' slots from raw demons');
+          }
+          return resolve([...pipeline_result, ...filled].slice(0, 2));
         }
 
         resolve(pipeline_result.slice(0, 2));
