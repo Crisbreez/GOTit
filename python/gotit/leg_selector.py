@@ -123,7 +123,7 @@ DEFAULT_CFG: Dict[str, Any] = {
         "4_power": 0.560,
     },
     "p_true_mode":       "min",
-    "absolute_floor_p":  0.52,
+    "absolute_floor_p":  0.50,   # floor lowered — 0.52 kills too many props when sharp data sparse
     "demon_min_p":       0.50,
     "ban_goblins":       False,   # goblins allowed in The System
     "fragility_kill":    0.65,

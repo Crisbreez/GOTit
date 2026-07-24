@@ -547,10 +547,17 @@ function GameCard({ game, optResult, selectedIds, onToggle, atMax, onSave, isSav
   // demons always come from game.demons (pipeline), enriched with two_demons metadata
   const gameSelection: GameSelection = useMemo(() => {
     if (!optResult || !Array.isArray(optResult.six_legs) || optResult.six_legs.length === 0) {
-      // Optimizer not ready or returned nothing — show raw standards as interim
+      // Optimizer not ready or NO-GO — show raw standards as interim, deduped by player
+      const seen = new Set<string>();
       const rawStandards = [...(game.standards ?? []), ...(game.goblins ?? [])]
         .filter((p: any) => !p.isDemon)
-        .sort((a: any, b: any) => (b.propScore ?? 0) - (a.propScore ?? 0));
+        .sort((a: any, b: any) => (b.propScore ?? 0) - (a.propScore ?? 0))
+        .filter((p: any) => {
+          const pid = p.playerName ?? p.playerId ?? '';
+          if (seen.has(pid)) return false;
+          seen.add(pid);
+          return true;
+        });
       return { standards: rawStandards, demons: game.demons ?? [], ready: false };
     }
     const { standards, demons } = materializeSelectedGame(game, optResult);
