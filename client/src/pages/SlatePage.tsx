@@ -925,11 +925,24 @@ export default function SlatePage() {
         return { ...p, pWin: leg.p_win, evMarginal: leg.ev_marginal, evCorrAdj: leg.ev_corr_adj, demonScore: leg.demon_score };
       }
 
-      // Re-rank standards+goblins by p_win descending
-      const enrichedStandards = g.standards.map(enrichProp)
+      // Filter standards+goblins to ONLY the MILP-selected six_legs.
+      // The optimizer is the source of truth for which props appear.
+      // Raw PP props that were not selected by the MILP do not show.
+      const sixLegIds = new Set((opt.six_legs || []).map((l: OptimizerLeg) => l.prop_id).filter(Boolean));
+      const sixLegKeys = new Set((opt.six_legs || []).map((l: OptimizerLeg) => `${l.player_name}|${l.stat_type}`));
+
+      const selectedStandards = [...g.standards, ...g.goblins]
+        .filter((p: Prop) => sixLegIds.has(p.id) || sixLegKeys.has(`${p.playerName}|${p.statType}`))
+        .map(enrichProp)
         .sort((a, b) => (b.pWin ?? b.propScore ?? 0) - (a.pWin ?? a.propScore ?? 0));
-      const enrichedGoblins = g.goblins.map(enrichProp)
-        .sort((a, b) => (b.pWin ?? b.propScore ?? 0) - (a.pWin ?? a.propScore ?? 0));
+
+      // Fallback: if optimizer returned no six_legs for this game, show enriched raw props
+      const enrichedStandards = selectedStandards.length >= 6
+        ? selectedStandards
+        : g.standards.map(enrichProp).sort((a, b) => (b.pWin ?? b.propScore ?? 0) - (a.pWin ?? a.propScore ?? 0));
+      const enrichedGoblins = selectedStandards.length >= 6
+        ? []   // goblins already merged into selectedStandards above
+        : g.goblins.map(enrichProp).sort((a, b) => (b.pWin ?? b.propScore ?? 0) - (a.pWin ?? a.propScore ?? 0));
 
       // PP is the display source of truth for demons — never replace PP's isDemon=true props.
       // The optimizer enriches demons with p_win but does NOT reassign which props are demons.
