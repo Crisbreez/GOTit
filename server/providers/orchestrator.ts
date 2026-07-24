@@ -216,47 +216,18 @@ export async function orchestratePull(league: string, forceRefresh = false): Pro
         'Takedowns':             1.5,
         'Fight Time (Mins)':     8.0,
       };
-      // ── Demon line floor gate — PP designates thousands of 0.5 props as "demon".
-      // GOTit rule: PP is authority on demon identity BUT GOTit applies elimination
-      // gates. First gate: minimum line by stat type. Demons below floor are
-      // downgraded to standard (kept in DB but not shown in demon section).
-      const DEMON_LINE_FLOORS: Record<string, number> = {
-        'Home Runs':            1.5,
-        'Triples':              1.5,
-        'Stolen Bases':         1.5,
-        'Doubles':              1.5,
-        'Walks':                1.5,
-        'Singles':              1.5,
-        'RBIs':                 1.5,
-        'Runs':                 1.5,
-        'Hits':                 1.5,
-        'Total Bases':          2.5,
-        'Hits+Runs+RBIs':       2.5,
-        'Hitter Fantasy Score': 3.5,
-        'Hitter Strikeouts':    1.5,
-        'Pitcher Strikeouts':   3.5,
-        'Pitching Outs':        9.5,
-        'Pitches Thrown':       59.5,
-        'Earned Runs Allowed':  0.5,
-        'Hits Allowed':         2.5,
-        'Significant Strikes':  25.0,
-        'Takedowns':            1.5,
-        'Plate Appearances':    3.5,
-      };
-
-      let demonDowngraded = 0;
+      // Demon line floor gate is handled entirely by demon_pipeline.py.
+      // All isDemon=true props pass through here unchanged.
       const ppProps = ppPropsRaw
         .map((p: any) => {
           // Goblins: ALWAYS keep as-is — they are discount lines by design,
           // line floors do NOT apply to goblins.
           if (p.isGoblin) return p;
-          // Demons: apply minimum line gate — demote to standard if below floor
+          // Demons: pass ALL demon props through to the pipeline with isDemon=true.
+          // The demon_pipeline.py applies its own line floor gate (DEMON_LINE_FLOOR)
+          // with relaxation tiers. Stripping demons here starves the pipeline and
+          // breaks the always-2 guarantee.
           if (p.isDemon) {
-            const dfloor = DEMON_LINE_FLOORS[p.statType] ?? 1.5;
-            if (p.lineScore < dfloor) {
-              demonDowngraded++;
-              return { ...p, isDemon: false }; // demote — still stored, not in demon section
-            }
             return p;
           }
           // Standard props: block trash stats entirely, then apply line floor
@@ -267,7 +238,7 @@ export async function orchestratePull(league: string, forceRefresh = false): Pro
         })
         .filter(Boolean);
 
-      console.log(`[Orchestrator] ${league}: floor filter — ${ppPropsRaw.length} raw → ${ppProps.length} kept | ${demonDowngraded} demons downgraded`);
+      console.log(`[Orchestrator] ${league}: floor filter — ${ppPropsRaw.length} raw → ${ppProps.length} kept`);
       if (ppProps.length > 0) {
         state.pp.consecutiveFailures = 0;
         state.pp.rateLimited = false;
