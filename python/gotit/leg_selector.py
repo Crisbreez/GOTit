@@ -1370,36 +1370,45 @@ SLIP_HIT_PROB_FLOOR = 0.04   # 6 legs at 0.64 each ≈ 0.075; floor is conservat
 
 def solve_game_milp(
     candidates: List[LegCandidate],
-    win_score_map: Dict[str, float],   # WinScoreStandard.win_score or DemonWinScore composite
+    win_score_map: Dict[str, float],
     r_star_6:   float,
     time_limit_sec: float = 5.0,
 ) -> Optional[List[LegCandidate]]:
     """
-    Must-Win Slip Optimizer.
+    Must-Win Slip Optimizer — two-pool architecture.
 
-    Primary objective: maximize slip hit probability (product of p_wins).
-    In log-space: maximize Σ log(p_win) * x_L  — this is linear and exact.
+    Pool x_i — non-demon legs (STANDARD + GOBLIN):
+      • Exactly 6 selected:        Σ x_i = 6
+      • 6 unique players:          Σ x_i for each player_id ≤ 1
+      • ≥ 2 distinct stat types
+      • Direction diversity (soft)
+      • Stat-type caps
+      • p_win floor per tier
 
-    Secondary objective embedded in win_score_map: among legs with similar
-    log(p_win), prefer those with higher WinScore (market agreement, distribution
-    conviction, role certainty).
+    Pool y_j — demon legs:
+      • 1 or 2 selected:           1 ≤ Σ y_j ≤ 2  (if any demons available)
+      • Distinct players within demons: Σ y_j per player_id ≤ 1
+      • NO cross-pool uniqueness between x_i and y_j
+        → a demon player may duplicate a non-demon player (by spec)
 
-    Combined objective coefficient per leg:
-        obj_L = log(p_win_L) + 0.10 * win_score_L
-
-    The 0.10 weight keeps payout/quality as a tiebreaker without overriding
-    the hit-probability primary objective.
-
-    Constraints:
-      Σ x_L = 6
-      Standard legs: p_win ≥ STANDARD_PWIN_FLOOR (0.57)
-      Demon legs: at most 2, gate survivors only, distinct players, no subs
-      ≤ 3 legs per player
-      ≥ 2 distinct stat categories
-      No-slip: returned None if slip_hit_prob < SLIP_HIT_PROB_FLOOR
+    Objective: maximize Σ log(p_win)*x_i + Σ log(p_win)*y_j + 0.10*(win_scores)
     """
-    if len(candidates) < 6:
+    # Split candidates by pool
+    nd_eligible = [
+        lg for lg in candidates
+        if lg.tier != Tier.DEMON and win_score_map.get(lg.prop_id, 0.0) > 0.0
+    ]
+    d_eligible = [
+        lg for lg in candidates
+        if lg.tier == Tier.DEMON and win_score_map.get(lg.prop_id, 0.0) > 0.0
+    ]
+
+    if len(nd_eligible) < 6:
+        log.info("[MILP] Only %d non-demon candidates with edge — need 6, slip rejected",
+                 len(nd_eligible))
         return None
+
+    log.info("[MILP] non-demon pool=%d  demon pool=%d", len(nd_eligible), len(d_eligible))
 
     solver = pywraplp.Solver.CreateSolver("SCIP")
     if not solver:
@@ -1407,117 +1416,136 @@ def solve_game_milp(
         return None
     solver.SetTimeLimit(int(time_limit_sec * 1000))
 
-    # Hard-exclude any candidate with win_score == 0 (no edge reason fired).
-    # These props failed the edge gate and must never enter the MILP.
-    eligible = [lg for lg in candidates if win_score_map.get(lg.prop_id, 0.0) > 0.0]
-    if not eligible:
-        log.info("[MILP] All candidates scored 0 — no edge on any prop, slip rejected")
-        return None
-    log.info("[MILP] %d/%d candidates have edge (score > 0)", len(eligible), len(candidates))
-
-    lg_map = {lg.prop_id: lg for lg in eligible}
+    # ── Pool x: non-demon BoolVars ────────────────────────────────────────────
+    nd_map = {lg.prop_id: lg for lg in nd_eligible}
     x: Dict[str, pywraplp.Variable] = {
-        lg.prop_id: solver.BoolVar(f"x_{lg.prop_id}") for lg in eligible
+        lg.prop_id: solver.BoolVar(f"x_{lg.prop_id}") for lg in nd_eligible
     }
 
-    # ── Must-Win Objective ────────────────────────────────────────────────────
-    # Primary: maximize Σ log(p_win) * x   [maximizes product of p_wins]
-    # Tiebreaker: + 0.10 * win_score       [market/distribution conviction]
-    obj_coeffs = []
-    for lg in eligible:
-        log_pwin = math.log(max(lg.p_win, 0.001))
-        ws = win_score_map.get(lg.prop_id, 0.0)
-        obj_coeffs.append((lg.prop_id, log_pwin + 0.10 * ws))
+    # ── Pool y: demon BoolVars ────────────────────────────────────────────────
+    d_map = {lg.prop_id: lg for lg in d_eligible}
+    y: Dict[str, pywraplp.Variable] = {
+        lg.prop_id: solver.BoolVar(f"y_{lg.prop_id}") for lg in d_eligible
+    }
 
-    solver.Maximize(
-        solver.Sum([coeff * x[pid] for pid, coeff in obj_coeffs])
-    )
+    # ── Objective: maximize log(p_win) + 0.10*win_score across both pools ─────
+    obj_terms = []
+    for lg in nd_eligible:
+        coeff = math.log(max(lg.p_win, 0.001)) + 0.10 * win_score_map.get(lg.prop_id, 0.0)
+        obj_terms.append(coeff * x[lg.prop_id])
+    for lg in d_eligible:
+        coeff = math.log(max(lg.p_win, 0.001)) + 0.10 * win_score_map.get(lg.prop_id, 0.0)
+        obj_terms.append(coeff * y[lg.prop_id])
+    solver.Maximize(solver.Sum(obj_terms))
 
-    # ── Exactly 6 legs ────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # HARD CONSTRAINTS — x pool (non-demons)
+    # ═══════════════════════════════════════════���══════════════════════════════
+
+    # [C1] Exactly 6 non-demon legs
     solver.Add(solver.Sum(list(x.values())) == 6)
 
-    # ── Demon legs: AT MOST 1 per slip, gate survivors only, no substitutions ──
-    # Rule: PP is the only authority on demon identity. GOTit applies 4 gates
-    # (line floor, sharp sanity, hit-rate floor, role/script quality) and ranks
-    # survivors. Top 1 demon enters the slip. If none survive, slip has 0 demons.
-    # NEVER force a demon to fill the slot.
-    demon_vars = [x[lg.prop_id] for lg in eligible if lg.tier == Tier.DEMON]
-    if demon_vars:
-        solver.Add(solver.Sum(demon_vars) <= 1)  # max 1 demon per slip
+    # [C2] Exactly 1 non-demon leg per player (6 unique players among the 6)
+    nd_player_vars: Dict[str, List] = {}
+    for lg in nd_eligible:
+        nd_player_vars.setdefault(lg.player_id, []).append(x[lg.prop_id])
+    for pid, vars_ in nd_player_vars.items():
+        solver.Add(solver.Sum(vars_) <= 1)  # at most 1 leg per player in x pool
 
-    # ── ≤ 3 legs per player ───────────────────────────────────────────────────
-    player_vars: Dict[str, List] = {}
-    for lg in eligible:
-        player_vars.setdefault(lg.player_id, []).append(x[lg.prop_id])
-    for vars_ in player_vars.values():
-        solver.Add(solver.Sum(vars_) <= 3)
+    # [C3] Direction diversity (soft — only when minority side has ≥ 4 candidates)
+    nd_over  = [x[lg.prop_id] for lg in nd_eligible if lg.direction == Direction.OVER]
+    nd_under = [x[lg.prop_id] for lg in nd_eligible if lg.direction == Direction.UNDER]
+    if nd_over and len(nd_under) >= 4:
+        solver.Add(solver.Sum(nd_over) <= 5)
+    if nd_under and len(nd_over) >= 4:
+        solver.Add(solver.Sum(nd_under) <= 5)
 
-    # ── Direction diversity (soft — only enforce if enough of each direction) ──
-    # Skip direction cap when candidates are mostly one-directional (e.g. MLB
-    # fantasy score boards that are all OVER). Enforce cap only when at least
-    # 4 candidates exist in the minority direction.
-    over_vars  = [x[lg.prop_id] for lg in eligible if lg.direction == Direction.OVER]
-    under_vars = [x[lg.prop_id] for lg in eligible if lg.direction == Direction.UNDER]
-    if over_vars and len(under_vars) >= 4:
-        solver.Add(solver.Sum(over_vars) <= 5)   # allow up to 5 of 6 same direction
-    if under_vars and len(over_vars) >= 4:
-        solver.Add(solver.Sum(under_vars) <= 5)
-
-    # ── ≥ 2 distinct stat categories ──────────────────────────────────────────
-    stat_vars: Dict[str, List] = {}
-    for lg in eligible:
-        stat_vars.setdefault(lg.stat_type, []).append(x[lg.prop_id])
+    # [C4] ≥ 2 distinct stat categories among the 6 non-demon legs
+    nd_stat_vars: Dict[str, List] = {}
+    for lg in nd_eligible:
+        nd_stat_vars.setdefault(lg.stat_type, []).append(x[lg.prop_id])
     z_stat: Dict[str, pywraplp.Variable] = {}
-    for stat, vars_ in stat_vars.items():
+    for stat, vars_ in nd_stat_vars.items():
         z = solver.BoolVar(f"z_{stat}")
         solver.Add(solver.Sum(vars_) >= z)
         solver.Add(solver.Sum(vars_) <= 6 * z)
         z_stat[stat] = z
     solver.Add(solver.Sum(list(z_stat.values())) >= 2)
 
-    # ── Stat-type caps: prevent any single stat from dominating the slip ──────
-    # HFS and Significant Strikes are composite stats with correlated failure modes.
-    # Cap them at 2 per slip to force diversification across stat types.
-    hfs_vars = [x[lg.prop_id] for lg in eligible if lg.stat_type == 'Hitter Fantasy Score']
+    # [C5] Stat-type caps (correlated failure mode protection)
+    hfs_vars = [x[lg.prop_id] for lg in nd_eligible if lg.stat_type == 'Hitter Fantasy Score']
     if len(hfs_vars) > 2:
         solver.Add(solver.Sum(hfs_vars) <= 2)
-
-    sig_vars = [x[lg.prop_id] for lg in eligible if lg.stat_type == 'Significant Strikes']
+    sig_vars = [x[lg.prop_id] for lg in nd_eligible if lg.stat_type == 'Significant Strikes']
     if len(sig_vars) > 2:
         solver.Add(solver.Sum(sig_vars) <= 2)
-
-    # General cap: no stat type can appear more than 3 times in a 6-leg slip
-    for stat, vars_ in stat_vars.items():
+    for stat, vars_ in nd_stat_vars.items():
         if len(vars_) > 3:
             solver.Add(solver.Sum(vars_) <= 3)
 
-    # ── Per-leg admission floors ──────────────────────────────────────────────
-    # Standard legs: must clear the must-win floor (0.57).
-    # Demon legs already passed qualify_demons 4-gate chain; use demon floor (0.53).
-    # Goblin legs: treated as lower-tier standards — use r_star_6 floor.
-    for lg in eligible:
-        if lg.tier == Tier.STANDARD:
-            if lg.p_win < STANDARD_PWIN_FLOOR:
-                solver.Add(x[lg.prop_id] == 0)
-        elif lg.tier == Tier.GOBLIN:
-            if lg.p_win < r_star_6:
-                solver.Add(x[lg.prop_id] == 0)
-        # DEMON: qualify_demons already gated them; trust that gate
+    # [C6] p_win floors per tier
+    for lg in nd_eligible:
+        if lg.tier == Tier.STANDARD and lg.p_win < STANDARD_PWIN_FLOOR:
+            solver.Add(x[lg.prop_id] == 0)
+        elif lg.tier == Tier.GOBLIN and lg.p_win < r_star_6:
+            solver.Add(x[lg.prop_id] == 0)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # HARD CONSTRAINTS — y pool (demons)
+    # No cross-pool uniqueness. Demon player may duplicate a non-demon player.
+    # ══════════════════════════════════════════════════════════════════════════
+
+    if y:
+        # [D1] 1–2 demon legs
+        solver.Add(solver.Sum(list(y.values())) >= 1)
+        solver.Add(solver.Sum(list(y.values())) <= 2)
+
+        # [D2] At most 1 demon leg per player within the demon pool
+        d_player_vars: Dict[str, List] = {}
+        for lg in d_eligible:
+            d_player_vars.setdefault(lg.player_id, []).append(y[lg.prop_id])
+        for pid, vars_ in d_player_vars.items():
+            solver.Add(solver.Sum(vars_) <= 1)
+
+        # NOTE: No Σ(x_i + y_j) ≤ 1 per player.
+        # Demon player duplication of non-demon players is explicitly allowed.
 
     # ── Solve ─────────────────────────────────────────────────────────────────
     status = solver.Solve()
     if status not in (pywraplp.Solver.OPTIMAL, pywraplp.Solver.FEASIBLE):
+        log.info("[MILP] Infeasible — no valid slip for this game")
         return None
 
-    selected = [lg_map[pid] for pid, var in x.items() if var.solution_value() > 0.5]
-    if len(selected) != 6:
-        return None
+    selected_nd = [nd_map[pid] for pid, var in x.items() if var.solution_value() > 0.5]
+    selected_d  = [d_map[pid]  for pid, var in y.items() if var.solution_value() > 0.5]
+
+    # ── Pre-return validation assertions ──────────────────────────────────────
+    # These must never fail. If they do, the constraint above is broken.
+    assert len(selected_nd) == 6, (
+        f"ASSERTION_FAIL: non_demons.length == {len(selected_nd)}, expected 6"
+    )
+    unique_nd_players = len({lg.player_id for lg in selected_nd})
+    assert unique_nd_players == 6, (
+        f"ASSERTION_FAIL: unique(non_demons.player_id).length == {unique_nd_players}, expected 6"
+    )
+    if d_eligible:
+        assert 1 <= len(selected_d) <= 2, (
+            f"ASSERTION_FAIL: demons.length == {len(selected_d)}, expected 1–2"
+        )
+    # No cross-pool uniqueness check — demon duplication of non-demon players is allowed.
+
+    log.info(
+        "[MILP] selected: %d non-demon legs (players: %s), %d demon legs",
+        len(selected_nd),
+        [lg.player_id for lg in selected_nd],
+        len(selected_d),
+    )
+
+    selected = selected_nd + selected_d
 
     # ── No-slip check: reject if geometric hit probability is below floor ──────
-    # If the "best" 6 legs the optimizer found still combine to a slip hit
-    # probability below SLIP_HIT_PROB_FLOOR, the board is too weak. Show nothing.
     slip_hit_prob = 1.0
-    for lg in selected:
+    for lg in selected_nd:   # slip_hit_prob based on non-demon legs only
         slip_hit_prob *= lg.p_win
     if slip_hit_prob < SLIP_HIT_PROB_FLOOR:
         log.info(
@@ -1526,10 +1554,12 @@ def solve_game_milp(
         )
         return None
 
-    log.info("Slip selected: hit_prob=%.4f legs=%s",
+    log.info("Slip selected: hit_prob=%.4f non_demon_legs=%s demon_legs=%s",
              slip_hit_prob,
              [(lg.player_name, lg.stat_type, lg.direction.value, round(lg.p_win,3))
-              for lg in selected])
+              for lg in selected_nd],
+             [(lg.player_name, lg.stat_type, round(lg.p_win,3))
+              for lg in selected_d])
     return selected
 
 
@@ -1789,12 +1819,32 @@ def select_legs_for_slate(
             log.info("Game %s: no qualifying slip (MILP infeasible or board too weak)", game_id)
             continue
 
-        demons = [lg for lg in selected if lg.tier == Tier.DEMON]
-        # Demons may be 0 or 1 on weak boards — that is correct; no forced fill
+        # ── Separate pools — source of truth from MILP ────────────────────────
+        non_demons = [lg for lg in selected if lg.tier != Tier.DEMON]
+        demons     = [lg for lg in selected if lg.tier == Tier.DEMON]
+
+        # Post-solve validation assertions (mirrors MILP internal assertions)
+        if len(non_demons) != 6:
+            log.error(
+                "ASSERTION_FAIL: non_demons.length == %d, expected 6 — game=%s",
+                len(non_demons), game_id,
+            )
+        unique_nd_players = len({lg.player_id for lg in non_demons})
+        if unique_nd_players != 6:
+            log.error(
+                "ASSERTION_FAIL: unique(non_demons.player_id).length == %d, expected 6 — game=%s",
+                unique_nd_players, game_id,
+            )
+        if demons and not (1 <= len(demons) <= 2):
+            log.error(
+                "ASSERTION_FAIL: demons.length == %d, expected 1–2 — game=%s",
+                len(demons), game_id,
+            )
+        # Cross-pool uniqueness is NOT checked — demon player duplication is allowed.
 
         port_ev = sum(win_score_map.get(lg.prop_id, 0.0) for lg in selected)
         slip_hit_prob = 1.0
-        for lg in selected:
+        for lg in non_demons:   # hit prob based on non-demon legs only
             slip_hit_prob *= lg.p_win
 
         def leg_to_dict(lg: LegCandidate) -> Dict:
