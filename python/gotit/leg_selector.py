@@ -1445,21 +1445,15 @@ def solve_game_milp(
     # [C1] Exactly 6 non-demon legs
     solver.Add(solver.Sum(list(x.values())) == 6)
 
-    # [C2] 6 unique players — guaranteed structurally by pre-MILP player dedup.
-    # The non-demon pool entering here already has at most 1 candidate per player,
-    # so the solver cannot select 2 legs from the same player even without an
-    # explicit constraint. We assert this post-solve instead of constraining it here,
-    # keeping the solver lean and making any dedup failure loud.
-    #
-    # Pre-solve structural check (cheap — runs before solver.Solve())
-    nd_players_in_pool = [lg.player_id for lg in nd_eligible]
-    if len(nd_players_in_pool) != len(set(nd_players_in_pool)):
-        dupes = [p for p in set(nd_players_in_pool) if nd_players_in_pool.count(p) > 1]
-        log.error(
-            "[MILP] STRUCTURAL_FAIL: non-demon pool contains duplicate players %s — "
-            "dedup step did not run correctly",
-            dupes,
-        )
+    # [C2] At most 1 non-demon leg per player — hard solver constraint.
+    # This is the authoritative enforcement. The pre-MILP dedup is a performance
+    # optimization only. This constraint must always be present in the solver
+    # regardless of what the pool looks like going in.
+    nd_player_vars: Dict[str, List] = {}
+    for lg in nd_eligible:
+        nd_player_vars.setdefault(lg.player_id, []).append(x[lg.prop_id])
+    for pid, vars_ in nd_player_vars.items():
+        solver.Add(solver.Sum(vars_) <= 1)
 
     # [C3] Direction diversity (soft — only when minority side has ≥ 4 candidates)
     nd_over  = [x[lg.prop_id] for lg in nd_eligible if lg.direction == Direction.OVER]
