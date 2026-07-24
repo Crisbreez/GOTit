@@ -144,67 +144,81 @@ export function registerRoutes(httpServer: Server, app: Express) {
   });
 
   // ── Slate ──────────────────────────────────────────────────────────────────
-  // ── Demon qualifier helper: runs qualify_demons.py for a single game ────────
-  async function pickTop2Demons(gameProps: any[]): Promise<any[]> {
+  // ── Demon pipeline helper — exact route pattern ──────────────────────────────
+  //
+  //   pipeline = runDemonPipeline(game)
+  //   selected = pipeline.selected_demons
+  //   if selected.empty and pipeline.post_relaxation_demons.not_empty:
+  //       selected = top2(pipeline.post_relaxation_demons)
+  //   game.demons = selected
+  //   game.demon_pipeline_trace = pipeline.trace
+  //
+  // Returns { demons: Prop[], trace: object }
+  async function runDemonPipeline(gameProps: any[]): Promise<{ demons: any[]; trace: any }> {
     return new Promise((resolve) => {
       const scriptPath = path.resolve(process.cwd(), 'python', 'qualify_demons.py');
       const python = process.env.PYTHON_BIN || 'python3';
       let out = '', err = '';
-      const child = spawn(python, [scriptPath], { timeout: 20_000, cwd: process.cwd() });
+      const child = spawn(python, [scriptPath], { timeout: 30_000, cwd: process.cwd() });
       child.stdin.write(JSON.stringify(gameProps));
       child.stdin.end();
       child.stdout.on('data', (d: Buffer) => { out += d.toString(); });
       child.stderr.on('data', (d: Buffer) => { err += d.toString(); });
       child.on('close', (code: number | null) => {
         if (code !== 0) {
-          console.warn('[Demons] qualify_demons exited', code, err.slice(0, 200));
-          // Process-level crash — fallback to raw demons sorted by lineScore
-          const raw = gameProps.filter((p: any) => p.isDemon)
-            .sort((a: any, b: any) => b.lineScore - a.lineScore)
-            .slice(0, 2);
-          return resolve(raw);
+          console.warn('[Demons] qualify_demons crashed code=' + code, err.slice(0, 300));
+          // Process crash — fallback: raw demons by lineScore, distinct players
+          const seen = new Set<string>();
+          const raw = gameProps
+            .filter((p: any) => p.isDemon)
+            .sort((a: any, b: any) => (b.lineScore ?? 0) - (a.lineScore ?? 0))
+            .filter((p: any) => { if (seen.has(p.playerName)) return false; seen.add(p.playerName); return true; })
+            .slice(0, 2)
+            .map((p: any) => ({ ...p, fallback_render_used: true, fallback_reason: 'process_crash' }));
+          return resolve({ demons: raw, trace: { error: 'process_crash', exit_code: code } });
         }
-        let pipeline_result: any[] = [];
+
+        let pipeline: any = null;
         try {
-          const parsed = JSON.parse(out);
-          pipeline_result = Array.isArray(parsed) ? parsed : [];
-        } catch {
-          pipeline_result = [];
+          pipeline = JSON.parse(out);
+        } catch (e) {
+          console.warn('[Demons] JSON parse failed:', e);
+          return resolve({ demons: [], trace: { error: 'json_parse_failed' } });
         }
 
-        // ── Fallback render patch ─────────────────────────────────────────────
-        // If pipeline returned 0 demons (MILP/solver blocked them) but
-        // at least 2 survivors exist in the raw pipeline output, bypass
-        // MILP and hard-emit the top 2 by demonScore.composite.
-        // fallback_render_used=true is logged so we can trace the code path.
-        // Always return 2 demons per game.
-        // If pipeline returned fewer than 2, fill remaining slots from raw demons
-        // sorted by lineScore (distinct players only). fallback_render_used=true marks them.
-        if (pipeline_result.length < 2) {
-          const usedPlayers = new Set(pipeline_result.map((d: any) => d.playerName));
-          const rawDemons = gameProps
-            .filter((p: any) => p.isDemon && !usedPlayers.has(p.playerName))
-            .sort((a: any, b: any) => (b.lineScore ?? 0) - (a.lineScore ?? 0));
+        // ── Exact route pattern ────────────────────────────────────────────────
+        let selected: any[] = Array.isArray(pipeline?.selected_demons) ? pipeline.selected_demons : [];
+        const postRelaxation: any[] = Array.isArray(pipeline?.post_relaxation_demons) ? pipeline.post_relaxation_demons : [];
+        const trace: any = pipeline?.trace ?? {};
 
-          const needed = 2 - pipeline_result.length;
-          const seenFill = new Set<string>();
-          const filled: any[] = [];
-          for (const d of rawDemons) {
-            if (seenFill.has(d.playerName)) continue;
-            seenFill.add(d.playerName);
-            filled.push({ ...d, fallback_render_used: true });
-            if (filled.length >= needed) break;
-          }
-
-          if (filled.length > 0) {
-            console.warn('[Demons] fallback_render_used=true — pipeline gave ' + pipeline_result.length + ', filled ' + filled.length + ' slots from raw demons');
-          }
-          return resolve([...pipeline_result, ...filled].slice(0, 2));
+        // Assertion: selected_demons must be a subset of post_relaxation_demons or empty
+        if (selected.length > 0 && postRelaxation.length === 0) {
+          console.warn('[Demons] ASSERT: selected non-empty but post_relaxation empty — unexpected');
         }
 
-        resolve(pipeline_result.slice(0, 2));
+        // If selected is empty but post_relaxation has survivors → use top2(post_relaxation)
+        if (selected.length === 0 && postRelaxation.length > 0) {
+          const seen = new Set<string>();
+          selected = postRelaxation
+            .sort((a: any, b: any) => (b.demonScore?.composite ?? 0) - (a.demonScore?.composite ?? 0))
+            .filter((d: any) => { if (seen.has(d.playerName)) return false; seen.add(d.playerName); return true; })
+            .slice(0, 2)
+            .map((d: any) => ({ ...d, fallback_render_used: true, fallback_reason: 'post_relaxation_bypass' }));
+          console.warn('[Demons] selected_demons was empty — used top2(post_relaxation), count=' + selected.length);
+        }
+
+        // Assertion: demons.length must be 0..2
+        if (selected.length > 2) {
+          console.warn('[Demons] ASSERT: selected.length=' + selected.length + ' > 2 — trimming');
+          selected = selected.slice(0, 2);
+        }
+
+        resolve({ demons: selected, trace });
       });
-      child.on('error', () => resolve([]));
+      child.on('error', (e: Error) => {
+        console.warn('[Demons] spawn error:', e.message);
+        resolve({ demons: [], trace: { error: e.message } });
+      });
     });
   }
 
@@ -225,11 +239,11 @@ export function registerRoutes(httpServer: Server, app: Express) {
       return res.json({ error: 'no props found for gameId=' + gameId + ' league=' + league });
     }
 
-    return new Promise<void>((done) => {
-      const scriptPath = path.resolve(process.cwd(), 'python', 'qualify_demons.py');
-      const python = process.env.PYTHON_BIN || 'python3';
-      let out = '', err = '';
-      // Pass bypass_test flag via env var — qualify_demons.py reads it
+    // Use runDemonPipeline with DEMON_BYPASS_TEST=1 via temp env override
+    const scriptPath = path.resolve(process.cwd(), 'python', 'qualify_demons.py');
+    const python = process.env.PYTHON_BIN || 'python3';
+    let out = '', errBuf = '';
+    await new Promise<void>((done) => {
       const child = spawn(python, [scriptPath], {
         timeout: 30_000,
         cwd: process.cwd(),
@@ -238,31 +252,29 @@ export function registerRoutes(httpServer: Server, app: Express) {
       child.stdin.write(JSON.stringify(gameProps));
       child.stdin.end();
       child.stdout.on('data', (d: Buffer) => { out += d.toString(); });
-      child.stderr.on('data', (d: Buffer) => { err += d.toString(); });
-      child.on('close', (code: number | null) => {
-        let selected: any[] = [];
-        let trace: any = null;
-        try {
-          const parsed = JSON.parse(out);
-          selected = Array.isArray(parsed) ? parsed : [];
-          if (selected.length > 0 && selected[0].pipelineTrace) {
-            trace = selected[0].pipelineTrace;
-          }
-        } catch { /* parse error */ }
-        res.json({
-          bypass_test: true,
-          league,
-          gameId: gameId || '(all)',
-          props_sent: gameProps.length,
-          selected_count: selected.length,
-          selected,
-          pipeline_trace: trace,
-          stderr_tail: err.slice(-1000),
-          exit_code: code,
-        });
-        done();
-      });
-      child.on('error', (e: Error) => { res.json({ error: e.message }); done(); });
+      child.stderr.on('data', (d: Buffer) => { errBuf += d.toString(); });
+      child.on('close', () => done());
+      child.on('error', () => done());
+    });
+
+    let pipeline: any = {};
+    try { pipeline = JSON.parse(out); } catch { /* ignore */ }
+
+    const bypassSelected: any[] = Array.isArray(pipeline?.selected_demons) ? pipeline.selected_demons : [];
+    const postRelaxation: any[] = Array.isArray(pipeline?.post_relaxation_demons) ? pipeline.post_relaxation_demons : [];
+    const trace: any = pipeline?.trace ?? {};
+
+    res.json({
+      bypass_test:              true,
+      league,
+      gameId:                   gameId || '(all)',
+      props_sent:               gameProps.length,
+      selected_count:           bypassSelected.length,
+      post_relaxation_count:    postRelaxation.length,
+      selected_demons:          bypassSelected,
+      post_relaxation_demons:   postRelaxation,
+      pipeline_trace:           trace,
+      stderr_tail:              errBuf.slice(-800),
     });
   });
 
@@ -294,18 +306,30 @@ export function registerRoutes(httpServer: Server, app: Express) {
       g.props.push(p);
     }
 
-    // Run qualify_demons for each game in parallel — picks exactly top 2
+    // Run demon pipeline for each game in parallel — exact route pattern
     const rawGames = Array.from(gameMap.values()).filter(g => !!g.gameId);
     const demonResults = await Promise.all(
-      rawGames.map(g => pickTop2Demons(g.props))
+      rawGames.map(g => runDemonPipeline(g.props))
     );
+
+    // Assertions on handoff
+    demonResults.forEach((r, i) => {
+      const g = rawGames[i];
+      if (!Array.isArray(r.demons)) {
+        console.error('[Demons] ASSERT: demons is not array for game', g.gameId);
+      }
+      if (r.demons.length > 2) {
+        console.error('[Demons] ASSERT: demons.length > 2 for game', g.gameId, '— got', r.demons.length);
+      }
+    });
 
     const games = rawGames
       .map((g, i) => ({
         ...g,
-        demons:    demonResults[i],   // exactly top 2 GOTit-qualified demons
-        goblins:   (g.props as any[]).filter((p: any) => p.isGoblin),
-        standards: (g.props as any[]).filter((p: any) => !p.isDemon && !p.isGoblin),
+        demons:               demonResults[i].demons,   // selected_demons (with post_relaxation fallback applied)
+        demon_pipeline_trace: demonResults[i].trace,    // full 8-stage trace
+        goblins:              (g.props as any[]).filter((p: any) => p.isGoblin),
+        standards:            (g.props as any[]).filter((p: any) => !p.isDemon && !p.isGoblin),
       }))
       .sort((a, b) => {
         if (!a.startTime) return 1;

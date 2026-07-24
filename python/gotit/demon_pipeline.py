@@ -849,3 +849,225 @@ def run_demon_pipeline(
         })
 
     return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Structured pipeline wrapper — used by qualify_demons.py
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_demon_pipeline_full(
+    raw_props: List[dict],
+    sharp_map: Optional[Dict[str, dict]] = None,
+    max_demons: int = 2,
+    bypass_test: bool = False,
+) -> dict:
+    """
+    Returns structured pipeline object:
+    {
+      'selected_demons':        list of output dicts (top-2 after all passes),
+      'post_relaxation_demons': list of ALL dicts that survived any relaxation tier,
+      'trace':                  pipeline_trace dict from 8 stages,
+    }
+
+    Route pattern:
+      pipeline = run_demon_pipeline_full(game_props)
+      selected = pipeline['selected_demons']
+      if not selected and pipeline['post_relaxation_demons']:
+          selected = top2(pipeline['post_relaxation_demons'])
+      game['demons'] = selected
+      game['demon_pipeline_trace'] = pipeline['trace']
+    """
+    import json as _json
+
+    sharp_map = sharp_map or {}
+    trace: dict = {'stages': {}, 'bypass_test': bypass_test, 'warnings': []}
+
+    def _t(stage: str, **kw) -> None:
+        trace['stages'][stage] = kw
+        log.info('[demon_S%s] %s', stage, ' | '.join(f'{k}={v}' for k, v in kw.items()))
+
+    def _assert(cond: bool, msg: str) -> None:
+        if not cond:
+            trace['warnings'].append('ASSERTION_FAIL: ' + msg)
+            log.error('[demon_ASSERT_FAIL] %s', msg)
+
+    # S1: ingest
+    raw_demons = [d for d in raw_props if d.get('isDemon')]
+    _t('S1_ingest',
+       raw_props_total=len(raw_props),
+       raw_demons=len(raw_demons),
+       ids=[str(d.get('propId') or d.get('id') or '')[:16] for d in raw_demons[:10]])
+    _assert(isinstance(raw_props, list), 'raw_props must be a list')
+
+    # S2: normalize
+    candidates: List[DemonRecord] = []
+    for d in raw_demons:
+        rec = _normalize(d, sharp_map)
+        if rec is None:
+            continue
+        candidates.append(rec)
+
+    b1 = [r for r in candidates if r.bucket == 1]
+    b2 = [r for r in candidates if r.bucket == 2]
+    b3 = [r for r in candidates if r.bucket == 3]
+    bx = [r for r in candidates if r.bucket is None]
+    _t('S2_normalize',
+       normalized=len(candidates),
+       b1_count=len(b1), b1_ids=[r.prop_id[:16] for r in b1],
+       b2_count=len(b2), b2_ids=[r.prop_id[:16] for r in b2],
+       b3_count=len(b3), b3_ids=[r.prop_id[:16] for r in b3],
+       hard_excluded=len(bx))
+    _assert(len(candidates) <= len(raw_demons),
+            f'normalize output ({len(candidates)}) > input ({len(raw_demons)})')
+
+    if not candidates:
+        _t('S3_hard_gate', survivors=0, note='no candidates')
+        _t('S4_relaxation', survivors=0)
+        _t('S5_post_relaxation', count=0, ids=[])
+        _t('S6_pick_top2', selected=0, ids=[])
+        _t('S7_bypass', bypass_test=bypass_test, bypass_used=False, post_relaxation_available=0)
+        _t('S8_output', count=0)
+        log.info('[demon_TRACE] %s', _json.dumps(trace, default=str))
+        return {'selected_demons': [], 'post_relaxation_demons': [], 'trace': trace}
+
+    # S3: hard gate snapshot
+    hard_survivors = []
+    hard_killed = []
+    for rec in candidates:
+        killed = False
+        for gate_name, gate_fn in [
+            ('excluded_stat',    lambda r: _hard_gate_excluded(r)),
+            ('line_floor',       lambda r: _hard_gate_line_floor(r)),
+            ('injury',           lambda r: _hard_gate_injury(r)),
+            ('overpriced_sharp', lambda r: _hard_gate_overpriced(r, SOFT_TIERS[0][1])),
+            ('near_certain',     lambda r: _hard_gate_near_certain(r)),
+            ('script_conflict',  lambda r: _hard_gate_script_conflict(r)),
+        ]:
+            reason = gate_fn(rec)
+            if reason:
+                hard_killed.append({'id': rec.prop_id[:16], 'name': rec.player_name,
+                                    'stat': rec.stat_type, 'gate': gate_name, 'reason': reason})
+                killed = True
+                break
+        if not killed:
+            hard_survivors.append(rec)
+    _t('S3_hard_gate',
+       input=len(candidates),
+       survivors=len(hard_survivors),
+       killed=len(hard_killed),
+       survivor_ids=[r.prop_id[:16] for r in hard_survivors],
+       killed_log=hard_killed[:10])
+    _assert(len(hard_survivors) + len(hard_killed) == len(candidates), 'S3: counts must sum')
+
+    # S4: relaxation — bucket 1 → 2 → 3
+    selected: List[DemonRecord] = []
+    relaxation_log: List[dict] = []
+    all_tier_survivors: List[DemonRecord] = []
+    seen_pool_ids: set = set()
+
+    for bucket_num, bucket_filter, is_junk in [(1, {1}, False), (2, {2}, False), (3, {3}, True)]:
+        for prob_floor, market_tol, role_floor, label in SOFT_TIERS:
+            tier_s = _run_tier(
+                candidates, prob_floor, market_tol, role_floor, label,
+                bucket_filter=bucket_filter,
+                is_junk_pass=is_junk,
+            )
+            for r in tier_s:
+                if r.prop_id not in seen_pool_ids:
+                    seen_pool_ids.add(r.prop_id)
+                    all_tier_survivors.append(r)
+            new_picks = _pick_top(tier_s, selected, max(0, max_demons - len(selected)))
+            relaxation_log.append({
+                'bucket': bucket_num, 'tier': label,
+                'tier_survivors': len(tier_s),
+                'new_picks': len(new_picks),
+                'pick_ids': [r.prop_id[:16] for r in new_picks],
+            })
+            if new_picks:
+                selected.extend(new_picks)
+            if len(selected) >= max_demons:
+                break
+        if len(selected) >= max_demons:
+            break
+
+    all_tier_survivors.sort(key=lambda r: r.demon_score, reverse=True)
+
+    _t('S4_relaxation',
+       tiers_run=len(relaxation_log),
+       relaxation_log=relaxation_log,
+       post_relaxation_count=len(all_tier_survivors),
+       post_relaxation_ids=[r.prop_id[:16] for r in all_tier_survivors])
+    _assert(all(r.eligible_demon for r in all_tier_survivors),
+            'S4: all post-relaxation survivors must be eligible_demon=True')
+
+    # S5: post-relaxation pool snapshot
+    _t('S5_post_relaxation',
+       count=len(all_tier_survivors),
+       ids=[r.prop_id[:16] for r in all_tier_survivors],
+       top_scores=[(r.prop_id[:12], round(r.demon_score, 4), r.bucket, r.tier_used)
+                   for r in all_tier_survivors[:5]])
+    _assert(len(selected) <= max_demons,
+            f'S5: selected ({len(selected)}) > max_demons ({max_demons})')
+
+    # S6: pick_top2 result
+    _t('S6_pick_top2',
+       selected=len(selected),
+       ids=[r.prop_id[:16] for r in selected],
+       scores=[(r.prop_id[:12], round(r.demon_score, 4), r.bucket, r.tier_used)
+               for r in selected])
+    _assert(len({r.player_name for r in selected}) == len(selected),
+            'S6: duplicate players in selection')
+    if len(all_tier_survivors) >= max_demons:
+        _assert(len(selected) == max_demons,
+                f'S6: {len(all_tier_survivors)} survivors available but only {len(selected)} selected')
+
+    # S7: bypass test
+    bypass_used = False
+    if bypass_test and len(all_tier_survivors) >= 2:
+        selected = _pick_top(all_tier_survivors, [], max_demons)
+        bypass_used = True
+        log.info('[demon_S7_BYPASS] override with top2(post_relaxation): %s',
+                 [r.prop_id[:16] for r in selected])
+    _t('S7_bypass',
+       bypass_test=bypass_test,
+       bypass_used=bypass_used,
+       post_relaxation_available=len(all_tier_survivors),
+       bypass_ids=[r.prop_id[:16] for r in selected] if bypass_used else [])
+
+    # S8: output
+    _t('S8_output',
+       count=len(selected),
+       bypass_used=bypass_used,
+       ids=[r.prop_id[:16] for r in selected])
+    _assert(len(selected) <= max_demons, 'S8: output exceeds max_demons')
+    _assert(all(r.eligible_demon for r in selected), 'S8: ineligible demon in output')
+
+    if len(selected) < max_demons:
+        msg = (f'only {len(selected)}/{max_demons} demons — '
+               f'{len(candidates)} candidates, {len(all_tier_survivors)} post-relaxation survivors')
+        trace['warnings'].append(msg)
+        log.warning('[demon_pipeline] WARNING: %s', msg)
+
+    log.info('[demon_TRACE] %s', _json.dumps(trace, default=str))
+
+    def _to_dict(rec: DemonRecord) -> dict:
+        return {
+            **rec.raw,
+            'isDemon': True,
+            'demonScore': {
+                'composite':    rec.demon_score,
+                'p_win':        rec.proj_hit_prob,
+                'line':         rec.pp_line,
+                'stat':         rec.stat_type,
+                'bucket':       rec.bucket,
+                'tier':         rec.tier_used,
+                'gates_passed': rec.gates_passed,
+                'gates_failed': rec.gates_failed,
+            },
+        }
+
+    return {
+        'selected_demons':        [_to_dict(r) for r in selected],
+        'post_relaxation_demons': [_to_dict(r) for r in all_tier_survivors],
+        'trace':                  trace,
+    }
