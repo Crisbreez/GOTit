@@ -354,6 +354,17 @@ export function registerRoutes(httpServer: Server, app: Express) {
         return new Date(a.startTime).getTime() - new Date(b.startTime).getTime();
       });
 
+    // ── Debug: log game object shape for each game ────────────────────────────
+    games.forEach(g => {
+      console.log(
+        '[SLATE_DEBUG] game=' + g.gameId +
+        ' | standards(raw)=' + (g.standards?.length ?? 0) +
+        ' | demons(pipeline)=' + (g.demons?.length ?? 0) +
+        ' | goblins=' + (g.goblins?.length ?? 0) +
+        ' | demon_players=' + (g.demons?.map((d: any) => d.playerName) || []).join(',')
+      );
+    });
+
     const lastPull = await storage.getLastPull(league);
     const provState = getProviderState(league);
 
@@ -369,6 +380,121 @@ export function registerRoutes(httpServer: Server, app: Express) {
       lastSuccessfulPullAt: provState.lastSuccessfulPullAt,
       rateLimited: provState.rateLimited ?? false,
       cooldownMs: provState.cooldownRemainingMs ?? null,
+    });
+  });
+
+  // ── Debug: dump optimizer result vs game object for a specific game ──────────
+  // Usage: GET /api/debug/game?league=MLB&gameId=<gameId>
+  // Returns: { game_standards_raw, game_demons_pipeline, optimizer_six_legs, optimizer_two_demons, mismatches }
+  app.get('/api/debug/game', async (req, res) => {
+    const league  = (req.query.league  as string || 'MLB').toUpperCase();
+    const gameId  = req.query.gameId   as string;
+
+    // 1. Fetch raw props from DB
+    const rawProps = await storage.getProps(league);
+    const gameProps = gameId
+      ? rawProps.filter((p: any) => (p.gameId || p.gameMatchup || 'unknown') === gameId)
+      : rawProps;
+
+    if (gameProps.length === 0) {
+      return res.status(404).json({ error: 'no props found for gameId', gameId, league });
+    }
+
+    // 2. Run demon pipeline on this game's props
+    const demonResult = await runDemonPipeline(gameProps);
+
+    // 3. Run optimizer on non-demon props only
+    const nonDemonProps = gameProps.filter((p: any) => !p.isDemon);
+    let optimizerResult: any = null;
+    let optimizerError:  any = null;
+
+    if (nonDemonProps.length >= 6) {
+      await new Promise<void>((done) => {
+        const scriptPath = path.resolve(process.cwd(), 'python', 'optimize.py');
+        const python     = process.env.PYTHON_BIN || 'python3';
+        let out = '', err = '';
+        const child = spawn(python, [scriptPath], { timeout: 30_000, cwd: process.cwd() });
+        child.stdin.write(JSON.stringify(nonDemonProps));
+        child.stdin.end();
+        child.stdout.on('data', (d: Buffer) => { out += d.toString(); });
+        child.stderr.on('data', (d: Buffer) => { err += d.toString(); });
+        child.on('close', () => {
+          try { optimizerResult = JSON.parse(out); } catch { optimizerError = out.slice(0, 300); }
+          if (!optimizerResult) optimizerError = (optimizerError || '') + ' | stderr: ' + err.slice(0, 300);
+          done();
+        });
+        child.on('error', (e: Error) => { optimizerError = e.message; done(); });
+      });
+    } else {
+      optimizerError = `only ${nonDemonProps.length} non-demon props — need 6`;
+    }
+
+    const gameOptOut = optimizerResult?.[gameId] || null;
+    const sixLegs    = gameOptOut?.six_legs   || [];
+    const twoDemonsOpt = gameOptOut?.two_demons || [];
+
+    // 4. Build game object exactly as /api/slate does
+    const gameStandardsRaw = gameProps.filter((p: any) => !p.isDemon && !p.isGoblin);
+    const gameGoblins      = gameProps.filter((p: any) => p.isGoblin);
+    const gameDemonsPipeline = demonResult.demons;
+
+    // 5. Check for mismatches
+    const mismatches: string[] = [];
+
+    // six_legs player uniqueness
+    const sixLegPlayers = sixLegs.map((l: any) => l.player_name);
+    if (new Set(sixLegPlayers).size !== sixLegs.length) {
+      mismatches.push('DUPLICATE_PLAYERS_IN_SIX_LEGS: ' + sixLegPlayers.join(', '));
+    }
+    if (sixLegs.length !== 6 && sixLegs.length !== 0) {
+      mismatches.push('SIX_LEGS_COUNT=' + sixLegs.length + ' (expected 6)');
+    }
+
+    // demon leaks into six_legs
+    const demonLeaks = sixLegs.filter((l: any) => l.tier === 'demon');
+    if (demonLeaks.length > 0) {
+      mismatches.push('DEMON_LEAK_IN_SIX_LEGS: ' + demonLeaks.map((l: any) => l.player_name).join(', '));
+    }
+
+    // non-demon leaks into two_demons
+    const nonDemonLeaks = twoDemonsOpt.filter((l: any) => l.tier !== 'demon');
+    if (nonDemonLeaks.length > 0) {
+      mismatches.push('NON_DEMON_IN_TWO_DEMONS: ' + nonDemonLeaks.map((l: any) => l.player_name + '/' + l.tier).join(', '));
+    }
+
+    // pipeline demons count
+    if (gameDemonsPipeline.length < 1) {
+      mismatches.push('PIPELINE_DEMONS_COUNT=' + gameDemonsPipeline.length + ' (expected 1-2)');
+    }
+
+    res.json({
+      gameId,
+      league,
+      mismatches,
+      game_standards_raw_count:    gameStandardsRaw.length,
+      game_goblins_count:          gameGoblins.length,
+      game_demons_pipeline_count:  gameDemonsPipeline.length,
+      game_demons_pipeline:        gameDemonsPipeline.map((d: any) => ({
+        playerName: d.playerName, statType: d.statType, lineScore: d.lineScore,
+        isDemon: d.isDemon, tier: d.tier, bucket: d.demonScore?.bucket,
+      })),
+      optimizer_six_legs_count:    sixLegs.length,
+      optimizer_six_legs:          sixLegs.map((l: any) => ({
+        player_name: l.player_name, stat_type: l.stat_type, tier: l.tier,
+        line: l.line, direction: l.direction, p_win: l.p_win,
+      })),
+      optimizer_two_demons_count:  twoDemonsOpt.length,
+      optimizer_two_demons:        twoDemonsOpt.map((l: any) => ({
+        player_name: l.player_name, stat_type: l.stat_type, tier: l.tier, p_win: l.p_win,
+      })),
+      optimizer_error: optimizerError,
+      pipeline_trace_summary: demonResult.trace?.stages
+        ? Object.fromEntries(
+            Object.entries(demonResult.trace.stages).map(([k, v]: [string, any]) => [
+              k, { count: v.survivors ?? v.count ?? v.selected ?? '?', note: v.note }
+            ])
+          )
+        : demonResult.trace,
     });
   });
 
