@@ -1917,8 +1917,12 @@ def select_legs_for_slate(
                 }
             return d
 
+        # six_legs = non-demon legs ONLY.
+        # two_demons = demon legs ONLY (from MILP y_j pool).
+        # These must be separate. Frontend materializes six_legs as the
+        # standard card roster — demons must never appear in six_legs.
         output[game_id] = {
-            "six_legs":   [leg_to_dict(lg) for lg in selected],
+            "six_legs":   [leg_to_dict(lg) for lg in non_demons],
             "two_demons": [leg_to_dict(lg) for lg in demons],
             "meta": {
                 "slate_breakeven_r6":    round(r_star_6, 4),

@@ -375,7 +375,7 @@ def main():
 
     # Enrich each output leg with nondemon pipeline metadata
     for game_id, game_data in output.items():
-        for leg in game_data.get('legs', []):
+        for leg in game_data.get('six_legs', []):  # six_legs = non-demon legs only
             pid = leg.get('prop_id') or leg.get('propId') or ''
             nd = nd_lookup.get(pid)
             if nd:
