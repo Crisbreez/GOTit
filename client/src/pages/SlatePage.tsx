@@ -992,17 +992,33 @@ export default function SlatePage() {
       }
 
       // ── Step 4: Enrich demon picks from demon pipeline (already selected) ──
-      // game.demons is already the pipeline selected set from the backend.
-      // Just enrich with any MILP demon leg metadata if present.
+      //
+      // AUTHORITY RULE:
+      //   game.demons  = demon pipeline output (runDemonPipeline) — DISPLAY SOURCE OF TRUTH
+      //   opt.two_demons = MILP y_j output — used ONLY for p_win/ev enrichment metadata
+      //
+      // Defense (Bug 3): opt.two_demons must NEVER replace or filter game.demons.
+      // If opt.two_demons is used as the roster, the demon pipeline is bypassed.
+      // Enrichment only — game.demons roster is immutable after pipeline.
       const demonLegLookup = new Map<string, OptimizerLeg>();
       for (const leg of (opt.two_demons || []) as OptimizerLeg[]) {
+        // Guard: only index legs that are actually demons
+        if (leg.tier !== 'demon') {
+          console.error('[GOTit] EMIT_GUARD: non-demon in two_demons — skipped', leg.player_name, leg.stat_type);
+          continue;
+        }
         if (leg.prop_id) demonLegLookup.set(leg.prop_id, leg);
         demonLegLookup.set(`${leg.player_name}|${leg.stat_type}`, leg);
       }
+      // Enrich game.demons (pipeline roster) with MILP metadata only — never replace
       const enrichedDemons = g.demons.map((d: any) => {
         const leg = demonLegLookup.get(d.id) || demonLegLookup.get(`${d.playerName}|${d.statType}`);
         return leg ? { ...d, pWin: leg.p_win, evMarginal: leg.ev_marginal } : d;
       });
+      // Roster length must equal game.demons length — enrichment never adds or removes
+      if (enrichedDemons.length !== g.demons.length) {
+        console.error('[GOTit] EMIT_GUARD: enrichedDemons.length changed — roster corrupted', g.gameId);
+      }
 
       // Demon invariant check
       if (enrichedDemons.length < 1 || enrichedDemons.length > 2) {

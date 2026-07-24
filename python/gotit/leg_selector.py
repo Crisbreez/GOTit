@@ -1917,13 +1917,47 @@ def select_legs_for_slate(
                 }
             return d
 
-        # six_legs = non-demon legs ONLY.
-        # two_demons = demon legs ONLY (from MILP y_j pool).
-        # These must be separate. Frontend materializes six_legs as the
-        # standard card roster — demons must never appear in six_legs.
+        # ── Output integrity: enforce separation before emit ─────────────────
+        # Defense 1: six_legs must contain ZERO demons.
+        # Defense 2: two_demons must contain ZERO non-demons.
+        # These fire as hard assertions — if either fails, the game is dropped.
+        six_legs_out  = [lg for lg in non_demons if lg.tier != Tier.DEMON]
+        two_demons_out = [lg for lg in demons    if lg.tier == Tier.DEMON]
+
+        if len(six_legs_out) != len(non_demons):
+            log.error(
+                "EMIT_ASSERT: demon leaked into six_legs — game=%s dropped "
+                "(%d non_demons → %d after filter)",
+                game_id, len(non_demons), len(six_legs_out),
+            )
+            continue  # drop game — never emit a poisoned card
+
+        if len(two_demons_out) != len(demons):
+            log.error(
+                "EMIT_ASSERT: non-demon leaked into two_demons — game=%s "
+                "(%d demons → %d after filter)",
+                game_id, len(demons), len(two_demons_out),
+            )
+            continue
+
+        if len(six_legs_out) != 6:
+            log.error(
+                "EMIT_ASSERT: six_legs.length == %d, expected 6 — game=%s dropped",
+                len(six_legs_out), game_id,
+            )
+            continue
+
+        unique_emit_players = len({lg.player_id for lg in six_legs_out})
+        if unique_emit_players != 6:
+            log.error(
+                "EMIT_ASSERT: unique players in six_legs == %d, expected 6 — game=%s dropped",
+                unique_emit_players, game_id,
+            )
+            continue
+
         output[game_id] = {
-            "six_legs":   [leg_to_dict(lg) for lg in non_demons],
-            "two_demons": [leg_to_dict(lg) for lg in demons],
+            "six_legs":   [leg_to_dict(lg) for lg in six_legs_out],
+            "two_demons": [leg_to_dict(lg) for lg in two_demons_out],
             "meta": {
                 "slate_breakeven_r6":    round(r_star_6, 4),
                 "portfolio_win_score":    round(port_ev / 6, 6),

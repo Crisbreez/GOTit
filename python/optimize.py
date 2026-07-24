@@ -373,7 +373,66 @@ def main():
     )
     nd_lookup = {r.prop_id: r for r in nd_all_records}
 
-    # Enrich each output leg with nondemon pipeline metadata
+    # ── Defense: validate output before enrichment and emit ──────────────────
+    # Defense 1: six_legs must not contain demons.
+    # Defense 2: two_demons must not contain non-demons.
+    # Defense 3: enrichment loop must key off six_legs (never 'legs').
+    clean_output = {}
+    for game_id, game_data in output.items():
+        six  = game_data.get('six_legs', [])
+        two  = game_data.get('two_demons', [])
+
+        # Reject any leg in six_legs that carries tier==demon
+        demon_leak = [l for l in six if l.get('tier') == 'demon']
+        if demon_leak:
+            logging.error(
+                '[optimize] EMIT_GUARD: %d demon(s) found in six_legs for game=%s — game dropped. '
+                'Leaked: %s',
+                len(demon_leak), game_id,
+                [(l.get('player_name'), l.get('stat_type')) for l in demon_leak],
+            )
+            continue  # drop poisoned game
+
+        # Reject any leg in two_demons that is not a demon
+        non_demon_leak = [l for l in two if l.get('tier') != 'demon']
+        if non_demon_leak:
+            logging.error(
+                '[optimize] EMIT_GUARD: %d non-demon(s) found in two_demons for game=%s — stripped.',
+                len(non_demon_leak), game_id,
+            )
+            game_data['two_demons'] = [l for l in two if l.get('tier') == 'demon']
+
+        # six_legs count must be exactly 6
+        if len(six) != 6:
+            logging.error(
+                '[optimize] EMIT_GUARD: six_legs.length == %d for game=%s — game dropped.',
+                len(six), game_id,
+            )
+            continue
+
+        # Unique player check on six_legs
+        players = [l.get('player_name', '') for l in six]
+        if len(set(players)) != 6:
+            logging.error(
+                '[optimize] EMIT_GUARD: unique players in six_legs == %d for game=%s — game dropped. '
+                'Players: %s',
+                len(set(players)), game_id, players,
+            )
+            continue
+
+        # Note on two_demons vs demon pipeline:
+        # two_demons here is the MILP y_j output — used by the frontend ONLY for
+        # p_win enrichment metadata on demon cards. The actual demon display roster
+        # comes from game.demons (set by runDemonPipeline in routes.ts).
+        # These are two separate authorities and must never be conflated.
+        # The frontend SlatePage.tsx reads opt.two_demons for enrichment only.
+        game_data['_emit_validated'] = True
+        clean_output[game_id] = game_data
+
+    output = clean_output
+
+    # Enrich each six_legs leg with nondemon pipeline metadata
+    # Key is always 'six_legs' — never 'legs' (that key does not exist in output)
     for game_id, game_data in output.items():
         for leg in game_data.get('six_legs', []):  # six_legs = non-demon legs only
             pid = leg.get('prop_id') or leg.get('propId') or ''
