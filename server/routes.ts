@@ -312,25 +312,42 @@ export function registerRoutes(httpServer: Server, app: Express) {
       rawGames.map(g => runDemonPipeline(g.props))
     );
 
-    // Assertions on handoff
-    demonResults.forEach((r, i) => {
-      const g = rawGames[i];
-      if (!Array.isArray(r.demons)) {
-        console.error('[Demons] ASSERT: demons is not array for game', g.gameId);
-      }
-      if (r.demons.length > 2) {
-        console.error('[Demons] ASSERT: demons.length > 2 for game', g.gameId, '— got', r.demons.length);
-      }
-    });
-
+    // Build games — pipeline.selected_demons is the ONLY source of truth for demons.
+    // No re-filter, no rebuild, no override after this point.
     const games = rawGames
-      .map((g, i) => ({
-        ...g,
-        demons:               demonResults[i].demons,   // selected_demons (with post_relaxation fallback applied)
-        demon_pipeline_trace: demonResults[i].trace,    // full 8-stage trace
-        goblins:              (g.props as any[]).filter((p: any) => p.isGoblin),
-        standards:            (g.props as any[]).filter((p: any) => !p.isDemon && !p.isGoblin),
-      }))
+      .map((g, i) => {
+        const pipeline = demonResults[i];
+        // selected_demons is source of truth — assign directly, never re-derive
+        const demons: any[] = pipeline.demons;  // already has post_relaxation fallback applied
+
+        // ── Hard assertion: selected_demons must not be lost ─────────────────
+        // If pipeline produced demons but the slot ended up empty, something
+        // clobbered them between pipeline output and slate response.
+        if (pipeline.demons.length > 0 && demons.length === 0) {
+          console.error(
+            '[Demons] ASSERTION_FAIL: selected_demons lost in slate route',
+            'gameId=' + g.gameId,
+            'pipeline.demons.length=' + pipeline.demons.length,
+            'demons.length=' + demons.length,
+          );
+        }
+
+        // Assertion: must be array, must be 0..2
+        if (!Array.isArray(demons)) {
+          console.error('[Demons] ASSERT: demons is not array for game', g.gameId);
+        }
+        if (demons.length > 2) {
+          console.error('[Demons] ASSERT: demons.length > 2 for game', g.gameId, '— got', demons.length);
+        }
+
+        return {
+          ...g,
+          demons,                              // source of truth: pipeline.selected_demons
+          demon_pipeline_trace: pipeline.trace, // full 8-stage trace
+          goblins:   (g.props as any[]).filter((p: any) => p.isGoblin),
+          standards: (g.props as any[]).filter((p: any) => !p.isDemon && !p.isGoblin),
+        };
+      })
       .sort((a, b) => {
         if (!a.startTime) return 1;
         if (!b.startTime) return -1;
