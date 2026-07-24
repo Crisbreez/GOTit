@@ -441,8 +441,10 @@ function GameCard({ game, selectedIds, onToggle, atMax, onSave, isSaving }: {
 
   // Direction is GOTit-decided and locked. No flip. No override.
 
-  const allStandards = [...game.standards, ...game.goblins]
-    .sort((a, b) => (b.propScore ?? 0) - (a.propScore ?? 0));
+  // game.standards is the MILP-selected set — already exactly 6 legs, already ordered.
+  // Never merge goblins back in; goblins are absorbed into standards by the optimizer.
+  // Never sort the full raw pool — display selected set only.
+  const allStandards = game.standards;
   const visibleProps = propCount > 0 ? allStandards.slice(0, propCount) : [];
 
   // Props visible on this card (standards + demons when activated)
@@ -903,53 +905,124 @@ export default function SlatePage() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data?.pulledAt, league]);
 
-  // Merge optimizer results into games: re-rank standards by p_win, replace demons
+  // ── Two-layer model: MILP selected set is the only display source of truth ──
+  //
+  // Layer 1 (raw):      game.standards_raw  — full PP candidate pool, never displayed
+  // Layer 2 (selected): game.standards      — exactly the 6 MILP-selected non-demon legs
+  //                     game.demons         — exactly the 1–2 demon pipeline selected legs
+  //
+  // Pattern: candidate generation → MILP solve → materialization → validate → render selected only
+  // No fallback to raw pool. If invariants fail, game is marked invalid and hidden.
   const optimizedGames: GameCard[] = useMemo(() => {
     if (!optimizerResult) return games;
     return games.map(g => {
       const opt = optimizerResult[g.gameId];
-      if (!opt) return g;
 
-      // Build p_win lookup by player_name+stat_type (prop_id may differ)
-      const legLookup = new Map<string, OptimizerLeg>();
-      for (const leg of [...(opt.six_legs || []), ...(opt.two_demons || [])]) {
-        const key = `${leg.player_name}|${leg.stat_type}`;
-        legLookup.set(key, leg);
-        if (leg.prop_id) legLookup.set(leg.prop_id, leg);
+      // No optimizer result for this game — hide it entirely (no raw fallback)
+      if (!opt || !Array.isArray(opt.six_legs) || opt.six_legs.length === 0) {
+        return { ...g, standards: [], goblins: [], _milpValid: false };
       }
 
-      function enrichProp(p: Prop): Prop {
-        const key = `${p.playerName}|${p.statType}`;
-        const leg = legLookup.get(p.id || '') || legLookup.get(key);
-        if (!leg) return p;
-        return { ...p, pWin: leg.p_win, evMarginal: leg.ev_marginal, evCorrAdj: leg.ev_corr_adj, demonScore: leg.demon_score };
+      // ── Step 1: Build raw prop index by stable keys ────────────────────────
+      // Keys: prop_id (if present) and player_name|stat_type|direction
+      const rawPool = new Map<string, Prop>();
+      for (const p of [...g.standards, ...g.goblins]) {
+        if (p.id) rawPool.set(p.id, p);
+        const dirKey = `${p.playerName}|${p.statType}|${(p.direction || 'over').toLowerCase()}`;
+        rawPool.set(dirKey, p);
+        // Also index without direction for looser match
+        rawPool.set(`${p.playerName}|${p.statType}`, p);
       }
 
-      // Filter standards+goblins to ONLY the MILP-selected six_legs.
-      // The optimizer is the source of truth for which props appear.
-      // Raw PP props that were not selected by the MILP do not show.
-      const sixLegIds = new Set((opt.six_legs || []).map((l: OptimizerLeg) => l.prop_id).filter(Boolean));
-      const sixLegKeys = new Set((opt.six_legs || []).map((l: OptimizerLeg) => `${l.player_name}|${l.stat_type}`));
+      // ── Step 2: Materialize MILP selected legs from raw pool ───────────────
+      // For each six_legs entry, find its canonical raw PP prop object.
+      // Enrich it with MILP metadata (p_win, ev, edge reasons).
+      // If no raw prop matches, construct a synthetic prop from the leg data.
+      const materialized: Prop[] = [];
+      for (const leg of opt.six_legs as OptimizerLeg[]) {
+        const dirKey = `${leg.player_name}|${leg.stat_type}|${(leg.direction || 'over').toLowerCase()}`;
+        const rawProp =
+          (leg.prop_id ? rawPool.get(leg.prop_id) : undefined) ||
+          rawPool.get(dirKey) ||
+          rawPool.get(`${leg.player_name}|${leg.stat_type}`);
 
-      const selectedStandards = [...g.standards, ...g.goblins]
-        .filter((p: Prop) => sixLegIds.has(p.id) || sixLegKeys.has(`${p.playerName}|${p.statType}`))
-        .map(enrichProp)
-        .sort((a, b) => (b.pWin ?? b.propScore ?? 0) - (a.pWin ?? a.propScore ?? 0));
+        const enriched: Prop = rawProp
+          ? {
+              ...rawProp,
+              pWin:       leg.p_win,
+              evMarginal: leg.ev_marginal,
+              evCorrAdj:  leg.ev_corr_adj,
+              edgeReasons: (leg as any).edgeReasons,
+              selectedByMilp: true,
+            }
+          : {
+              // Synthetic fallback — MILP selected this leg but no raw PP prop matched key
+              id:           leg.prop_id || `${leg.player_name}|${leg.stat_type}`,
+              playerName:   leg.player_name,
+              statType:     leg.stat_type,
+              lineScore:    leg.line,
+              direction:    leg.direction,
+              pWin:         leg.p_win,
+              evMarginal:   leg.ev_marginal,
+              evCorrAdj:    leg.ev_corr_adj,
+              isDemon:      false,
+              isGoblin:     leg.tier === 'goblin',
+              selectedByMilp: true,
+              _synthetic:   true,
+            } as any;
 
-      // Fallback: if optimizer returned no six_legs for this game, show enriched raw props
-      const enrichedStandards = selectedStandards.length >= 6
-        ? selectedStandards
-        : g.standards.map(enrichProp).sort((a, b) => (b.pWin ?? b.propScore ?? 0) - (a.pWin ?? a.propScore ?? 0));
-      const enrichedGoblins = selectedStandards.length >= 6
-        ? []   // goblins already merged into selectedStandards above
-        : g.goblins.map(enrichProp).sort((a, b) => (b.pWin ?? b.propScore ?? 0) - (a.pWin ?? a.propScore ?? 0));
+        materialized.push(enriched);
+      }
 
-      // PP is the display source of truth for demons — never replace PP's isDemon=true props.
-      // The optimizer enriches demons with p_win but does NOT reassign which props are demons.
-      // PP's odds_type=="demon" flag from the pull is the only authority on demon status.
-      const enrichedDemons = g.demons.map(enrichProp);
+      // ── Step 3: Validate invariants ────────────────────────────────────────
+      const playerIds = materialized.map(p => p.playerName); // use playerName as player key
+      const uniquePlayers = new Set(playerIds).size;
+      const milpValid =
+        materialized.length === 6 &&
+        uniquePlayers === 6;
 
-      return { ...g, standards: enrichedStandards, goblins: enrichedGoblins, demons: enrichedDemons };
+      if (!milpValid) {
+        console.error(
+          '[GOTit] INVARIANT_FAIL game=' + g.gameId,
+          '| standards.length=' + materialized.length + ' (expected 6)',
+          '| unique_players=' + uniquePlayers + ' (expected 6)',
+        );
+        // Do not render raw fallback — mark invalid, show nothing
+        return { ...g, standards: [], goblins: [], _milpValid: false };
+      }
+
+      // ── Step 4: Enrich demon picks from demon pipeline (already selected) ──
+      // game.demons is already the pipeline selected set from the backend.
+      // Just enrich with any MILP demon leg metadata if present.
+      const demonLegLookup = new Map<string, OptimizerLeg>();
+      for (const leg of (opt.two_demons || []) as OptimizerLeg[]) {
+        if (leg.prop_id) demonLegLookup.set(leg.prop_id, leg);
+        demonLegLookup.set(`${leg.player_name}|${leg.stat_type}`, leg);
+      }
+      const enrichedDemons = g.demons.map((d: any) => {
+        const leg = demonLegLookup.get(d.id) || demonLegLookup.get(`${d.playerName}|${d.statType}`);
+        return leg ? { ...d, pWin: leg.p_win, evMarginal: leg.ev_marginal } : d;
+      });
+
+      // Demon invariant check
+      if (enrichedDemons.length < 1 || enrichedDemons.length > 2) {
+        console.error(
+          '[GOTit] DEMON_INVARIANT_FAIL game=' + g.gameId,
+          '| demons.length=' + enrichedDemons.length + ' (expected 1–2)',
+        );
+      }
+
+      // ── Step 5: Return selected roster only ───────────────────────────────
+      // standards = exactly the 6 MILP-selected legs (materialized from raw)
+      // goblins   = [] (goblins are merged into standards by the MILP)
+      // demons    = exactly the pipeline-selected demon legs
+      return {
+        ...g,
+        standards:   materialized,
+        goblins:     [],
+        demons:      enrichedDemons,
+        _milpValid:  true,
+      };
     });
   }, [games, optimizerResult]);
 
