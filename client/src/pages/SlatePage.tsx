@@ -522,32 +522,24 @@ function GameCard({ game, optResult, selectedIds, onToggle, atMax, onSave, isSav
   const isActivated = propCount > 0;
 
   // ── GameSelection: materialize MILP selected set from raw pool ─────────────
-  // standards = exactly the MILP six_legs materialized from raw PP props
-  // demons    = demon pipeline roster (game.demons), enriched with two_demons metadata
-  // ready     = optimizer has fired and selection is materialized
-  // error     = validation failure message (shown instead of raw fallback)
+  // If optimizer has results → materialize from six_legs (selected set only)
+  // If optimizer not ready  → show raw standards sorted by propScore (interim display)
+  // demons always come from game.demons (pipeline), enriched with two_demons metadata
   const gameSelection: GameSelection = useMemo(() => {
-    if (!optResult) {
-      // Optimizer hasn't fired yet — not ready, show skeleton
-      return { standards: [], demons: game.demons ?? [], ready: false };
+    if (!optResult || !Array.isArray(optResult.six_legs) || optResult.six_legs.length === 0) {
+      // Optimizer not ready or returned nothing — show raw standards as interim
+      const rawStandards = [...(game.standards ?? []), ...(game.goblins ?? [])]
+        .filter((p: any) => !p.isDemon)
+        .sort((a: any, b: any) => (b.propScore ?? 0) - (a.propScore ?? 0));
+      return { standards: rawStandards, demons: game.demons ?? [], ready: false };
     }
     const { standards, demons } = materializeSelectedGame(game, optResult);
     return { standards, demons, ready: true };
   }, [game, optResult]);
 
-  // Show skeleton while optimizer is loading
-  if (!gameSelection.ready) {
-    return (
-      <div className="game-card animate-in" style={{ opacity: 0.5 }}>
-        <div style={{ padding: '16px', fontSize: '13px', color: '#888', textAlign: 'center' }}>
-          Loading picks...
-        </div>
-      </div>
-    );
-  }
-
-  // Validate selection before rendering — no raw fallback
-  const validationError = isActivated
+  // Validate selection only when optimizer has fired (ready=true)
+  // Raw interim display is not validated — it's a preview only
+  const validationError = (isActivated && gameSelection.ready)
     ? validateSelection(gameSelection, propCount)
     : null;
 
