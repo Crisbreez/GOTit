@@ -119,6 +119,88 @@ interface SlateResponse {
   cooldownMs?: number | null;
 }
 
+// ── GameSelection architecture ────────────────────────────────────────────────
+// Two-layer model: raw pool (from /api/slate) + selected set (from /api/optimize).
+// Only the selected set is ever rendered. Raw pool is never displayed.
+
+type GameSelection = {
+  standards: Prop[];   // exactly the N MILP-selected non-demon legs
+  demons:    Prop[];   // exactly the 1-2 demon pipeline selected legs
+  ready:     boolean;
+  error?:    string | null;
+};
+
+// Stable key for matching a raw Prop to an OptimizerLeg
+function keyForProp(p: Prop): string {
+  return `${p.id}|${p.playerName}|${p.statType}|${p.lineScore}|${(p.direction || 'over').toLowerCase()}`;
+}
+
+// Stable key for matching an OptimizerLeg to a raw Prop
+function keyForLeg(l: OptimizerLeg): string {
+  return `${l.prop_id}|${l.player_name}|${l.stat_type}|${l.line}|${(l.direction || 'over').toLowerCase()}`;
+}
+
+function materializeSelectedGame(
+  rawGame: GameCard,
+  optGame: OptimizerResult[string] | undefined,
+): { standards: Prop[]; demons: Prop[] } {
+  // Build lookup maps from the raw PP pool
+  const standardPool = rawGame.standards ?? [];
+  const demonPool    = rawGame.demons    ?? [];
+
+  const standardMap = new Map<string, Prop>(standardPool.map(p => [keyForProp(p), p]));
+  const demonMap    = new Map<string, Prop>(demonPool.map(p => [keyForProp(p), p]));
+
+  // Materialize standard legs from optimizer six_legs
+  const standards = (optGame?.six_legs ?? [])
+    .map(leg => {
+      const key  = keyForLeg(leg);
+      const prop = standardMap.get(key);
+      if (!prop) return null;
+      return {
+        ...prop,
+        pWin:          leg.p_win,
+        evMarginal:    leg.ev_marginal,
+        evCorrAdj:     leg.ev_corr_adj,
+        optimizerTier: 'standard' as const,
+      };
+    })
+    .filter(Boolean) as Prop[];
+
+  // Materialize demon legs from optimizer two_demons
+  // (used only for p_win enrichment — game.demons is the display roster)
+  const demons = demonPool.map(d => {
+    // Try to enrich with MILP two_demons metadata
+    const dKey = keyForProp(d);
+    const matchedLeg = (optGame?.two_demons ?? []).find(l => keyForLeg(l) === dKey);
+    return matchedLeg
+      ? {
+          ...d,
+          pWin:          matchedLeg.p_win,
+          evMarginal:    matchedLeg.ev_marginal,
+          evCorrAdj:     matchedLeg.ev_corr_adj,
+          optimizerTier: 'demon' as const,
+          isDemon:       true,
+        }
+      : d;
+  });
+
+  return { standards, demons };
+}
+
+function validateSelection(
+  sel:            { standards: Prop[]; demons: Prop[] },
+  requestedCount: number,
+): string | null {
+  if (sel.standards.length < requestedCount) {
+    return `Need ${requestedCount} legs, got ${sel.standards.length}`;
+  }
+  if (sel.demons.length < 1 || sel.demons.length > 2) {
+    return `Expected 1-2 demons, got ${sel.demons.length}`;
+  }
+  return null;
+}
+
 
 
 function formatTime(iso?: string) {
@@ -427,8 +509,9 @@ function PropRow({ prop, isSelected, onToggle, disabled }: {
   );
 }
 
-function GameCard({ game, selectedIds, onToggle, atMax, onSave, isSaving }: {
+function GameCard({ game, optResult, selectedIds, onToggle, atMax, onSave, isSaving }: {
   game: GameCard;
+  optResult?: OptimizerResult[string];
   selectedIds: Set<string>;
   onToggle: (prop: any) => void;
   atMax: boolean;
@@ -437,24 +520,53 @@ function GameCard({ game, selectedIds, onToggle, atMax, onSave, isSaving }: {
 }) {
   const [propCount, setPropCount] = useState<number>(0);
   const isActivated = propCount > 0;
-  // Direction is GOTit-decided and locked — dirOverrides removed
 
-  // Direction is GOTit-decided and locked. No flip. No override.
+  // ── GameSelection: materialize MILP selected set from raw pool ─────────────
+  // standards = exactly the MILP six_legs materialized from raw PP props
+  // demons    = demon pipeline roster (game.demons), enriched with two_demons metadata
+  // ready     = optimizer has fired and selection is materialized
+  // error     = validation failure message (shown instead of raw fallback)
+  const gameSelection: GameSelection = useMemo(() => {
+    if (!optResult) {
+      // Optimizer hasn't fired yet — not ready, show skeleton
+      return { standards: [], demons: game.demons ?? [], ready: false };
+    }
+    const { standards, demons } = materializeSelectedGame(game, optResult);
+    return { standards, demons, ready: true };
+  }, [game, optResult]);
 
-  // game.standards is the MILP-selected set — already exactly 6 legs, already ordered.
-  // Never merge goblins back in; goblins are absorbed into standards by the optimizer.
-  // Never sort the full raw pool — display selected set only.
-  const allStandards = game.standards;
+  // Show skeleton while optimizer is loading
+  if (!gameSelection.ready) {
+    return null; // parent shows skeleton for all cards until ready
+  }
+
+  // Validate selection before rendering — no raw fallback
+  const validationError = isActivated
+    ? validateSelection(gameSelection, propCount)
+    : null;
+
+  const allStandards = gameSelection.standards;
   const visibleProps = propCount > 0 ? allStandards.slice(0, propCount) : [];
 
   // Props visible on this card (standards + demons when activated)
-  const visibleDemonIds = isActivated ? game.demons.map((d: any) => d.id) : [];
+  const visibleDemonIds = isActivated ? gameSelection.demons.map((d: any) => d.id) : [];
   const visibleStandardIds = visibleProps.map((p: any) => p.id);
   const allVisibleIds = new Set([...visibleStandardIds, ...visibleDemonIds]);
 
   // Selected props that belong to THIS card
   const cardSelectedIds = [...selectedIds].filter(id => allVisibleIds.has(id));
   const canSave = cardSelectedIds.length >= 2;
+
+  // Validation error — show error state instead of rendering bad card
+  if (validationError && isActivated) {
+    return (
+      <div className="game-card animate-in">
+        <div style={{ padding: '16px', color: '#ff4d4d', fontSize: '13px', textAlign: 'center' }}>
+          ⚠ {validationError}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="game-card animate-in">
@@ -622,29 +734,29 @@ function GameCard({ game, selectedIds, onToggle, atMax, onSave, isSaving }: {
             </svg>
             Demon Picks
             <span style={{ marginLeft: 'auto', fontSize: '0.6rem', fontWeight: 700, color: 'hsl(0 72% 60%)', letterSpacing: '0.06em' }}>
-              TOP {game.demons.length}
+              TOP {gameSelection.demons.length}
             </span>
           </div>
           {/* Fallback render diagnostic tag */}
-          {game.demons.some((d: any) => d.fallback_render_used) && (
+          {gameSelection.demons.some((d: any) => d.fallback_render_used) && (
             <div style={{ fontSize: '0.55rem', fontWeight: 700, color: 'hsl(40 90% 60%)', letterSpacing: '0.08em', marginTop: 4, textTransform: 'uppercase' }}>
               ⚠ DIRECT PATH (fallback_render_used) — MILP bypassed
             </div>
           )}
           {/* Demon section — exactly top 2 GOTit-qualified demons from qualify_demons.py */}
-          {game.demons.length === 0 ? (
+          {gameSelection.demons.length === 0 ? (
             <div style={{ fontSize: '0.65rem', color: 'hsl(0 60% 55%)', fontWeight: 600, padding: '10px 0 6px', letterSpacing: '0.04em' }}>
               ⚠ PIPELINE RETURNED 0 DEMONS — all candidates failed gating for this game
             </div>
           ) : (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginTop: 10, marginBottom: 8 }}>
-              {game.demons.map((d: any, i: number) => (
+              {gameSelection.demons.map((d: any, i: number) => (
                 <DemonCard key={d.id} prop={d} rank={i + 1} />
               ))}
             </div>
           )}
           <div style={{ display: 'flex', flexDirection: 'column', gap: 5, marginTop: 4 }}>
-            {game.demons.map((d: any) => (
+            {gameSelection.demons.map((d: any) => (
               <PropRow
                 key={`sel-${d.id}`}
                 prop={d}
@@ -905,140 +1017,16 @@ export default function SlatePage() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data?.pulledAt, league]);
 
-  // ── Two-layer model: MILP selected set is the only display source of truth ──
-  //
-  // Layer 1 (raw):      game.standards_raw  — full PP candidate pool, never displayed
-  // Layer 2 (selected): game.standards      — exactly the 6 MILP-selected non-demon legs
-  //                     game.demons         — exactly the 1–2 demon pipeline selected legs
-  //
-  // Pattern: candidate generation → MILP solve → materialization → validate → render selected only
-  // No fallback to raw pool. If invariants fail, game is marked invalid and hidden.
+  // optimizedGames = raw games from /api/slate.
+  // Materialization now happens inside each GameCard via materializeSelectedGame.
+  // This memo just passes optResult per game into each card.
   const optimizedGames: GameCard[] = useMemo(() => {
     if (!optimizerResult) return games;
     return games.map(g => {
       const opt = optimizerResult[g.gameId];
 
-      // No optimizer result for this game — hide it entirely (no raw fallback)
-      if (!opt || !Array.isArray(opt.six_legs) || opt.six_legs.length === 0) {
-        return { ...g, standards: [], goblins: [], _milpValid: false };
-      }
-
-      // ── Step 1: Build raw prop index by stable keys ────────────────────────
-      // Keys: prop_id (if present) and player_name|stat_type|direction
-      const rawPool = new Map<string, Prop>();
-      for (const p of [...g.standards, ...g.goblins]) {
-        if (p.id) rawPool.set(p.id, p);
-        const dirKey = `${p.playerName}|${p.statType}|${(p.direction || 'over').toLowerCase()}`;
-        rawPool.set(dirKey, p);
-        // Also index without direction for looser match
-        rawPool.set(`${p.playerName}|${p.statType}`, p);
-      }
-
-      // ── Step 2: Materialize MILP selected legs from raw pool ───────────────
-      // For each six_legs entry, find its canonical raw PP prop object.
-      // Enrich it with MILP metadata (p_win, ev, edge reasons).
-      // If no raw prop matches, construct a synthetic prop from the leg data.
-      const materialized: Prop[] = [];
-      for (const leg of opt.six_legs as OptimizerLeg[]) {
-        const dirKey = `${leg.player_name}|${leg.stat_type}|${(leg.direction || 'over').toLowerCase()}`;
-        const rawProp =
-          (leg.prop_id ? rawPool.get(leg.prop_id) : undefined) ||
-          rawPool.get(dirKey) ||
-          rawPool.get(`${leg.player_name}|${leg.stat_type}`);
-
-        const enriched: Prop = rawProp
-          ? {
-              ...rawProp,
-              pWin:       leg.p_win,
-              evMarginal: leg.ev_marginal,
-              evCorrAdj:  leg.ev_corr_adj,
-              edgeReasons: (leg as any).edgeReasons,
-              selectedByMilp: true,
-            }
-          : {
-              // Synthetic fallback — MILP selected this leg but no raw PP prop matched key
-              id:           leg.prop_id || `${leg.player_name}|${leg.stat_type}`,
-              playerName:   leg.player_name,
-              statType:     leg.stat_type,
-              lineScore:    leg.line,
-              direction:    leg.direction,
-              pWin:         leg.p_win,
-              evMarginal:   leg.ev_marginal,
-              evCorrAdj:    leg.ev_corr_adj,
-              isDemon:      false,
-              isGoblin:     leg.tier === 'goblin',
-              selectedByMilp: true,
-              _synthetic:   true,
-            } as any;
-
-        materialized.push(enriched);
-      }
-
-      // ── Step 3: Validate invariants ────────────────────────────────────────
-      const playerIds = materialized.map(p => p.playerName); // use playerName as player key
-      const uniquePlayers = new Set(playerIds).size;
-      const milpValid =
-        materialized.length === 6 &&
-        uniquePlayers === 6;
-
-      if (!milpValid) {
-        console.error(
-          '[GOTit] INVARIANT_FAIL game=' + g.gameId,
-          '| standards.length=' + materialized.length + ' (expected 6)',
-          '| unique_players=' + uniquePlayers + ' (expected 6)',
-        );
-        // Do not render raw fallback — mark invalid, show nothing
-        return { ...g, standards: [], goblins: [], _milpValid: false };
-      }
-
-      // ── Step 4: Enrich demon picks from demon pipeline (already selected) ──
-      //
-      // AUTHORITY RULE:
-      //   game.demons  = demon pipeline output (runDemonPipeline) — DISPLAY SOURCE OF TRUTH
-      //   opt.two_demons = MILP y_j output — used ONLY for p_win/ev enrichment metadata
-      //
-      // Defense (Bug 3): opt.two_demons must NEVER replace or filter game.demons.
-      // If opt.two_demons is used as the roster, the demon pipeline is bypassed.
-      // Enrichment only — game.demons roster is immutable after pipeline.
-      const demonLegLookup = new Map<string, OptimizerLeg>();
-      for (const leg of (opt.two_demons || []) as OptimizerLeg[]) {
-        // Guard: only index legs that are actually demons
-        if (leg.tier !== 'demon') {
-          console.error('[GOTit] EMIT_GUARD: non-demon in two_demons — skipped', leg.player_name, leg.stat_type);
-          continue;
-        }
-        if (leg.prop_id) demonLegLookup.set(leg.prop_id, leg);
-        demonLegLookup.set(`${leg.player_name}|${leg.stat_type}`, leg);
-      }
-      // Enrich game.demons (pipeline roster) with MILP metadata only — never replace
-      const enrichedDemons = g.demons.map((d: any) => {
-        const leg = demonLegLookup.get(d.id) || demonLegLookup.get(`${d.playerName}|${d.statType}`);
-        return leg ? { ...d, pWin: leg.p_win, evMarginal: leg.ev_marginal } : d;
-      });
-      // Roster length must equal game.demons length — enrichment never adds or removes
-      if (enrichedDemons.length !== g.demons.length) {
-        console.error('[GOTit] EMIT_GUARD: enrichedDemons.length changed — roster corrupted', g.gameId);
-      }
-
-      // Demon invariant check
-      if (enrichedDemons.length < 1 || enrichedDemons.length > 2) {
-        console.error(
-          '[GOTit] DEMON_INVARIANT_FAIL game=' + g.gameId,
-          '| demons.length=' + enrichedDemons.length + ' (expected 1–2)',
-        );
-      }
-
-      // ── Step 5: Return selected roster only ───────────────────────────────
-      // standards = exactly the 6 MILP-selected legs (materialized from raw)
-      // goblins   = [] (goblins are merged into standards by the MILP)
-      // demons    = exactly the pipeline-selected demon legs
-      return {
-        ...g,
-        standards:   materialized,
-        goblins:     [],
-        demons:      enrichedDemons,
-        _milpValid:  true,
-      };
+      // Pass game through as-is — materialization happens inside GameCard
+      return g;
     });
   }, [games, optimizerResult]);
 
@@ -1255,6 +1243,7 @@ export default function SlatePage() {
             <div key={game.gameId} style={{ animationDelay: `${i * 60}ms` }}>
               <GameCard
                 game={game}
+                optResult={optimizerResult?.[game.gameId]}
                 selectedIds={selectedPropIds}
                 onToggle={handleToggle}
                 atMax={selectedPropIds.size >= MAX_PICKS}
