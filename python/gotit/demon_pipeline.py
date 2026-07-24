@@ -78,14 +78,19 @@ def _score(raw: Dict[str, Any]) -> Dict[str, Any]:
     z     = (mu - line) / sigma if sigma > 0 else 0.0
     p     = _phi(z)
 
+    # Map p_hit → propScore and confidenceLevel so frontend renders correctly
+    confidence_level = max(1, min(5, round(p * 5)))   # 0.50→2.5→3, 0.70→3.5→4
+
     return {
         **raw,
-        'p_hit':    round(p, 4),
-        'mu':       round(mu, 3),
-        'sigma':    round(sigma, 3),
-        'z_score':  round(z, 3),
-        'direction': 'over',   # demons are always over
-        'isDemon':  True,
+        'p_hit':           round(p, 4),
+        'propScore':       round(p, 4),       # frontend uses propScore for bar
+        'confidenceLevel': confidence_level,  # frontend uses this for dots
+        'mu':              round(mu, 3),
+        'sigma':           round(sigma, 3),
+        'z_score':         round(z, 3),
+        'direction':       'over',
+        'isDemon':         True,
     }
 
 

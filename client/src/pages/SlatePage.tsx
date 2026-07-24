@@ -272,7 +272,7 @@ function ConfidenceDots({ level }: { level?: number }) {
 
 // ── Demon prop card ───────────────────────────────────────────────────────────
 function DemonCard({ prop, rank }: { prop: Prop; rank: number }) {
-  const score = prop.propScore ?? 0.6;
+  const score = (prop as any).p_hit ?? prop.propScore ?? 0.6;
   const pct = Math.round(score * 100);
 
   return (
