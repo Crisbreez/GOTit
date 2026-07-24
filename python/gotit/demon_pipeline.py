@@ -1,5 +1,5 @@
 """
-demon_pipeline.py — GOTit Demon Selection Engine
+demon_pipeline.py — Demontime
 
 Goal: Maximize joint hit probability of exactly 2 Demons in the same game.
       Must-hit mode: ignore payout boost, pure EV. Only care about P(both clear).
