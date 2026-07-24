@@ -61,31 +61,60 @@ interface Prop {
   fallback_render_used?: boolean;
 }
 
+// The System — leg shape
 interface OptimizerLeg {
-  prop_id: string;
-  player_name: string;
-  stat_type: string;
-  line: number;
-  direction: string;
-  tier: string;
-  p_win: number;
-  ev_marginal: number;
-  ev_corr_adj: number;
-  demon_score?: {
-    composite: number;
-    market_anchor: number;
-    dist_hit_rate: number;
-    game_script_fit: number;
-    role_certainty: number;
-    pair_diversity: number;
-  };
+  prop_id:     string;
+  player:      string;
+  player_name: string;   // alias
+  player_id:   string;
+  stat:        string;
+  stat_type:   string;   // alias
+  side:        'more' | 'less';
+  direction:   string;   // alias for side
+  line:        number;
+  p_true:      number;
+  p_model:     number;
+  p_sharp:     number;
+  count:       number;
+  sharp_gap:   number;
+  fragility:   number;
+  traps:       string[];
+  eligible:    boolean;
+  game_id:     string;
+  is_demon:    boolean;
+  is_goblin:   boolean;
+  // legacy compat
+  p_win?:      number;
+  ev_marginal?: number;
+  ev_corr_adj?: number;
+  tier?:       string;
+}
+
+// The System — per-game decision
+interface SystemDecision {
+  decision:     'LOCKED' | 'SYSTEM_FIRE' | 'NO_GO';
+  path:         'LOCKED' | 'SYSTEM_FIRE' | 'NO_GO';
+  slip_type?:   '5_flex' | '6_flex' | '2_power' | '3_power' | '4_power';
+  avg_p?:       number;
+  p_be?:        number;
+  package_ev?:  number;
+  no_go_reason?: string;
+  best_avg_p?:  number;
+  guaranteed_roi?: number;
+  legs:         OptimizerLeg[];
 }
 
 interface OptimizerResult {
   [gameId: string]: {
-    six_legs: OptimizerLeg[];
-    two_demons: OptimizerLeg[];
-    meta: Record<string, unknown>;
+    six_legs:    OptimizerLeg[];
+    two_demons:  OptimizerLeg[];
+    path:        'LOCKED' | 'SYSTEM_FIRE' | 'NO_GO';
+    slip_type?:  string;
+    avg_p?:      number;
+    p_be?:       number;
+    package_ev?: number;
+    no_go_reason?: string;
+    system?:     SystemDecision;
   };
 }
 
@@ -137,7 +166,10 @@ function keyForProp(p: Prop): string {
 
 // Stable key for matching an OptimizerLeg to a raw Prop
 function keyForLeg(l: OptimizerLeg): string {
-  return `${l.prop_id}|${l.player_name}|${l.stat_type}|${l.line}|${(l.direction || 'over').toLowerCase()}`;
+  const name = l.player ?? l.player_name ?? '';
+  const stat = l.stat   ?? l.stat_type  ?? '';
+  const side = l.side   ?? (l.direction ?? 'over').toLowerCase();
+  return `${l.prop_id ?? ''}|${name}|${stat}|${l.line ?? ''}|${side}`;
 }
 
 function materializeSelectedGame(
@@ -151,7 +183,7 @@ function materializeSelectedGame(
   const standardMap = new Map<string, Prop>(standardPool.map(p => [keyForProp(p), p]));
   const demonMap    = new Map<string, Prop>(demonPool.map(p => [keyForProp(p), p]));
 
-  // Materialize standard legs from optimizer six_legs
+  // Materialize standard legs from The System six_legs
   const standards = (optGame?.six_legs ?? [])
     .map(leg => {
       const key  = keyForLeg(leg);
@@ -159,31 +191,19 @@ function materializeSelectedGame(
       if (!prop) return null;
       return {
         ...prop,
-        pWin:          leg.p_win,
-        evMarginal:    leg.ev_marginal,
-        evCorrAdj:     leg.ev_corr_adj,
+        pWin:          leg.p_true ?? leg.p_win,   // The System uses p_true
+        direction:     leg.side   ?? leg.direction ?? prop.direction,
+        count:         (leg as any).count,
+        sharpGap:      (leg as any).sharp_gap,
+        fragility:     (leg as any).fragility,
         optimizerTier: 'standard' as const,
       };
     })
     .filter(Boolean) as Prop[];
 
-  // Materialize demon legs from optimizer two_demons
-  // (used only for p_win enrichment — game.demons is the display roster)
-  const demons = demonPool.map(d => {
-    // Try to enrich with MILP two_demons metadata
-    const dKey = keyForProp(d);
-    const matchedLeg = (optGame?.two_demons ?? []).find(l => keyForLeg(l) === dKey);
-    return matchedLeg
-      ? {
-          ...d,
-          pWin:          matchedLeg.p_win,
-          evMarginal:    matchedLeg.ev_marginal,
-          evCorrAdj:     matchedLeg.ev_corr_adj,
-          optimizerTier: 'demon' as const,
-          isDemon:       true,
-        }
-      : d;
-  });
+  // Demons: display roster comes from demon pipeline, not The System
+  // two_demons is always [] from optimize.py — demons are a separate pipeline
+  const demons = demonPool.map(d => d);
 
   return { standards, demons };
 }

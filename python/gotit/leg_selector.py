@@ -1,2001 +1,633 @@
 """
-GOTit — Life-on-the-Line Leg Selector
-Selects exactly 6 legs + 2 distinct-player Demons per game.
-Maximizes expected flex payout. Zero heuristics. Full calibration traceability.
+leg_selector.py — The System (non-demon prop selection)
 
-Bugs fixed from original:
-  1. shapley_marginal_ev: `idx` was never defined — now iterates over all legs correctly
-  2. `math` was never imported — added
-  3. `scipy.stats.binom` in expected_payout — added proper import alias
-  4. `solver.Add(sum(demon_players.keys()) == 2)` — string sum is invalid, removed
-     (the y_vars block below it correctly enforces the distinct-player constraint)
-  5. shapley_marginal_ev loop structure was broken — fully rewritten with correct outer loop
+One pipeline. Two exit paths.
+  Core : score every PP prop (both More and Less), trap filters, fragility
+  Path A — LOCKED  : fat misprice with lockable hedge/arb → LOCKED FIRE  (stub in v1)
+  Path B — SYSTEM FIRE : package avg P clears break-even + EV > floor
+  Path C — NO-GO   : neither clears
+
+Non-negotiable rules:
+  assert side in ("more", "less")
+  assert decision in ("LOCKED", "SYSTEM_FIRE", "NO_GO")
+  if SYSTEM_FIRE: assert avg_p >= p_be and package_ev >= min_package_ev
+  demons: side == "more" and p_true >= demon_min_p  (handled in demon_pipeline.py)
 """
+
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import math
+import sys
+from collections import Counter
 from dataclasses import dataclass, field
-from itertools import combinations
-from typing import Dict, List, Optional, Tuple
-from enum import Enum
+from itertools import combinations, product
+from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
-import scipy.stats
-from scipy.stats import poisson, nbinom, gamma, norm
-from scipy.optimize import minimize_scalar
-from scipy.special import ndtr
-from scipy.stats import multivariate_normal
-from ortools.linear_solver import pywraplp
-
-log = logging.getLogger("gotit.leg_selector")
+log = logging.getLogger(__name__)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 0. FLEX PAYOUT TABLE (exact PrizePicks Flex)
-# ──────────────────────────────────────────────────────────────────────────────
-FLEX_PAYOUT: Dict[int, Dict[int, float]] = {
-    2: {2: 3.0,  1: 0.0,  0: 0.0},
-    3: {3: 5.0,  2: 1.5,  1: 0.0,  0: 0.0},
-    4: {4: 10.0, 3: 2.0,  2: 0.4,  1: 0.0,  0: 0.0},
-    5: {5: 20.0, 4: 4.0,  3: 0.4,  2: 0.0,  1: 0.0,  0: 0.0},
-    6: {6: 25.0, 5: 10.0, 4: 2.0,  3: 0.0,  2: 0.0,  1: 0.0,  0: 0.0},
+# ─────────────────────────────────────────────────────────────────────────────
+# Math helpers (Section 3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _phi(z: float) -> float:
+    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
+def p_more(mu: float, sigma: float, L: float) -> float:
+    if sigma <= 1e-9:
+        return 1.0 if mu > L else (0.5 if mu == L else 0.0)
+    return _phi((mu - L) / sigma)
+
+
+def p_less(mu: float, sigma: float, L: float) -> float:
+    return 1.0 - p_more(mu, sigma, L)
+
+
+def implied_prob(american: float) -> float:
+    a = float(american)
+    if a >= 0:
+        return 100.0 / (a + 100.0)
+    return abs(a) / (abs(a) + 100.0)
+
+
+def no_vig_pair(imp_over: float, imp_under: float) -> Tuple[float, float]:
+    s = imp_over + imp_under
+    if s <= 0:
+        return 0.5, 0.5
+    return imp_over / s, imp_under / s
+
+
+def p_true_blend(p_model: float, p_sharp: Optional[float], mode: str = "min") -> float:
+    if p_sharp is None:
+        return _clamp(p_model, 0.01, 0.99)
+    if mode == "min":
+        return _clamp(min(p_model, p_sharp), 0.01, 0.99)
+    return _clamp(0.5 * p_model + 0.5 * p_sharp, 0.01, 0.99)
+
+
+def count(pt: float, p_be: float) -> float:
+    return pt - p_be
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Payout tables (PrizePicks standard)
+# ─────────────────────────────────────────────────────────────────────────────
+
+PAYOUTS: Dict[str, Dict[int, float]] = {
+    "5_flex": {5: 10.0, 4: 2.0, 3: 0.4, 2: 0.0, 1: 0.0, 0: 0.0},
+    "6_flex": {6: 25.0, 5: 2.0, 4: 0.4, 3: 0.0, 2: 0.0, 1: 0.0, 0: 0.0},
+    "2_power": {2: 3.0, 1: 0.0, 0: 0.0},
+    "3_power": {3: 5.0, 2: 0.0, 1: 0.0, 0: 0.0},
+    "4_power": {4: 10.0, 3: 0.0, 2: 0.0, 1: 0.0, 0: 0.0},
 }
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 1. STAT-TYPE → DISTRIBUTION FAMILY
-# ──────────────────────────────────────────────────────────────────────────────
-class DistFamily(Enum):
-    POISSON = "poisson"
-    NEGBIN  = "negbin"
-    GAMMA   = "gamma"
-    SKELLAM = "skellam"
+def flex_ev(probs: List[float], payout_by_hits: Dict[int, float], stake: float = 1.0) -> float:
+    """Full enumeration over 2^n hit patterns (n <= 6)."""
+    n = len(probs)
+    ev = 0.0
+    for mask in product([0, 1], repeat=n):
+        hits = sum(mask)
+        p = 1.0
+        for i, h in enumerate(mask):
+            p *= probs[i] if h else (1.0 - probs[i])
+        mult = payout_by_hits.get(hits, 0.0)
+        ev += p * (mult * stake)
+    return ev - stake  # net EV
 
 
-STAT_DIST: Dict[str, DistFamily] = {
-    # Continuous / Gamma
-    "Points":               DistFamily.GAMMA,
-    "Total Bases":          DistFamily.GAMMA,
-    "Hits+Runs+RBIs":       DistFamily.GAMMA,
-    "Fantasy Score":        DistFamily.GAMMA,
-    "Hitter Fantasy Score": DistFamily.GAMMA,
-    "Pitcher Fantasy Score": DistFamily.GAMMA,
-    "Passing Yards":        DistFamily.GAMMA,
-    "Rushing Yards":        DistFamily.GAMMA,
-    "Receiving Yards":      DistFamily.GAMMA,
-    "Pts+Reb+Ast":              DistFamily.GAMMA,
-    # Negative Binomial (overdispersed counts)
-    "Rebounds":                 DistFamily.NEGBIN,
-    "Assists":                  DistFamily.NEGBIN,
-    "Receptions":               DistFamily.NEGBIN,
-    "Rush Attempts":            DistFamily.NEGBIN,
-    # Poisson (rare discrete counts)
-    "Hits":                     DistFamily.POISSON,
-    "Home Runs":                DistFamily.POISSON,
-    "Walks":                    DistFamily.POISSON,
-    "Stolen Bases":             DistFamily.POISSON,
-    "Blocks":                   DistFamily.POISSON,
-    "Steals":                   DistFamily.POISSON,
-    "Turnovers":                DistFamily.POISSON,
-    "3-PT Made":                DistFamily.POISSON,
-    "Passing TDs":              DistFamily.POISSON,
-    "Singles":                  DistFamily.POISSON,
-    "Doubles":                  DistFamily.POISSON,
-    "Triples":                  DistFamily.POISSON,
-    "Plate Appearances":        DistFamily.POISSON,
-    # MLB Strikeouts — PP uses distinct names for batter vs pitcher
-    "Strikeouts":               DistFamily.POISSON,  # backward compat
-    "Hitter Strikeouts":        DistFamily.POISSON,
-    "Pitcher Strikeouts":       DistFamily.POISSON,
-    "Strikeouts Allowed":       DistFamily.POISSON,
-    # MLB pitcher counts
-    "RBIs":                     DistFamily.POISSON,
-    "Runs":                     DistFamily.POISSON,
-    "Walks Allowed":            DistFamily.POISSON,
-    "Earned Runs Allowed":      DistFamily.POISSON,
-    "Hits Allowed":             DistFamily.POISSON,
-    "Pitching Outs":            DistFamily.POISSON,
-    "Pitches Thrown":           DistFamily.POISSON,
-    "1st Inning Walks Allowed": DistFamily.POISSON,
-    "1st Inning Runs Allowed":  DistFamily.POISSON,
+def power_ev(probs: List[float], multiplier: float, stake: float = 1.0) -> float:
+    p_all = 1.0
+    for p in probs:
+        p_all *= p
+    return p_all * multiplier * stake - stake
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Config defaults (Section 6)
+# ─────────────────────────────────────────────────────────────────────────────
+
+DEFAULT_CFG: Dict[str, Any] = {
+    "p_be": {
+        "5_flex":  0.543,
+        "6_flex":  0.542,
+        "2_power": 0.577,
+        "3_power": 0.550,
+        "4_power": 0.560,
+    },
+    "p_true_mode":       "min",
+    "absolute_floor_p":  0.52,
+    "demon_min_p":       0.50,
+    "ban_goblins":       False,   # goblins allowed in The System
+    "fragility_kill":    0.65,
+    "require_role":      False,   # relax v1 — no role feed yet
+    "min_package_ev":    0.02,
+    "min_lock_roi":      0.005,
+    "max_same_game_legs": 2,
+    "unit_pct_bankroll": 0.01,
+    "lock_unit_pct":     0.02,
+    "preferred_slips":   ["5_flex", "6_flex"],
+    "fat_count":         0.03,
+    "combo_head":        12,      # top-N by count to enumerate combos from
 }
 
-_DEFAULT_FAMILY = DistFamily.GAMMA
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Data structures
+# ─────────────────────────────────────────────────────────────────────────────
 
-def get_family(stat_type: str) -> DistFamily:
-    return STAT_DIST.get(stat_type, _DEFAULT_FAMILY)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 2. CALIBRATION PARAMETERS
-# ──────────────────────────────────────────────────────────────────────────────
-@dataclass(frozen=True)
-class CalibrationParams:
-    delta_goblin:     Dict[str, float]
-    delta_demon:      Dict[str, float]
-    margin_beta:      Dict[str, float]
-    probe_prob:       float
-    probe_magnitude:  float
-    corr_guard_rho:   float
-    void_premium:     Dict[str, float]
-    dist_params:      Dict[str, Dict[str, float]]
-    version:          str
-    trained_on:       str
-    sha256:           str
-
-    def verify_hash(self) -> bool:
-        blob = json.dumps({
-            "delta_goblin":    self.delta_goblin,
-            "delta_demon":     self.delta_demon,
-            "margin_beta":     self.margin_beta,
-            "probe_prob":      self.probe_prob,
-            "probe_magnitude": self.probe_magnitude,
-            "corr_guard_rho":  self.corr_guard_rho,
-            "void_premium":    self.void_premium,
-            "dist_params":     self.dist_params,
-            "version":         self.version,
-            "trained_on":      self.trained_on,
-        }, sort_keys=True).encode()
-        return hashlib.sha256(blob).hexdigest() == self.sha256
-
-
-def get_default_calibration() -> CalibrationParams:
-    """
-    Default calibration used until offline training produces real params.
-    All tier offsets = 0. Shape params are empirical starting points.
-    Hash is computed from these exact values — change any value and update sha256.
-    """
-    params = {
-        "delta_goblin":    {"default": 0.0},
-        "delta_demon":     {"default": 0.0},
-        "margin_beta":     {"beta0": 0.04, "beta1": 0.002, "beta2": 0.01, "beta3": 0.005, "beta4": 0.01},
-        "probe_prob":      0.05,
-        "probe_magnitude": 0.25,
-        "corr_guard_rho":  0.60,
-        "void_premium":    {"default": 0.0},
-        "dist_params":     {
-            "Points":          {"a": 6.0,  "scale": 4.0},
-            "Rebounds":        {"r": 4.0,  "p": 0.55},
-            "Assists":         {"r": 3.5,  "p": 0.60},
-            "Hits":            {"mu": 1.0},
-            "Strikeouts":      {"mu": 5.5},
-            "Total Bases":     {"a": 3.0,  "scale": 1.2},
-            "Hits+Runs+RBIs":  {"a": 4.0,  "scale": 1.2},
-            "Fantasy Score":   {"a": 5.0,  "scale": 7.0},
-            "Hitter Fantasy Score": {"a": 4.5, "scale": 5.0},
-            "Passing Yards":   {"a": 8.0,  "scale": 30.0},
-            "Rushing Yards":   {"a": 4.0,  "scale": 20.0},
-            "Receiving Yards": {"a": 4.0,  "scale": 18.0},
-        },
-        "version":    "default-v1",
-        "trained_on": "2026-01-01/2026-07-08",
-    }
-    blob = json.dumps(params, sort_keys=True).encode()
-    sha = hashlib.sha256(blob).hexdigest()
-    return CalibrationParams(**params, sha256=sha)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 3. SHARP CONSENSUS (imported from sharp.py; redefined here for selector use)
-# ──────────────────────────────────────────────────────────────────────────────
-@dataclass(frozen=True)
-class SharpConsensus:
-    prop_id:      str
-    median:       float
-    shape_params: Dict[str, float]
-    timestamp:    str
-    books_used:   List[str]
-    freshness_sec: float
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 4. PP BOARD PROP (raw input)
-# ──────────────────────────────────────────────────────────────────────────────
-class Tier(str, Enum):
-    STANDARD = "Standard"
-    GOBLIN   = "Goblin"
-    DEMON    = "Demon"
-
-
-class Direction(str, Enum):
-    OVER  = "OVER"
-    UNDER = "UNDER"
-
-
-@dataclass(frozen=True)
-class PPProp:
-    prop_id:              str
-    game_id:              str
-    player_id:            str
-    player_name:          str
-    stat_type:            str
-    tiers_offered:        List[Tier]
-    lines:                Dict[Tier, float]
-    hours_to_lock:        float
-    public_over_pct:      Optional[float]
-    dnp_prob:             float
-    correlation_partners: List[str]
-    # Direction stored on the prop from PP — governs which side the CDF evaluates.
-    # If PP sends an under, we evaluate UNDER; never force a direction ourselves.
-    stored_direction:     Direction = Direction.OVER
-    # Learning loop: injected by optimize.py from player_performance table
-    perf: Optional[Dict] = None  # {hitCount, missCount, last5, avgMargin} or None
-    # Sharp market signals — injected from DB at optimize time
-    pp_shade_signal:  str = 'no_data'   # 'lean_over' | 'lean_under' | 'neutral' | 'no_data'
-    sharp_fair_line:  Optional[float] = None
-    line_move_count:  int = 0
-    first_seen_line:  Optional[float] = None
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 5. CDF HELPERS
-# ──────────────────────────────────────────────────────────────────────────────
-
-# Micro-line cap: props with line exactly 0.5 (binary "did they do it at all?")
-# get their p_win capped so they don't crowd out higher-line props in the optimizer.
-# A 0.5-line binary prop isn't meaningfully more predictable than a 1.5-line prop;
-# the Gamma distribution can produce inflated p_wins on these lines.
-# Lines of 1.5+ are real baseball prop lines with genuine variance — no cap.
-_MICRO_LINE_THRESHOLD = 0.75   # cap only true half-ball lines (0.5)
-_MICRO_LINE_P_WIN_CAP  = 0.54  # 0.5-line props are treated as near-coin-flips
-
-
-# CV (coefficient of variation = std/mean) by stat type for Gamma/NegBin families.
-# These are empirical MLB/NBA estimates used to derive realistic variance
-# when the sharp median is the only input available.
-_STAT_CV: Dict[str, float] = {
-    "Total Bases":         0.85,  # highly variable: 0-HR game vs 3-TB game
-    "Hits+Runs+RBIs":      0.80,
-    "Fantasy Score":       0.70,
-    "Hitter Fantasy Score": 0.75,
-    "Points":              0.45,  # NBA scoring — more concentrated
-    "Rebounds":            0.65,
-    "Assists":             0.70,
-    "Receptions":          0.65,
-    "Passing Yards":       0.40,
-    "Rushing Yards":       0.75,
-    "Receiving Yards":     0.75,
-    # MMA — extreme variance due to early stoppages; high CV = wide CDF = lower p_win
-    # A fighter projected for 40 sig strikes can land 3 if stopped in round 1.
-    "Significant Strikes": 1.20,  # very high variance — early stoppage risk baked in
-    "Fight Time (Mins)":   0.90,  # fight duration is highly uncertain
-    "Takedowns":           1.10,  # grappling attempts vary wildly
-}
-_DEFAULT_CV = 0.70
-
-
-def _median_anchored_shape(median: float, shape: Dict, family: DistFamily, stat_type: str = "") -> Dict:
-    """
-    Re-derive distribution shape parameters so the distribution's mean/mode
-    is anchored to `median` rather than to calibration defaults.
-
-    This prevents the classic bug where shape params calibrated for a typical
-    line (e.g. mu=5.5 for Strikeouts) are applied to a micro-line prop
-    (e.g. line=0.5 HR) and yield p_win ≈ 1.0.
-
-    Strategy:
-    - POISSON:  set lam = median (mean = median)
-    - NEGBIN:   use CV to derive r,p so mean=median and variance realistic
-    - GAMMA:    use CV to derive a,scale so mean=median and variance realistic
-    - SKELLAM:  proxy: mu1 = median, mu2 = 0
-    """
-    if family == DistFamily.POISSON:
-        return {"mu": max(0.01, median)}
-    elif family == DistFamily.NEGBIN:
-        # For NegBin: mean=r*(1-p)/p, var=r*(1-p)/p^2 = mean/p
-        # CV = sqrt(var)/mean = 1/sqrt(r*p/(1-p)) → r = mean*(1-p)/p, p = mean/var
-        # Simpler: derive r from CV → CV^2 = (1-p)/(r*p) → r = (1-p)/(p*CV^2)
-        # We fix CV from the stat type and solve for r,p.
-        cv = _STAT_CV.get(stat_type, _DEFAULT_CV)
-        # var = (median * cv)^2
-        var = (median * cv) ** 2
-        # p = mean/var for NegBin parameterization where var=mean/p ... actually:
-        # NegBin(r,p): mean = r*(1-p)/p, var = r*(1-p)/p^2 = mean/p
-        # So p = mean/var, r = mean*p/(1-p)
-        p = float(np.clip(median / max(var, 0.01), 0.01, 0.99))
-        r = max(0.1, median * p / max(1 - p, 0.01))
-        return {"r": r, "p": p}
-    elif family == DistFamily.GAMMA:
-        # Gamma(a, scale): mean = a*scale, var = a*scale^2
-        # CV = 1/sqrt(a) → a = 1/CV^2, scale = mean/a
-        cv = _STAT_CV.get(stat_type, _DEFAULT_CV)
-        a = max(0.5, 1.0 / (cv ** 2))
-        scale = median / max(a, 0.01)
-        return {"a": a, "scale": max(scale, 0.01)}
-    elif family == DistFamily.SKELLAM:
-        return {"mu1": max(0.01, median), "mu2": 0.0}
-    else:
-        return {"mu": max(0.01, median)}
-
-
-def cdf_at_line(line: float, median: float, shape: Dict, family: DistFamily, stat_type: str = "") -> float:
-    """
-    P(X ≤ line - 0.5) for discrete; P(X ≤ line) for continuous.
-    Uses median-anchored shape so micro-line props stay realistic.
-    """
-    anchored = _median_anchored_shape(median, shape, family, stat_type)
-    x = line - 0.5
-    if family == DistFamily.POISSON:
-        lam = anchored["mu"]
-        return float(poisson.cdf(x, lam))
-    elif family == DistFamily.NEGBIN:
-        r = anchored["r"]
-        p = anchored["p"]
-        return float(nbinom.cdf(x, r, p))
-    elif family == DistFamily.GAMMA:
-        a     = anchored["a"]
-        scale = anchored["scale"]
-        return float(gamma.cdf(x, a, scale=scale))
-    elif family == DistFamily.SKELLAM:
-        mu  = anchored["mu1"] - anchored["mu2"]
-        var = anchored["mu1"] + anchored["mu2"]
-        return float(norm.cdf(x, mu, max(np.sqrt(var), 0.01)))
-    else:
-        return float(norm.cdf(x, median, max(median * 0.25, 0.01)))
-
-
-def _calibrated_p_win(
-    line: float,
-    median: float,
-    shape: Dict,
-    family: DistFamily,
-    direction: "Direction",
-    stat_type: str = "",
-) -> float:
-    """
-    Compute p_win anchored to the sharp median, with a micro-line safety cap.
-    stat_type is used to look up realistic CV for Gamma/NegBin families.
-    """
-    if direction == Direction.OVER:
-        raw = win_prob_over(line, median, shape, family, stat_type)
-    else:
-        raw = win_prob_under(line, median, shape, family, stat_type)
-
-    # Cap only true 0.5-line binary props ("did they HR/steal/hit at all?")
-    if line <= _MICRO_LINE_THRESHOLD:
-        raw = min(raw, _MICRO_LINE_P_WIN_CAP)
-
-    return raw
-
-
-def win_prob_over(line: float, median: float, shape: Dict, family: DistFamily, stat_type: str = "") -> float:
-    return 1.0 - cdf_at_line(line, median, shape, family, stat_type)
-
-
-def win_prob_under(line: float, median: float, shape: Dict, family: DistFamily, stat_type: str = "") -> float:
-    return cdf_at_line(line, median, shape, family, stat_type)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 6. BREAKEVEN r* FOR EACH SLIP SIZE
-# ──────────────────────────────────────────────────────────────────────────────
-def expected_payout_iid(k: int, r: float) -> float:
-    """E[payout] for k-pick slip where each leg wins i.i.d. with prob r."""
-    exp = 0.0
-    binom = scipy.stats.binom
-    for m in range(k + 1):
-        prob = float(binom.pmf(m, k, r))
-        exp += prob * FLEX_PAYOUT[k].get(m, 0.0)
-    return exp
-
-
-def breakeven_r(k: int) -> float:
-    """Solve E[payout] == 1 for r ∈ (0.5, 0.99)."""
-    f   = lambda r: (expected_payout_iid(k, r) - 1.0) ** 2
-    res = minimize_scalar(f, bounds=(0.5, 0.99), method="bounded")
-    return float(res.x)
-
-
-# Pre-compute once at import time
-BREAKEVEN_R: Dict[int, float] = {k: breakeven_r(k) for k in range(2, 7)}
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 7. LEG CANDIDATE
-# ──────────────────────────────────────────────────────────────────────────────
 @dataclass
-class LegCandidate:
+class ScoredLeg:
     prop_id:     str
-    game_id:     str
     player_id:   str
     player_name: str
     stat_type:   str
-    tier:        Tier
+    game_id:     str
+    side:        str            # "more" | "less"
     line:        float
-    direction:   Direction
-    p_win:       float
-    ev_marginal: float = 0.0
-    ev_corr_adj: float = 0.0
-    under_score: Optional["UnderScore"] = None  # set for UNDER standard legs that qualify
-    # Learning loop: set from player_performance before scoring
-    perf_hit_rate:    Optional[float] = None  # lifetime hit rate (0.0-1.0), None = no history
-    perf_last5_hits:  int = 0                 # hits in last 5 settled legs
-    perf_sample_size: int = 0                 # total settled legs (hit+miss)
-    # PP shade signal from sharp comparison (set at ingest)
-    pp_shade_signal:  str = 'no_data'         # 'lean_over' | 'lean_under' | 'neutral' | 'no_data'
-    sharp_fair_line:  Optional[float] = None  # SGO fair line if available
-    line_move_count:  int = 0                 # how many times PP moved this line
-    first_seen_line:  Optional[float] = None  # line when first pulled this session
-    edge_reasons:     List[str] = field(default_factory=list)  # populated by score_side
-
-    @property
-    def family(self) -> DistFamily:
-        return get_family(self.stat_type)
+    p_model:     float
+    p_sharp:     float
+    p_true:      float
+    p_be_5flex:  float
+    count:       float
+    sharp_gap:   float
+    fragility:   float
+    trap_flags:  List[str]
+    eligible:    bool
+    kill_reasons: List[str]
+    # raw prop fields for frontend
+    is_demon:    bool = False
+    is_goblin:   bool = False
+    sport:       str  = ''
+    team:        str  = ''
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 8. SHAPLEY MARGINAL EV — FIXED
-# ──────────────────────────────────────────────────────────────────────────────
-def _pmf_dp(p_wins: List[float]) -> np.ndarray:
-    """Exact PMF of sum of Bernoullis via DP convolution."""
-    n = len(p_wins)
-    pmf = np.zeros(n + 1)
-    pmf[0] = 1.0
-    for p in p_wins:
-        # Convolve in-place (right to left to avoid double-counting)
-        for j in range(len(pmf) - 1, 0, -1):
-            pmf[j] = pmf[j] * (1 - p) + pmf[j - 1] * p
-        pmf[0] *= (1 - p)
-    return pmf
+# ─────────────────────────────────────────────────────────────────────────────
+# Sharp quote helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
-
-def shapley_marginal_ev(
-    legs: List[LegCandidate],
-    r_star: Dict[int, float],
-) -> Dict[str, float]:
+def _sharp_probs(sharps: List[Dict], line: float) -> Tuple[Optional[float], Optional[float]]:
     """
-    Exact Shapley marginal EV for each leg.
-    Iterates over each leg (outer loop) and all subsets of other legs.
-    Only considers slip sizes 2..6.
-    Efficient for N ≤ 15; uses exact DP convolution for PMF.
+    Find the closest sharp quote to PP line, return no-vig (over, under).
+    sharps: list of {book, side, line, american_odds, ts}
     """
-    N = len(legs)
-    shapley: Dict[str, float] = {lg.prop_id: 0.0 for lg in legs}
+    if not sharps:
+        return None, None
 
-    # Outer loop: for each leg, compute its Shapley value
-    for idx, target_leg in enumerate(legs):
-        other_indices = [i for i in range(N) if i != idx]
-        shapley_val = 0.0
+    # Match exact line first, else nearest
+    def dist(q):
+        return abs(q.get('line', line) - line)
 
-        # Slip sizes 2..6: target_leg + s others = slip size s+1
-        for s in range(1, min(6, len(other_indices) + 1)):
-            k = s + 1  # total slip size including target_leg
-            weight = 1.0 / (math.comb(N - 1, s) * 5)  # normalized over 5 slip sizes
+    best = min(sharps, key=dist)
+    imp_over  = implied_prob(best.get('american_odds', -110)) if best.get('side') == 'more' else None
+    imp_under = implied_prob(best.get('american_odds', -110)) if best.get('side') == 'less' else None
 
-            for combo in combinations(other_indices, s):
-                # PMF with target leg
-                all_p_wins = [legs[i].p_win for i in combo] + [target_leg.p_win]
-                pmf_with   = _pmf_dp(all_p_wins)
-                ev_with    = sum(pmf_with[m] * FLEX_PAYOUT[k].get(m, 0.0)
-                                 for m in range(k + 1))
+    # Try to get both sides
+    over_q  = next((q for q in sharps if q.get('side') == 'more'), None)
+    under_q = next((q for q in sharps if q.get('side') == 'less'), None)
 
-                # PMF without target leg (slip size k-1)
-                if k > 2:
-                    combo_p_wins = [legs[i].p_win for i in combo]
-                    pmf_wo = _pmf_dp(combo_p_wins)
-                    ev_wo  = sum(pmf_wo[m] * FLEX_PAYOUT[k - 1].get(m, 0.0)
-                                 for m in range(k))
-                else:
-                    ev_wo = 0.0
+    if over_q and under_q:
+        io = implied_prob(over_q['american_odds'])
+        iu = implied_prob(under_q['american_odds'])
+        nv_over, nv_under = no_vig_pair(io, iu)
+        return nv_over, nv_under
 
-                shapley_val += (ev_with - ev_wo) * weight
+    if over_q:
+        io = implied_prob(over_q['american_odds'])
+        return io, 1.0 - io
+    if under_q:
+        iu = implied_prob(under_q['american_odds'])
+        return 1.0 - iu, iu
 
-        shapley[target_leg.prop_id] = shapley_val
-
-    return shapley
+    return None, None
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 9. CORRELATION-ADJUSTED EV (Gaussian copula)
-# ──────────────────────────────────────────────────────────────────────────────
-def corr_adjusted_ev(
-    legs:      List[LegCandidate],
-    shapley_ev: Dict[str, float],
-    rho_map:   Dict[Tuple[str, str], float],
-) -> Dict[str, float]:
-    """Subtract pairwise correlation overlap penalty."""
-    adj: Dict[str, float] = {}
-
-    for i, L in enumerate(legs):
-        ev = shapley_ev[L.prop_id]
-        overlap = 0.0
-        for j, L2 in enumerate(legs):
-            if i == j:
-                continue
-            rho = rho_map.get((L.prop_id, L2.prop_id), 0.0)
-            if rho <= 0:
-                continue
-
-            # Clamp z-scores away from ±∞
-            z1 = float(np.clip(norm.ppf(L.p_win),  -4.0, 4.0))
-            z2 = float(np.clip(norm.ppf(L2.p_win), -4.0, 4.0))
-
-            try:
-                p_both  = multivariate_normal.cdf(
-                    [z1, z2], mean=[0, 0], cov=[[1, rho], [rho, 1]]
-                )
-            except Exception:
-                p_both = L.p_win * L2.p_win
-
-            p_indep  = L.p_win * L2.p_win
-            pair_ev  = min(shapley_ev[L.prop_id], shapley_ev[L2.prop_id])
-            overlap += max(0.0, p_both - p_indep) * pair_ev
-
-        adj[L.prop_id] = ev - 0.15 * overlap
-
-    return adj
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 10. DEMON QUALIFICATION SCORE
-# ──────────────────────────────────────────────────────────────────────────────
-
-# ── Demon policy (canonical) ──────────────────────────────────────────────────
-# 1. PP odds_type == "demon" is the ONLY source of demon identity.
-# 2. GOTit never promotes a standard prop to demon.
-# 3. GOTit scores only PP demons.
-# 4. If a PP demon fails the keep rule, it is dropped.
-# 5. If a game has 0 or 1 qualifying demons, show 0 or 1. No substitutions.
-# 6. Final demon ranking is by composite descending, distinct-player enforced.
-
-DEMON_PWIN_FLOOR  = 0.53   # keep gate: p_win must clear this
-_DEMON_EDGE_CUTOFF = -0.5   # keep gate: anchor_delta >= this
-_DEMON_DNP_CUTOFF  = 0.15   # keep gate: dnp_prob must be below this
-
-# Gate 0 — minimum line per stat type (rejects 0.5 lottery lines PP mislabels demon)
-_DEMON_LINE_FLOOR: dict = {
-    "Home Runs":            1.5,
-    "Triples":              1.5,
-    "Stolen Bases":         1.5,
-    "Doubles":              1.5,
-    "Walks":                1.5,
-    "Singles":              1.5,
-    "RBIs":                 1.5,
-    "Runs":                 1.5,
-    "Hits":                 1.5,
-    "Total Bases":          2.5,
-    "Hits+Runs+RBIs":       2.5,
-    "Hitter Fantasy Score": 3.5,
-    "Hitter Strikeouts":    1.5,
-    "Pitcher Strikeouts":   3.5,
-    "Pitching Outs":        9.5,
-    "Pitches Thrown":      59.5,
-    "Earned Runs Allowed":  0.5,
-    "Hits Allowed":         2.5,
-    "_default":             1.5,
-}
-
-# Standard-tier line floors — minimum line score to enter optimizer.
-# Prevents near-certain "lottery" props (e.g. TB 0.5) from clogging the slate.
-# Rule: standard legs with line < floor are dropped before scoring.
-_STANDARD_LINE_FLOOR: dict = {
-    # MLB hitting — raised floors based on observed miss patterns.
-    # 0.5 and 1.5 binary lines are near-coin-flips; require real volume.
-    "Total Bases":         2.5,   # was 1.5 — TB 1.5 still misses on 0-for nights
-    "Hits":                1.5,
-    "Hits+Runs+RBIs":      2.5,   # was 1.5 — 1.5 H+R+RBI is a coin flip
-    "Singles":             1.5,   # keep 1.5 but first-name gate blocks junk players
-    "RBIs":                1.5,
-    "Runs":                1.5,
-    "Walks":               1.5,
-    "Hitter Strikeouts":   1.5,
-    "Hitter Fantasy Score": 5.5,  # block low-line HFS — must be a meaningful game
-    "Home Runs":           0.51,
-    "Stolen Bases":        0.51,
-    "Doubles":             0.51,
-    "Triples":             0.51,
-    # MLB pitching
-    "Pitcher Strikeouts":  3.5,   # was 2.5 — 2.5 Ks is too easy to miss
-    "Pitcher Fantasy Score": 25.0, # block low pitcher fantasy lines
-    "Innings Pitched":     4.5,
-    "Hits Allowed":        2.5,
-    "Earned Runs Allowed": 0.5,
-    "Pitches Thrown":      70.0,  # must pitch deep enough to matter
-    # MMA — raised significantly; early stoppages kill low-line picks
-    "Significant Strikes": 25.0,  # was 15 — fighters stopped early score near 0
-    "Takedowns":           1.5,   # was 0.5 — single takedown is a coin flip
-    "Fight Time (Mins)":   8.0,   # must expect a long fight
-    "_default":            1.0,
-}
-
-# Game-script fit table: stat types that benefit from high-pace / high-volume games.
-# Keys are stat types; value is +1 (pace helps) or -1 (pace hurts).
-# Used as a multiplier on a game's run-rate signal (total projected runs/pts).
-_STAT_PACE_SIGN: Dict[str, int] = {
-    # MLB — high run-environment helps all hitting stats
-    "Hits":                     +1,
-    "Total Bases":              +1,
-    "Hits+Runs+RBIs":           +1,
-    "Home Runs":                +1,
-    "RBIs":                     +1,
-    "Runs":                     +1,
-    "Walks":                    +1,
-    "Plate Appearances":        +1,
-    "Hitter Fantasy Score":     +1,
-    "Hitter Strikeouts":        -1,  # high K environment bad for hitters
-    # MLB pitching — low run-environment helps pitcher stats
-    "Pitcher Strikeouts":       +1,  # high K rate environment helps pitcher Ks
-    "Pitching Outs":            +1,
-    "Pitches Thrown":           +1,
-    "Earned Runs Allowed":      -1,  # high offense bad for pitcher ERA props
-    "Hits Allowed":             -1,
-    # NBA — high pace helps all
-    "Points":                   +1,
-    "Rebounds":                 +1,
-    "Assists":                  +1,
-    "Pts+Reb+Ast":              +1,
-    "3-PT Made":                +1,
-}
-
-
-@dataclass
-class DemonScore:
-    prop_id:           str
-    player_name:       str
-    stat_type:         str
-    line:              float
-    direction:         Direction
-    p_win:             float
-    # Layer sub-scores (0.0–1.0 each)
-    market_anchor:     float   # L1
-    dist_hit_rate:     float   # L2
-    game_script_fit:   float   # L3
-    role_certainty:    float   # L4
-    pair_diversity:    float   # L5 (applied at pairing stage)
-    composite:         float
-    qualifies:         bool
-
-
-def _demon_keep(
-    line_floor_pass: bool,
-    anchor_delta:    float,
-    p_win:           float,
-    dnp_prob:        float,
-) -> bool:
-    """Hard keep gate — all four must be true."""
-    return (
-        line_floor_pass
-        and anchor_delta >= _DEMON_EDGE_CUTOFF
-        and p_win        >= DEMON_PWIN_FLOOR
-        and dnp_prob      < _DEMON_DNP_CUTOFF
-    )
-
-
-def score_demon(
-    cand:       "LegCandidate",
-    sc:         "SharpConsensus",
-    dnp_prob:   float,
-    game_total: float,
-    pace_fit:        float = 0.5,
-    matchup_fit:     float = 0.5,
-    environment_fit: float = 0.5,
-    usage_fragility: float = 0.0,
-    freshness_risk:  float = 0.0,
-    same_failure_penalty: float = 0.0,
-) -> DemonScore:
+def _sharp_gap(sharps: List[Dict], line: float, side: str) -> float:
     """
-    Score a PP-flagged demon leg.
-    Keep gate: line_floor AND anchor_delta >= -0.5 AND p_win >= 0.53 AND dnp_prob < 0.15
-    Weights:   L1=0.34  L2=0.28  L3=0.18  L4=0.12  L5=0.08
+    Sharp line vs PP line gap.
+    Positive = sharp consensus is further in the favored direction.
     """
-    direction = cand.direction
-    pp_line   = cand.line
-    p_win     = cand.p_win
-
-    # ── Gate 0: line floor per stat type ─────────────────────────────────────
-    min_line        = _DEMON_LINE_FLOOR.get(cand.stat_type, _DEMON_LINE_FLOOR["_default"])
-    line_floor_pass = pp_line >= min_line
-
-    # ── anchor_delta = sharp_fair_line − pp_demon_line (OVER convention) ─────
-    sgo_median    = sc.median
-    anchor_delta  = (sgo_median - pp_line) if direction == Direction.OVER else (pp_line - sgo_median)
-    is_real_sharp = sc.freshness_sec < 9000.0
-
-    # ── Keep gate ─────────────────────────────────────────────────────────────
-    qualifies = _demon_keep(line_floor_pass, anchor_delta, p_win, dnp_prob)
-    if not qualifies:
-        return DemonScore(
-            prop_id=cand.prop_id, player_name=cand.player_name,
-            stat_type=cand.stat_type, line=pp_line, direction=direction,
-            p_win=p_win, market_anchor=0.0, dist_hit_rate=0.0,
-            game_script_fit=0.0, role_certainty=0.0, pair_diversity=0.0,
-            composite=0.0, qualifies=False,
-        )
-
-    # ── L1: Market anchor ─────────────────────────────────────────────────────
-    # clamp(0.5 + anchor_delta / 1.0)
-    l1 = float(np.clip(0.5 + anchor_delta / 1.0, 0.0, 1.0)) if is_real_sharp else 0.45
-
-    # ── L2: Distribution hit rate ─────────────────────────────────────────────
-    # clamp((p_win − 0.53) / 0.17)
-    l2 = float(np.clip((p_win - 0.53) / 0.17, 0.0, 1.0))
-
-    # ── L3: Game script fit ───────────────────────────────────────────────────
-    # clamp(0.40*pace_fit + 0.30*matchup_fit + 0.30*environment_fit)
-    # Derive pace_fit from game_total when not externally provided.
-    if game_total > 0 and pace_fit == 0.5:
-        mlb_stats = {
-            "Hits", "Total Bases", "Hits+Runs+RBIs", "Home Runs", "RBIs", "Runs",
-            "Walks", "Plate Appearances", "Hitter Fantasy Score", "Hitter Strikeouts",
-            "Pitcher Strikeouts", "Pitching Outs", "Pitches Thrown",
-            "Earned Runs Allowed", "Hits Allowed", "Singles", "Doubles", "Triples",
-        }
-        league_avg = 8.5 if cand.stat_type in mlb_stats else 220.0
-        pace_dev   = (game_total - league_avg) / league_avg
-        pace_sign  = _STAT_PACE_SIGN.get(cand.stat_type, +1)
-        pace_fit   = float(np.clip(0.5 + pace_dev * pace_sign * 0.5, 0.0, 1.0))
-    l3 = float(np.clip(0.40 * pace_fit + 0.30 * matchup_fit + 0.30 * environment_fit, 0.0, 1.0))
-
-    # ── L4: Role certainty ────────────────────────────────────────────────────
-    # clamp(1.0 − (0.55*dnp_prob + 0.25*usage_fragility + 0.20*freshness_risk))
-    fr = 0.0 if is_real_sharp else (freshness_risk if freshness_risk else 0.4)
-    l4 = float(np.clip(1.0 - (0.55 * dnp_prob + 0.25 * usage_fragility + 0.20 * fr), 0.0, 1.0))
-
-    # ── L5: Pair diversity (applied at pairing stage; default 1.0 = no penalty)
-    l5 = float(np.clip(1.0 - same_failure_penalty, 0.0, 1.0))
-
-    # ── DemonScore formula per spec: ──────────────────────────────────────────
-    #   0.30*p_ceiling + 0.24*market_misprice + 0.18*script_ceiling_fit
-    # + 0.12*role_stability + 0.10*recent_burst_pattern + 0.06*pair_diversity
-    #
-    # Mapping to current variables:
-    #   p_ceiling            = l2  (p_win margin above demon floor — "ceiling hit rate")
-    #   market_misprice      = l1  (anchor_delta — how much market undervalues this line)
-    #   script_ceiling_fit   = l3  (game script alignment with this stat's ceiling)
-    #   role_stability       = l4  (role certainty: low dnp_prob + usage consistency)
-    #   recent_burst_pattern = 0.5 (placeholder — no burst model yet; neutral)
-    #   pair_diversity       = l5  (stat-type diversity penalty applied at pairing)
-    p_ceiling           = l2   # distribution ceiling hit rate
-    market_misprice     = l1   # sharp market mispricing of the demon line
-    script_ceiling_fit  = l3   # game context ceiling alignment
-    role_stability      = l4   # player role certainty
-    # recent_burst: real hit rate from player_performance when available
-    if cand.perf_hit_rate is not None and cand.perf_sample_size >= 3:
-        # Use last-5 recency as burst signal, fall back to lifetime rate
-        if cand.perf_sample_size >= 3:
-            last5_rate = cand.perf_last5_hits / min(cand.perf_sample_size, 5)
-            # Blend: 70% last-5 recency, 30% lifetime
-            recent_burst = float(np.clip(0.70 * last5_rate + 0.30 * cand.perf_hit_rate, 0.0, 1.0))
-        else:
-            recent_burst = float(np.clip(cand.perf_hit_rate, 0.0, 1.0))
+    if not sharps:
+        return 0.0
+    sharp_lines = [q.get('line', line) for q in sharps if q.get('line') is not None]
+    if not sharp_lines:
+        return 0.0
+    avg_sharp = sum(sharp_lines) / len(sharp_lines)
+    # For more: sharp > PP line = bad (tougher to clear); sharp < PP line = good
+    if side == 'more':
+        return line - avg_sharp   # positive = PP line below sharp = easier to hit
     else:
-        recent_burst = 0.50  # no history: neutral
-    diversity           = l5   # pair diversity (applied at qualify_demons stage)
-
-    composite = float(np.clip(
-        0.30 * p_ceiling
-      + 0.24 * market_misprice
-      + 0.18 * script_ceiling_fit
-      + 0.12 * role_stability
-      + 0.10 * recent_burst
-      + 0.06 * diversity,
-        0.0, 1.0,
-    ))
-
-    return DemonScore(
-        prop_id=cand.prop_id,
-        player_name=cand.player_name,
-        stat_type=cand.stat_type,
-        line=pp_line,
-        direction=direction,
-        p_win=p_win,
-        market_anchor=round(l1, 4),
-        dist_hit_rate=round(l2, 4),
-        game_script_fit=round(l3, 4),
-        role_certainty=round(l4, 4),
-        pair_diversity=round(l5, 4),
-        composite=round(composite, 4),
-        qualifies=True,
-    )
+        return avg_sharp - line   # positive = PP line above sharp = easier to hit under
 
 
-def qualify_demons(
-    demon_cands:  List["LegCandidate"],
-    sc_map:       Dict[str, "SharpConsensus"],
-    dnp_model:    Dict[str, float],
-    game_total:   float = 0.0,
-) -> List["LegCandidate"]:
+# ─────────────────────────────────────────────────────────────────────────────
+# Fragility + trap detection (Section 6)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fragility_score(ctx: Dict[str, Any]) -> float:
+    score = 0.0
+    score += 0.25 * min(ctx.get('minutes_risk', 0), 2) / 2
+    score += 0.20 * min(ctx.get('blowout_risk', 0), 2) / 2
+    score += 0.20 * min(ctx.get('weather_risk', 0), 2) / 2
+    score += 0.15 * min(ctx.get('platoon_risk', 0), 2) / 2
+    if not ctx.get('role_confirmed', True):
+        score += 0.25
+    if ctx.get('news_kill', False):
+        score = 1.0
+    return _clamp(score, 0.0, 1.0)
+
+
+def _detect_traps(row: Dict, side: str, ctx: Dict, cfg: Dict) -> List[str]:
+    flags = []
+    featured_ids = cfg.get('ui_featured_ids', set())
+    if row.get('prizepicks_id') in featured_ids or row.get('id') in featured_ids:
+        flags.append('featured_tab')
+    if side == 'more' and cfg.get('public_over_bias_active', False):
+        flags.append('public_over_lean')
+    if row.get('isDemon') or row.get('is_demon'):
+        flags.append('demon')
+    return flags
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Score one prop → two ScoredLegs (Section 5)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _estimate_mu_sigma(row: Dict, sharps: List[Dict]) -> Tuple[float, float]:
     """
-    Filter and rank PP demons using demon_score().
-    Returns the subset of demon_cands that pass ALL gates,
-    ordered by composite score descending.
-
-    Pair diversity (L5): after scoring individuals, apply a 10% penalty
-    to the second demon of any pair sharing the same stat_type.
-    This nudges the MILP toward demons from different failure modes.
-
-    Returns: ranked list of qualified LegCandidates (may be empty, 1, or ≥2).
+    Estimate mu/sigma when no model projection is available.
+    Use sharp line gap as signal; fall back to line * calibrated ratio.
     """
-    if not demon_cands:
-        return []
-
-    scored: List[tuple] = []  # (DemonScore, LegCandidate)
-    for cand in demon_cands:
-        sc = sc_map.get(cand.prop_id)
-        if not sc:
-            continue
-        dnp_prob = dnp_model.get(cand.player_id, dnp_model.get(cand.prop_id, 0.0))
-        ds = score_demon(cand, sc, dnp_prob, game_total)
-        if ds.qualifies:
-            scored.append((ds, cand))
-
-    if not scored:
-        return []
-
-    # Sort by composite descending
-    scored.sort(key=lambda t: t[0].composite, reverse=True)
-
-    # Apply L5 pair-diversity penalty: if top-2 demons share stat_type, knock
-    # the second one down slightly to open the door for a more diverse alternative.
-    # Rebuild composite with L5 factored in for ranking purposes only.
-    if len(scored) >= 2:
-        top_stat = scored[0][0].stat_type
-        for i in range(1, len(scored)):
-            ds, cand = scored[i]
-            if ds.stat_type == top_stat:
-                # Same failure mode — 10% diversity penalty on composite
-                penalized = DemonScore(
-                    **{**ds.__dict__,
-                       "pair_diversity": 0.0,
-                       "composite": round(ds.composite * 0.90, 4)}
-                )
-                scored[i] = (penalized, cand)
-        # Re-sort after penalty
-        scored.sort(key=lambda t: t[0].composite, reverse=True)
-
-    # Hard-cap: top 2 distinct-player demons only. No substitutions.
-    # Walk the ranked list and pick the first 2 distinct players.
-    top2: List[tuple] = []
-    seen_players: set = set()
-    for ds, cand in scored:
-        if cand.player_id not in seen_players:
-            top2.append((ds, cand))
-            seen_players.add(cand.player_id)
-        if len(top2) == 2:
-            break
-
-    log.info("[demon] qualified %d/%d PP demons → top2=%d",
-             len(scored), len(demon_cands), len(top2))
-    for ds, _ in top2:
-        log.info(
-            "[demon]  SELECTED %s %s %.1f %s → p_win=%.3f L1=%.2f L2=%.2f L3=%.2f L4=%.2f composite=%.3f",
-            ds.player_name, ds.stat_type, ds.line, ds.direction.value,
-            ds.p_win, ds.market_anchor, ds.dist_hit_rate,
-            ds.game_script_fit, ds.role_certainty, ds.composite,
-        )
-    # Log dropped demons so we can audit why they were cut
-    dropped = [(ds, c) for ds, c in scored if c not in [cand for _, cand in top2]]
-    for ds, _ in dropped[:4]:
-        log.info(
-            "[demon]  DROPPED  %s %s %.1f → composite=%.3f",
-            ds.player_name, ds.stat_type, ds.line, ds.composite,
-        )
-
-    return [cand for _, cand in top2]
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 10. GAME-SCRIPT ENGINE + SCRIPTED WINNER SCORE
-# ──────────────────────────────────────────────────────────────────────────────
-#
-# build_game_script() returns six contextual signals derived from SharpConsensus
-# and game metadata. These signals adjust the CDF mu before p_win is computed,
-# so the distribution reflects today's environment, not a historical average.
-#
-# Score shape (standard legs):
-#   scripted_winner_score =
-#       0.34 * p_win
-#     + 0.22 * market_agreement
-#     + 0.18 * script_fit
-#     + 0.12 * role_certainty
-#     + 0.08 * line_value
-#     + 0.06 * payout_boost
-#
-# Score shape (demon legs):
-#   demon_score =
-#       0.30 * p_ceiling
-#     + 0.24 * market_misprice
-#     + 0.18 * script_ceiling_fit
-#     + 0.12 * role_stability
-#     + 0.10 * recent_burst_pattern
-#     + 0.06 * pair_diversity
-
-STANDARD_PWIN_FLOOR = 0.50   # floor lowered — sharp data sparse, p_win clusters 0.50-0.55; MILP objective still maximizes p_win
-
-
-@dataclass(frozen=True)
-class GameScript:
-    run_env:        float   # 0-1: expected scoring volume (run total / league avg)
-    pace:           float   # 0-1: pace signal (fast=1, slow=0)
-    team_edge:      float   # -1..1: home team relative strength (positive = home favored)
-    bullpen_stress: float   # 0-1: how taxed is the bullpen (high = pitcher props riskier)
-    park_weather:   float   # 0-1: park + weather run factor (Coors hot day = 1)
-    blowout_risk:   float   # 0-1: likelihood game becomes lopsided early
-
-
-def build_game_script(
-    sc_list: List["SharpConsensus"],
-    game_total: float = 0.0,
-    home_ml:    float = -110.0,   # moneyline for home team
-    is_dome:    bool  = False,
-    temp_f:     float = 72.0,
-    wind_mph:   float = 5.0,
-    wind_toward_cf: bool = False,
-    bullpen_innings_last3: float = 4.0,  # bullpen IP in last 3 games
-) -> GameScript:
-    """
-    Build a game-script context dict from available inputs.
-    All signals normalized to 0-1 (or -1..1 for team_edge).
-    Falls back to neutral (0.5) when data is unavailable.
-    """
-    # run_env: game total vs league average (MLB=8.5, NBA=220)
-    if game_total > 0:
-        league_avg = 8.5 if game_total < 30 else 220.0
-        run_env = float(np.clip(game_total / league_avg, 0.3, 2.0) / 2.0)
-    else:
-        run_env = 0.5
-
-    # pace: proxy by run_env (high-total game = fast pace)
-    pace = run_env
-
-    # team_edge: derived from moneyline
-    # ML=-200 → implied prob ≈ 0.67; edge = 0.67 - 0.5 = +0.17 normalized
-    try:
-        if home_ml < 0:
-            implied = (-home_ml) / (-home_ml + 100)
-        else:
-            implied = 100 / (home_ml + 100)
-        team_edge = float(np.clip((implied - 0.50) * 2, -1.0, 1.0))
-    except Exception:
-        team_edge = 0.0
-
-    # park_weather: dome = neutral; outdoor hot + wind_out = high
-    if is_dome:
-        park_weather = 0.50
-    else:
-        temp_factor  = float(np.clip((temp_f - 60) / 40, 0.0, 1.0))
-        wind_factor  = float(np.clip(wind_mph / 20, 0.0, 1.0)) if wind_toward_cf else 0.0
-        park_weather = float(np.clip(0.60 * temp_factor + 0.40 * wind_factor, 0.0, 1.0))
-
-    # bullpen_stress: heavy recent usage raises pitcher prop risk
-    bullpen_stress = float(np.clip(bullpen_innings_last3 / 10.0, 0.0, 1.0))
-
-    # blowout_risk: large team edge + high run env = more lopsided risk
-    blowout_risk = float(np.clip(abs(team_edge) * run_env, 0.0, 1.0))
-
-    return GameScript(
-        run_env=round(run_env, 4),
-        pace=round(pace, 4),
-        team_edge=round(team_edge, 4),
-        bullpen_stress=round(bullpen_stress, 4),
-        park_weather=round(park_weather, 4),
-        blowout_risk=round(blowout_risk, 4),
-    )
-
-
-def adjust_distribution(
-    median:    float,
-    direction: "Direction",
-    stat_type: str,
-    script:    GameScript,
-) -> Tuple[float, float]:
-    """
-    Adjust mu_star based on game-script signals before CDF computation.
-    Returns (mu_star, sigma_star) for use in _calibrated_p_win.
-
-    Logic:
-    - pace_sign tells us if a high-pace game boosts or suppresses this stat.
-    - park_weather amplifies the run_env signal for hitting stats.
-    - blowout_risk slightly suppresses extreme overperformance.
-    """
-    pace_sign   = _STAT_PACE_SIGN.get(stat_type, +1)
-    env_signal  = script.run_env * (1.0 + 0.30 * script.park_weather)
-    mu_adj      = (env_signal - 0.50) * pace_sign * 0.12  # ±12% max shift on mu
-
-    # Blowout risk suppresses ceiling: if game goes lopsided early,
-    # volume stats get reduced (starter pulled, starters sit, etc.)
-    blowout_adj = -script.blowout_risk * 0.05  # up to -5% on mu
-
-    mu_star    = max(0.01, median * (1.0 + mu_adj + blowout_adj))
-    sigma_star = mu_star * _STAT_CV.get(stat_type, _DEFAULT_CV)
-
-    return mu_star, sigma_star
-
-
-# ── Edge reason codes ───────────────────────────────────────────────────────
-# A prop must produce at least ONE strong reason to move off 50/50.
-# If none fire, the prop is no_edge and excluded from picks.
-EDGE_REASONS = {
-    'sharp_line_gap':   'Sharp market sets fair line well away from PP line',
-    'shade_confirmed':  'PP shaded this line — market agrees direction',
-    'line_moved':       'PP moved this line confirming our direction',
-    'high_p_win':       'Statistical model gives strong win probability',
-    'strong_role':      'Player role certainty is very high',
-    'script_fit':       'Game script strongly favors this stat type',
-}
-
-# Thresholds that constitute a STRONG signal for each reason
-_SHARP_GAP_STRONG   = 0.35   # anchor_delta (in stat units) to call it a real gap
-_SHADE_CONFIRMED    = True    # shade signal present (lean_over / lean_under)
-_LINE_MOVED_MIN     = 1       # at least 1 confirmed line move
-_HIGH_PWIN_FLOOR    = 0.53    # p_win >= this = meaningful statistical edge
-_STRONG_ROLE_FLOOR  = 0.72    # w4 >= this = high role certainty
-_SCRIPT_FIT_FLOOR   = 0.58    # w3 >= this = script favors this stat type
-
-
-@dataclass
-class ScriptedCandidate:
-    """Output of score_side() — one evaluated direction for a standard/goblin leg."""
-    prop_id:              str
-    player_name:          str
-    stat_type:            str
-    line:                 float
-    direction:            Direction
-    p_win:                float
-    market_agreement:     float   # W2
-    script_fit:           float   # W3
-    role_certainty:       float   # W4
-    line_value:           float   # W5
-    payout_boost:         float   # W6
-    scripted_winner_score: float  # final 0-1
-    edge_reasons:         List[str] = field(default_factory=list)  # reasons this side has edge
-    has_edge:             bool = True   # False = no strong reason found, excluded from picks
-
-
-@dataclass
-class WinScoreStandard:
-    """Alias for compatibility — wraps ScriptedCandidate fields."""
-    prop_id:         str
-    player_name:     str
-    stat_type:       str
-    line:            float
-    direction:       Direction
-    p_win:           float
-    w1_pwin_margin:  float
-    w2_market_agree: float
-    w3_dist_conv:    float
-    w4_role:         float
-    win_score:       float
-
-
-def score_side(
-    cand:      "LegCandidate",
-    direction: Direction,
-    sc:        "SharpConsensus",
-    dnp_prob:  float,
-    script:    GameScript,
-    family:    DistFamily,
-    cal_shape: Dict,
-) -> ScriptedCandidate:
-    """
-    Score one direction of a standard or goblin prop against the game script.
-    Returns a ScriptedCandidate with scripted_winner_score.
-    """
-    # Adjust distribution to game context
-    mu_star, _ = adjust_distribution(sc.median, direction, cand.stat_type, script)
-
-    # Recompute p_win using script-adjusted mu
-    p_win = _calibrated_p_win(cand.line, mu_star, cal_shape, family, direction, cand.stat_type)
-
-    # W1 is embedded in p_win itself (p_win IS the primary win signal)
-    # W2: market agreement — anchor delta after script adjustment
-    # Start from 50/50 baseline. Shift based on:
-    #   1. Sharp median vs PP line (real SGO data when available)
-    #   2. Stored pp_shade_signal as fallback when no fresh sharp data
-    if direction == Direction.OVER:
-        anchor_delta = sc.median - cand.line
-    else:
-        anchor_delta = cand.line - sc.median
-    is_real = sc.freshness_sec < 9000.0
-
-    if is_real:
-        # Real sharp data — use it directly
-        w2 = float(np.clip(0.5 + anchor_delta / 1.0, 0.0, 1.0))
-    else:
-        # No fresh sharp data — use stored pp_shade_signal as market proxy
-        shade = cand.pp_shade_signal
-        if shade == 'lean_over':
-            w2 = 0.62 if direction == Direction.OVER else 0.38
-        elif shade == 'lean_under':
-            w2 = 0.38 if direction == Direction.OVER else 0.62
-        else:
-            w2 = 0.50  # true 50/50 baseline when no signal
-
-    # Line movement boost: if PP moved the line in the direction we're betting,
-    # that's confirmation. +0.03 per move, capped at +0.09.
-    if cand.line_move_count > 0 and cand.first_seen_line is not None:
-        moved_up = cand.line > cand.first_seen_line
-        move_confirms = (moved_up and direction == Direction.OVER) or \
-                        (not moved_up and direction == Direction.UNDER)
-        move_bonus = min(cand.line_move_count * 0.03, 0.09)
-        w2 = float(np.clip(w2 + (move_bonus if move_confirms else -move_bonus), 0.0, 1.0))
-
-    # W3: script_fit — how well this stat type benefits from today's environment
-    pace_sign  = _STAT_PACE_SIGN.get(cand.stat_type, +1)
-    if direction == Direction.UNDER:
-        pace_sign = -pace_sign  # under on a high-pace stat = bad script fit
-    w3 = float(np.clip(0.5 + (script.run_env - 0.5) * pace_sign * 1.0, 0.0, 1.0))
-
-    # W4: role_certainty — blended with historical hit rate when available
-    base_role = float(np.clip(1.0 - dnp_prob / 0.15, 0.0, 1.0))
-    if cand.perf_hit_rate is not None and cand.perf_sample_size >= 3:
-        # Weight: 60% base role certainty, 40% historical hit rate
-        # Recent form (last 5) adds a ±0.05 nudge
-        last5_bonus = (cand.perf_last5_hits / max(cand.perf_sample_size, 1) - 0.5) * 0.10 if cand.perf_sample_size >= 3 else 0.0
-        w4 = float(np.clip(0.60 * base_role + 0.40 * cand.perf_hit_rate + last5_bonus, 0.0, 1.0))
-    else:
-        w4 = base_role
-
-    # W5: line_value — how far the line is from the median (positive = line set favorably)
-    # For OVER: below-median line has value. For UNDER: above-median line has value.
-    lv_raw = anchor_delta / max(sc.median, 0.5)
-    w5 = float(np.clip(0.5 + lv_raw * 0.5, 0.0, 1.0))
-
-    # W6: payout_boost — slight bump for higher-line props (larger payout if it hits)
-    # Normalized to 0-1 based on line relative to stat-family typical range.
-    typical_line = sc.median
-    w6 = float(np.clip(cand.line / max(typical_line * 2, 0.5), 0.0, 1.0))
-
-    score = float(np.clip(
-        0.34 * p_win
-      + 0.22 * w2
-      + 0.18 * w3
-      + 0.12 * w4
-      + 0.08 * w5
-      + 0.06 * w6,
-        0.0, 1.0,
-    ))
-
-    # ── Edge reason gate ───────────────────────────────────────────────
-    # GOTit must produce a strong reason BEFORE it can rank this side.
-    # If none fire → has_edge=False → excluded from picks entirely.
-    edge_reasons = []  # type: List[str]
-
-    if is_real and abs(anchor_delta) >= _SHARP_GAP_STRONG:
-        edge_reasons.append('sharp_line_gap')
-    if not is_real and cand.pp_shade_signal in ('lean_over', 'lean_under'):
-        edge_reasons.append('shade_confirmed')
-    if cand.line_move_count >= _LINE_MOVED_MIN and cand.first_seen_line is not None:
-        moved_up = cand.line > cand.first_seen_line
-        move_confirms = (moved_up and direction == Direction.OVER) or \
-                        (not moved_up and direction == Direction.UNDER)
-        if move_confirms:
-            edge_reasons.append('line_moved')
-    if p_win >= _HIGH_PWIN_FLOOR:
-        edge_reasons.append('high_p_win')
-    if w4 >= _STRONG_ROLE_FLOOR:
-        edge_reasons.append('strong_role')
-    if w3 >= _SCRIPT_FIT_FLOOR:
-        edge_reasons.append('script_fit')
-
-    has_edge = len(edge_reasons) > 0
-
-    return ScriptedCandidate(
-        prop_id=cand.prop_id,
-        player_name=cand.player_name,
-        stat_type=cand.stat_type,
-        line=cand.line,
-        direction=direction,
-        p_win=p_win,
-        market_agreement=round(w2, 4),
-        script_fit=round(w3, 4),
-        role_certainty=round(w4, 4),
-        line_value=round(w5, 4),
-        payout_boost=round(w6, 4),
-        scripted_winner_score=round(score, 4),
-        edge_reasons=edge_reasons,
-        has_edge=has_edge,
-    )
-
-
-def score_standard_leg(
-    cand:      "LegCandidate",
-    sc:        "SharpConsensus",
-    dnp_prob:  float,
-    script:    Optional[GameScript] = None,
-    family:    Optional[DistFamily] = None,
-    cal_shape: Optional[Dict] = None,
-) -> "WinScoreStandard":
-    """
-    Backwards-compatible wrapper: scores a standard leg using score_side()
-    and returns a WinScoreStandard for MILP win_score_map.
-    """
-    if script is None:
-        script = GameScript(run_env=0.5, pace=0.5, team_edge=0.0,
-                            bullpen_stress=0.3, park_weather=0.5, blowout_risk=0.2)
-    if family is None:
-        family = get_family(cand.stat_type)
-    if cal_shape is None:
-        cal_shape = {}
-
-    sc_result = score_side(cand, cand.direction, sc, dnp_prob, script, family, cal_shape)
-
-    return WinScoreStandard(
-        prop_id=cand.prop_id,
-        player_name=cand.player_name,
-        stat_type=cand.stat_type,
-        line=cand.line,
-        direction=cand.direction,
-        p_win=sc_result.p_win,
-        w1_pwin_margin=round(sc_result.p_win, 4),
-        w2_market_agree=sc_result.market_agreement,
-        w3_dist_conv=sc_result.script_fit,
-        w4_role=sc_result.role_certainty,
-        win_score=sc_result.scripted_winner_score,
-    )
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 11. UNDER SCORING ENGINE
-# ──────────────────────────────────────────────────────────────────────────────
-
-@dataclass
-class UnderScore:
-    prop_id:                 str
-    player_name:             str
-    stat_type:               str
-    line:                    float
-    p_under:                 float
-    u1_market_anchor:        float
-    u2_dist_hit_rate:        float
-    u3_volume_weakness:      float
-    u4_game_script_suppression: float
-    u5_pair_diversity:       float
-    composite:               float
-    qualifies:               bool
-
-
-def _keep_under(
-    p_under:          float,
-    edge:             float,   # pp_line - fair_line (positive = PP line > fair = value on under)
-    dnp_prob:         float,
-    volume_weakness:  float,
-    upside_trap:      bool,
-) -> bool:
-    """Hard keep gate for under legs. All five conditions must be true."""
-    return (
-        p_under          >= 0.54
-        and edge          > 0.0
-        and dnp_prob      < 0.15
-        and volume_weakness >= 0.45
-        and not upside_trap
-    )
-
-
-def score_under(
-    cand:                   "LegCandidate",
-    sc:                     "SharpConsensus",
-    dnp_prob:               float,
-    # U3 volume weakness inputs
-    lineup_risk:            float = 0.5,
-    order_penalty:          float = 0.5,
-    pitch_count_risk:       float = 0.5,
-    sub_risk:               float = 0.0,
-    # U4 game script suppression inputs
-    park_suppression:       float = 0.5,
-    matchup_suppression:    float = 0.5,
-    run_env_suppression:    float = 0.5,
-    push_mass:              float = 0.5,
-    # U5
-    shared_failure_penalty: float = 0.0,
-) -> UnderScore:
-    """
-    Score a standard UNDER leg.
-    Keep gate: p_under>=0.54 AND edge>0 AND dnp<0.15 AND volume_weakness>=0.45 AND not upside_trap
-    Weights:   U1=0.36  U2=0.24  U3=0.18  U4=0.12  U5=0.10
-    """
-    pp_line   = cand.line
-    p_under   = cand.p_win   # p_win was computed for UNDER direction
-    fair_line = sc.median
-    is_real   = sc.freshness_sec < 9000.0
-
-    # edge = pp_line - fair_line: positive means PP line is above the fair line → under has value
-    edge = pp_line - fair_line
-
-    # Derive volume_weakness and upside_trap from available data when inputs are default
-    # volume_weakness: proxy = U3 formula with defaults (0.5 neutral each component)
-    volume_weakness = float(np.clip(
-        0.35 * lineup_risk + 0.25 * order_penalty +
-        0.25 * pitch_count_risk + 0.15 * sub_risk,
-        0.0, 1.0
-    ))
-    # upside_trap: true when the fair line is materially BELOW pp_line (edge > 1.5)
-    # meaning PP is pricing in a scenario where the player blows up the over — risky to fade
-    upside_trap = edge > 1.5
-
-    qualifies = _keep_under(p_under, edge, dnp_prob, volume_weakness, upside_trap)
-    if not qualifies:
-        return UnderScore(
-            prop_id=cand.prop_id, player_name=cand.player_name,
-            stat_type=cand.stat_type, line=pp_line, p_under=p_under,
-            u1_market_anchor=0.0, u2_dist_hit_rate=0.0, u3_volume_weakness=0.0,
-            u4_game_script_suppression=0.0, u5_pair_diversity=1.0,
-            composite=0.0, qualifies=False,
-        )
-
-    # ── U1: Market anchor ────────────────────────────────────────────────
-    # clamp(0.5 + (pp_line - fair_line) / 1.0)
-    u1 = float(np.clip(0.5 + edge / 1.0, 0.0, 1.0)) if is_real else 0.40
-
-    # ── U2: Distribution hit rate ─────────────────────────────────────────
-    # clamp((p_under - 0.54) / 0.16)
-    u2 = float(np.clip((p_under - 0.54) / 0.16, 0.0, 1.0))
-
-    # ── U3: Volume weakness ──────────────────────────────────────────────
-    # clamp(0.35*lineup_risk + 0.25*order_penalty + 0.25*pitch_count_risk + 0.15*sub_risk)
-    u3 = volume_weakness  # already computed above
-
-    # ── U4: Game script suppression ────────────────────────────────────────
-    # clamp(0.30*park_suppression + 0.25*matchup_suppression + 0.25*run_env + 0.20*push_mass)
-    u4 = float(np.clip(
-        0.30 * park_suppression + 0.25 * matchup_suppression +
-        0.25 * run_env_suppression + 0.20 * push_mass,
-        0.0, 1.0
-    ))
-
-    # ── U5: Pair diversity ─────────────────────────────────────────────────
-    u5 = float(np.clip(1.0 - shared_failure_penalty, 0.0, 1.0))
-
-    # ── Composite: U1=0.36 U2=0.24 U3=0.18 U4=0.12 U5=0.10 ────────────────
-    composite = float(np.clip(
-        0.36 * u1 + 0.24 * u2 + 0.18 * u3 + 0.12 * u4 + 0.10 * u5,
-        0.0, 1.0
-    ))
-
-    return UnderScore(
-        prop_id=cand.prop_id,
-        player_name=cand.player_name,
-        stat_type=cand.stat_type,
-        line=pp_line,
-        p_under=p_under,
-        u1_market_anchor=round(u1, 4),
-        u2_dist_hit_rate=round(u2, 4),
-        u3_volume_weakness=round(u3, 4),
-        u4_game_script_suppression=round(u4, 4),
-        u5_pair_diversity=round(u5, 4),
-        composite=round(composite, 4),
-        qualifies=True,
-    )
-
-
-# ── Slip-level must-win floor ─────────────────────────────────────────────────
-# A slip is only shown if its geometric hit probability clears this floor.
-# 6 legs at p_win=0.62 each → 0.62^6 ≈ 0.0566 — too low to show.
-# This floor filters boards where even the "best" 6 legs are too weak.
-SLIP_HIT_PROB_FLOOR = 0.04   # 6 legs at 0.64 each ≈ 0.075; floor is conservative
-
-def solve_game_milp(
-    candidates: List[LegCandidate],
-    win_score_map: Dict[str, float],
-    r_star_6:   float,
-    time_limit_sec: float = 5.0,
-) -> Optional[List[LegCandidate]]:
-    """
-    Must-Win Slip Optimizer — two-pool architecture.
-
-    Pool x_i — non-demon legs (STANDARD + GOBLIN):
-      • Exactly 6 selected:        Σ x_i = 6
-      • 6 unique players:          Σ x_i for each player_id ≤ 1
-      • ≥ 2 distinct stat types
-      • Direction diversity (soft)
-      • Stat-type caps
-      • p_win floor per tier
-
-    Pool y_j — demon legs:
-      • 1 or 2 selected:           1 ≤ Σ y_j ≤ 2  (if any demons available)
-      • Distinct players within demons: Σ y_j per player_id ≤ 1
-      • NO cross-pool uniqueness between x_i and y_j
-        → a demon player may duplicate a non-demon player (by spec)
-
-    Objective: maximize Σ log(p_win)*x_i + Σ log(p_win)*y_j + 0.10*(win_scores)
-    """
-    # Split candidates by pool
-    nd_eligible = [
-        lg for lg in candidates
-        if lg.tier != Tier.DEMON and win_score_map.get(lg.prop_id, 0.0) > 0.0
-    ]
-    d_eligible = [
-        lg for lg in candidates
-        if lg.tier == Tier.DEMON and win_score_map.get(lg.prop_id, 0.0) > 0.0
-    ]
-
-    if len(nd_eligible) < 6:
-        log.info("[MILP] Only %d non-demon candidates with edge — need 6, slip rejected",
-                 len(nd_eligible))
-        return None
-
-    log.info("[MILP] non-demon pool=%d  demon pool=%d", len(nd_eligible), len(d_eligible))
-
-    solver = pywraplp.Solver.CreateSolver("SCIP")
-    if not solver:
-        log.error("SCIP solver unavailable — OR-Tools not properly installed")
-        return None
-    solver.SetTimeLimit(int(time_limit_sec * 1000))
-
-    # ── Pool x: non-demon BoolVars ────────────────────────────────────────────
-    nd_map = {lg.prop_id: lg for lg in nd_eligible}
-    x: Dict[str, pywraplp.Variable] = {
-        lg.prop_id: solver.BoolVar(f"x_{lg.prop_id}") for lg in nd_eligible
+    L = float(row.get('lineScore', row.get('line', 0)) or 0)
+    stat_type = str(row.get('statType', row.get('stat_type', '')) or '')
+
+    sigma_ratios = {
+        'Total Bases': 0.38, 'Hits': 0.55, 'Hits+Runs+RBIs': 0.40,
+        'Pitcher Strikeouts': 0.32, 'Pitches Thrown': 0.14,
+        'Pitching Outs': 0.28, 'Hits Allowed': 0.42,
+        'Earned Runs Allowed': 0.70, 'Walks Allowed': 0.75,
+        'Significant Strikes': 0.22, 'Hitter Fantasy Score': 0.40,
+        'Points': 0.26, 'Rebounds': 0.40, 'Assists': 0.45,
+        'Points+Rebounds+Assists': 0.28, 'Takedowns': 0.55,
+        'Fight Time': 0.30, 'Rushing Attempts': 0.35,
+        'Strikeouts': 0.32, 'Fantasy Score': 0.40,
     }
+    sigma = max(0.5, L * sigma_ratios.get(stat_type, 0.40))
 
-    # ── Pool y: demon BoolVars ────────────────────────────────────────────────
-    d_map = {lg.prop_id: lg for lg in d_eligible}
-    y: Dict[str, pywraplp.Variable] = {
-        lg.prop_id: solver.BoolVar(f"y_{lg.prop_id}") for lg in d_eligible
-    }
+    # Sharp-informed mu
+    sharp_lines = [q.get('line', L) for q in sharps if q.get('line') is not None]
+    sharp_mu = sum(sharp_lines) / len(sharp_lines) if sharp_lines else L * 1.03
 
-    # ── Objective: maximize log(p_win) + 0.10*win_score across both pools ─────
-    obj_terms = []
-    for lg in nd_eligible:
-        coeff = math.log(max(lg.p_win, 0.001)) + 0.10 * win_score_map.get(lg.prop_id, 0.0)
-        obj_terms.append(coeff * x[lg.prop_id])
-    for lg in d_eligible:
-        coeff = math.log(max(lg.p_win, 0.001)) + 0.10 * win_score_map.get(lg.prop_id, 0.0)
-        obj_terms.append(coeff * y[lg.prop_id])
-    solver.Maximize(solver.Sum(obj_terms))
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # HARD CONSTRAINTS — x pool (non-demons)
-    # ═══════════════════════════════════════════���══════════════════════════════
-
-    # [C1] Exactly 6 non-demon legs
-    solver.Add(solver.Sum(list(x.values())) == 6)
-
-    # [C2] At most 1 non-demon leg per player — hard solver constraint.
-    # This is the authoritative enforcement. The pre-MILP dedup is a performance
-    # optimization only. This constraint must always be present in the solver
-    # regardless of what the pool looks like going in.
-    nd_player_vars: Dict[str, List] = {}
-    for lg in nd_eligible:
-        nd_player_vars.setdefault(lg.player_id, []).append(x[lg.prop_id])
-    for pid, vars_ in nd_player_vars.items():
-        solver.Add(solver.Sum(vars_) <= 1)
-
-    # [C3] Direction diversity (soft — only when minority side has ≥ 4 candidates)
-    nd_over  = [x[lg.prop_id] for lg in nd_eligible if lg.direction == Direction.OVER]
-    nd_under = [x[lg.prop_id] for lg in nd_eligible if lg.direction == Direction.UNDER]
-    if nd_over and len(nd_under) >= 4:
-        solver.Add(solver.Sum(nd_over) <= 5)
-    if nd_under and len(nd_over) >= 4:
-        solver.Add(solver.Sum(nd_under) <= 5)
-
-    # [C4] ≥ 2 distinct stat categories among the 6 non-demon legs
-    nd_stat_vars: Dict[str, List] = {}
-    for lg in nd_eligible:
-        nd_stat_vars.setdefault(lg.stat_type, []).append(x[lg.prop_id])
-    z_stat: Dict[str, pywraplp.Variable] = {}
-    for stat, vars_ in nd_stat_vars.items():
-        z = solver.BoolVar(f"z_{stat}")
-        solver.Add(solver.Sum(vars_) >= z)
-        solver.Add(solver.Sum(vars_) <= 6 * z)
-        z_stat[stat] = z
-    solver.Add(solver.Sum(list(z_stat.values())) >= 2)
-
-    # [C5] Stat-type caps (correlated failure mode protection)
-    hfs_vars = [x[lg.prop_id] for lg in nd_eligible if lg.stat_type == 'Hitter Fantasy Score']
-    if len(hfs_vars) > 2:
-        solver.Add(solver.Sum(hfs_vars) <= 2)
-    sig_vars = [x[lg.prop_id] for lg in nd_eligible if lg.stat_type == 'Significant Strikes']
-    if len(sig_vars) > 2:
-        solver.Add(solver.Sum(sig_vars) <= 2)
-    for stat, vars_ in nd_stat_vars.items():
-        if len(vars_) > 3:
-            solver.Add(solver.Sum(vars_) <= 3)
-
-    # [C6] p_win floors per tier
-    # STANDARD_PWIN_FLOOR is 0.50 — effectively admits all props with any edge signal.
-    # The MILP objective (maximize log p_win) naturally selects the highest p_win legs;
-    # this floor only hard-blocks props that are clearly worse than a coin flip.
-    for lg in nd_eligible:
-        if lg.tier == Tier.STANDARD and lg.p_win < STANDARD_PWIN_FLOOR:
-            solver.Add(x[lg.prop_id] == 0)
-        elif lg.tier == Tier.GOBLIN and lg.p_win < r_star_6:
-            solver.Add(x[lg.prop_id] == 0)
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # HARD CONSTRAINTS — y pool (demons)
-    # No cross-pool uniqueness. Demon player may duplicate a non-demon player.
-    # ══════════════════════════════════════════════════════════════════════════
-
-    if y:
-        # [D1] 1–2 demon legs
-        solver.Add(solver.Sum(list(y.values())) >= 1)
-        solver.Add(solver.Sum(list(y.values())) <= 2)
-
-        # [D2] At most 1 demon leg per player within the demon pool
-        d_player_vars: Dict[str, List] = {}
-        for lg in d_eligible:
-            d_player_vars.setdefault(lg.player_id, []).append(y[lg.prop_id])
-        for pid, vars_ in d_player_vars.items():
-            solver.Add(solver.Sum(vars_) <= 1)
-
-        # NOTE: No Σ(x_i + y_j) ≤ 1 per player.
-        # Demon player duplication of non-demon players is explicitly allowed.
-
-    # ── Solve ─────────────────────────────────────────────────────────────────
-    status = solver.Solve()
-    if status not in (pywraplp.Solver.OPTIMAL, pywraplp.Solver.FEASIBLE):
-        log.info("[MILP] Infeasible — no valid slip for this game")
-        return None
-
-    selected_nd = [nd_map[pid] for pid, var in x.items() if var.solution_value() > 0.5]
-    selected_d  = [d_map[pid]  for pid, var in y.items() if var.solution_value() > 0.5]
-
-    # ── Pre-return validation assertions ──────────────────────────────────────
-    # These must never fail. If they do, the constraint above is broken.
-    assert len(selected_nd) == 6, (
-        f"ASSERTION_FAIL: non_demons.length == {len(selected_nd)}, expected 6"
-    )
-    unique_nd_players = len({lg.player_id for lg in selected_nd})
-    assert unique_nd_players == 6, (
-        f"ASSERTION_FAIL: unique(non_demons.player_id).length == {unique_nd_players}, expected 6"
-    )
-    if d_eligible:
-        assert 1 <= len(selected_d) <= 2, (
-            f"ASSERTION_FAIL: demons.length == {len(selected_d)}, expected 1–2"
-        )
-    # No cross-pool uniqueness check — demon duplication of non-demon players is allowed.
-
-    log.info(
-        "[MILP] selected: %d non-demon legs (players: %s), %d demon legs",
-        len(selected_nd),
-        [lg.player_id for lg in selected_nd],
-        len(selected_d),
-    )
-
-    selected = selected_nd + selected_d
-
-    # ── No-slip check: reject if geometric hit probability is below floor ──────
-    slip_hit_prob = 1.0
-    for lg in selected_nd:   # slip_hit_prob based on non-demon legs only
-        slip_hit_prob *= lg.p_win
-    if slip_hit_prob < SLIP_HIT_PROB_FLOOR:
-        log.info(
-            "No-slip: slip_hit_prob=%.4f < floor=%.4f — board too weak",
-            slip_hit_prob, SLIP_HIT_PROB_FLOOR,
-        )
-        return None
-
-    log.info("Slip selected: hit_prob=%.4f non_demon_legs=%s demon_legs=%s",
-             slip_hit_prob,
-             [(lg.player_name, lg.stat_type, lg.direction.value, round(lg.p_win,3))
-              for lg in selected_nd],
-             [(lg.player_name, lg.stat_type, round(lg.p_win,3))
-              for lg in selected_d])
-    return selected
+    return sharp_mu, sigma
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 11. MAIN ENTRY POINT
-# ──────────────────────────────────────────────────────────────────────────────
-def select_legs_for_slate(
-    pp_props:       List[PPProp],
-    sharp_consensus: Dict[str, SharpConsensus],
-    calibration:    CalibrationParams,
-    game_scripts:   Dict[str, List[Dict]],
-    rho_map:        Dict[Tuple[str, str], float],
-    dnp_model:      Dict[str, float],
-) -> Dict[str, Dict]:
+def score_prop(row: Dict, model: Optional[Dict], sharps: List[Dict],
+               ctx: Dict, cfg: Dict) -> List[ScoredLeg]:
     """
-    Returns { game_id: {"six_legs": [...], "two_demons": [...], "meta": {...}} }
-    Games with no feasible MILP solution are omitted.
+    Score a single prop row for both More and Less.
+    Returns list of 1–2 ScoredLeg objects.
     """
+    L         = float(row.get('lineScore', row.get('line', 0)) or 0)
+    is_demon  = bool(row.get('isDemon') or row.get('is_demon'))
+    is_goblin = bool(row.get('isGoblin') or row.get('is_goblin'))
+    prop_id   = str(row.get('id') or row.get('prizepicks_id') or '')
+    player_id = str(row.get('playerId') or row.get('player_id') or row.get('playerName') or '')
+    player_name = str(row.get('playerName') or row.get('player_name') or '')
+    stat_type = str(row.get('statType') or row.get('stat_type') or '')
+    game_id   = str(row.get('gameId') or row.get('game_id') or '')
+    sport     = str(row.get('sport') or '')
+    team      = str(row.get('teamAbbr') or row.get('team') or '')
 
-    # 0. Verify calibration hash
-    if not calibration.verify_hash():
-        raise RuntimeError("Calibration hash mismatch — DO NOT TRADE")
+    if model:
+        mu    = float(model.get('mu', L) or L)
+        sigma = float(model.get('sigma', 1.0) or 1.0)
+        if sigma <= 1e-9:
+            sigma = 1.0
+    else:
+        mu, sigma = _estimate_mu_sigma(row, sharps)
 
-    # 1. Build all leg candidates across slate
-    all_candidates: List[LegCandidate] = []
+    p_m_model = p_more(mu, sigma, L)
+    p_l_model = p_less(mu, sigma, L)
 
-    for pp in pp_props:
-        if pp.prop_id not in sharp_consensus:
-            continue
-        sc     = sharp_consensus[pp.prop_id]
-        median = sc.median
-        shape  = sc.shape_params
-        family = get_family(pp.stat_type)
+    p_m_sharp_raw, p_l_sharp_raw = _sharp_probs(sharps, L)
 
-        # Get calibration shape override if present
-        cal_shape = calibration.dist_params.get(pp.stat_type, shape)
+    p_be_map = cfg.get('p_be', DEFAULT_CFG['p_be'])
+    p_be_5f  = p_be_map.get('5_flex', 0.543)
+    frag     = _fragility_score(ctx)
+    abs_floor = cfg.get('absolute_floor_p', 0.52)
+    frag_kill = cfg.get('fragility_kill', 0.65)
 
-        for tier in pp.tiers_offered:
-            line = pp.lines[tier]
+    legs: List[ScoredLeg] = []
 
-            # Direction rules (non-negotiable):
-            #   DEMON   → OVER only, demon section only
-            #   GOBLIN  → OVER only, slate section only
-            #   STANDARD → GOTit evaluates BOTH directions internally,
-            #              then keeps ONLY the one with higher p_win.
-            #              The DB stores a single over row per player+stat+game.
-            #              Both sides are derived here from the same line.
-            if tier in (Tier.GOBLIN, Tier.DEMON):
-                dirs = [Direction.OVER]
-            else:
-                dirs = [Direction.OVER, Direction.UNDER]
-
-            dnp_prob = dnp_model.get(pp.player_id, dnp_model.get(pp.prop_id, 0.0))
-
-            # Standard line floor — block lottery lines before scoring
-            if tier == Tier.STANDARD:
-                std_floor = _STANDARD_LINE_FLOOR.get(pp.stat_type, _STANDARD_LINE_FLOOR["_default"])
-                if line < std_floor:
-                    log.debug("Gate 0 (std floor): %s %s line=%.1f < floor=%.1f",
-                              pp.player_name, pp.stat_type, line, std_floor)
-                    continue
-
-            # Player-level junk filter — if EVERY standard prop this player has
-            # across all stat types is below floor, the player has no meaningful
-            # line on the board and should not appear in the slate at all.
-            # (Checks all props for this player in the same game batch, not just current.)
-            if tier == Tier.STANDARD:
-                all_player_props = [
-                    p for p in pp_props
-                    if p.player_id == pp.player_id
-                    and Tier.STANDARD in p.tiers_offered
-                ]
-                has_meaningful = any(
-                    p.lines.get(Tier.STANDARD, 0) >= _STANDARD_LINE_FLOOR.get(p.stat_type, _STANDARD_LINE_FLOOR["_default"])
-                    for p in all_player_props
-                )
-                if not has_meaningful:
-                    log.info("Player junk filter: %s has no prop above floor — skipping",
-                             pp.player_name)
-                    continue
-
-            best_cand: Optional[LegCandidate] = None
-            for d in dirs:
-                p_win = _calibrated_p_win(line, median, cal_shape, family, d, pp.stat_type)
-
-                # Hard filters
-                # Gate lowered to 0.48 — BREAKEVEN_R[6]-0.02 = ~0.565 kills all props
-                # when sharp data is sparse (p_win clusters 0.50-0.54).
-                # MILP objective still maximizes p_win among admitted props.
-                if p_win < 0.48:
-                    continue
-                if dnp_prob > 0.15:
-                    continue
-                if tier == Tier.DEMON and p_win < BREAKEVEN_R[6] + 0.03:
-                    continue
-
-                # Extract learning-loop performance fields
-                perf = pp.perf or {}
-                hit_c  = int(perf.get('hitCount', 0))
-                miss_c = int(perf.get('missCount', 0))
-                total_s = hit_c + miss_c
-                last5_raw = perf.get('last5', [])
-                last5_hits = sum(1 for x in last5_raw if x == 'hit')
-                lifetime_rate = (hit_c / total_s) if total_s > 0 else None
-
-                cand = LegCandidate(
-                    prop_id=pp.prop_id if d == Direction.OVER else f"{pp.prop_id}:under",
-                    game_id=pp.game_id,
-                    player_id=pp.player_id,
-                    player_name=pp.player_name,
-                    stat_type=pp.stat_type,
-                    tier=tier,
-                    line=line,
-                    direction=d,
-                    p_win=float(np.clip(p_win, 0.001, 0.999)),
-                    perf_hit_rate=lifetime_rate,
-                    perf_last5_hits=last5_hits,
-                    perf_sample_size=total_s,
-                    # Sharp market signals from PPProp
-                    pp_shade_signal=pp.pp_shade_signal,
-                    sharp_fair_line=pp.sharp_fair_line,
-                    line_move_count=pp.line_move_count,
-                    first_seen_line=pp.first_seen_line,
-                )
-
-                # Score UNDER standard legs; drop those that fail keep gate
-                if d == Direction.UNDER and tier == Tier.STANDARD:
-                    us = score_under(cand, sc, dnp_prob)
-                    if not us.qualifies:
-                        continue
-                    cand.under_score = us
-
-                # For standard legs: keep only the better-scoring direction
-                if tier == Tier.STANDARD:
-                    if best_cand is None or cand.p_win > best_cand.p_win:
-                        best_cand = cand
-                else:
-                    # Demons and goblins: only one direction (OVER), add directly
-                    all_candidates.append(cand)
-
-            # Add the single winning direction for standard legs
-            if tier == Tier.STANDARD and best_cand is not None:
-                all_candidates.append(best_cand)
-
-    if not all_candidates:
-        log.warning("No leg candidates passed hard filters — slate is empty")
-        return {}
-
-    # ── PRE-FILTER before Shapley: cap per game so Shapley stays O(N*C(15,5)) ──
-    # Shapley is exact for N≤15 but blows up beyond ~20. Pre-rank by p_win,
-    # reserve demon slots, and keep top MAX_SHAPLEY per game.
-    MAX_SHAPLEY = 40  # raised from 15 — ensures enough unique-player candidates survive dedup
-
-    filtered: List[LegCandidate] = []
-    by_game: Dict[str, List[LegCandidate]] = {}
-    for c in all_candidates:
-        by_game.setdefault(c.game_id, []).append(c)
-
-    for game_id, gcands in by_game.items():
-        raw_d_cands = [c for c in gcands if c.tier == Tier.DEMON]
-        s_cands     = sorted([c for c in gcands if c.tier != Tier.DEMON],
-                             key=lambda c: c.p_win, reverse=True)
-
-        # ── Demon qualification: PP flags it, GOTit scores and filters it ────
-        qualified_d = qualify_demons(
-            demon_cands=raw_d_cands,
-            sc_map=sharp_consensus,
-            dnp_model=dnp_model,
-        )
-        # Note: MILP handles 0/1/2 demon case — no skip here.
-        # Games with 0 qualifying demons produce a standard-only slip (no demon slots).
-
-        # ── Standard admission floor: drop before Shapley ─────────────────────
-        # Standards that can't clear STANDARD_PWIN_FLOOR have no path to selection;
-        # excluding them keeps Shapley fast and clean.
-        # Pre-filter: soft floor to keep candidates alive for dedup + MILP.
-        # Using a soft 0.45 cutoff here so props with sparse sharp data (p_win ~0.50)
-        # still reach the MILP, which applies the authoritative 0.57 hard floor per leg.
-        # Goblins always bypass — they use r_star_6 in the MILP.
-        PRE_FILTER_FLOOR = 0.45
-        s_cands_admitted = [
-            c for c in s_cands
-            if c.tier == Tier.GOBLIN or c.p_win >= PRE_FILTER_FLOOR
-        ]
-
-        # ── One-player-max dedup for non-demon pool ───────────────────────────
-        # Rule: the non-demon pool must yield exactly 6 legs from 6 different
-        # players. Enforcing this BEFORE the MILP (rather than only inside the
-        # solver) makes the constraint structural — the optimizer never even sees
-        # a second candidate from the same player.
-        #
-        # Within each player, keep the single highest-p_win candidate.
-        # Tie-break by win_score_map is not available here (scored later), so
-        # p_win is the correct pre-score sort key; the MILP objective will still
-        # maximise over this deduped pool.
-        seen_nd_players: Dict[str, LegCandidate] = {}
-        for c in s_cands_admitted:  # already sorted p_win desc
-            if c.player_id not in seen_nd_players:
-                seen_nd_players[c.player_id] = c  # first = highest p_win
-        s_deduped = list(seen_nd_players.values())
-        log.info(
-            "[pre-filter] game=%s non-demon pool: %d candidates → %d after player dedup",
-            game_id, len(s_cands_admitted), len(s_deduped),
-        )
-        if len(s_deduped) < 6:
-            log.info(
-                "[pre-filter] game=%s: only %d unique-player non-demon candidates — "
-                "need 6, game skipped",
-                game_id, len(s_deduped),
-            )
-            continue  # not enough distinct players — no valid slip possible
-
-        # Cap demon slots at 6 (enough for MILP to pick 2, with diversity)
-        demon_slots = qualified_d[:6]
-        standard_slots = s_deduped[:MAX_SHAPLEY - len(demon_slots)]
-        filtered.extend(demon_slots + standard_slots)
-
-    all_candidates = filtered
-    log.info("After pre-filter: %d candidates across %d games",
-             len(all_candidates), len(by_game))
-
-    if not all_candidates:
-        return {}
-
-    # 2+3+4. Per-game: Shapley EV → corr-adj EV → MILP
-    # Shapley MUST run per-game (N≤15). Running it across all games at once
-    # makes C(N-1,5) explode to billions of iterations.
-    output: Dict[str, Dict] = {}
-    r_star_6 = BREAKEVEN_R[6]
-    shapley_all:  Dict[str, float] = {}
-    # corr_adj_all removed — MILP now uses WinScoreStandard, not Shapley corr-adj EV
-
-    for game_id in set(c.game_id for c in all_candidates):
-        game_cands = [c for c in all_candidates if c.game_id == game_id]
-        if len(game_cands) < 6:
+    for side, pm, ps_raw in [('more', p_m_model, p_m_sharp_raw),
+                              ('less', p_l_model, p_l_sharp_raw)]:
+        # Demons are more-only
+        if is_demon and side == 'less':
             continue
 
-        # ── Build game script for this game ──────────────────────────────────
-        # Use game_total from sharp consensus if available; fall back to 0.
-        game_sc_list = [sc for sc in sharp_consensus.values()
-                        if any(c.prop_id == sc.prop_id for c in game_cands)]
-        game_script = build_game_script(
-            sc_list=game_sc_list,
-            game_total=sum(sc.median for sc in game_sc_list) / max(len(game_sc_list), 1)
-                       if game_sc_list else 0.0,
-        )
-        log.info("[script] game=%s run_env=%.2f pace=%.2f blowout=%.2f",
-                 game_id, game_script.run_env, game_script.pace, game_script.blowout_risk)
+        pt = p_true_blend(pm, ps_raw, cfg.get('p_true_mode', 'min'))
+        ps = ps_raw if ps_raw is not None else pm
+        gap = _sharp_gap(sharps, L, side)
+        traps = _detect_traps(row, side, ctx, cfg)
 
-        # ── Build WinScore map for MILP objective ────────────────────────────
-        # Standards + goblins: ScriptedCandidate.scripted_winner_score via score_side()
-        # Demons: DemonWinScore composite with script_ceiling_fit
-        win_score_map: Dict[str, float] = {}
-        for c in game_cands:
-            dnp_p  = dnp_model.get(c.player_id, dnp_model.get(c.prop_id, 0.0))
-            sc_c   = sharp_consensus.get(c.prop_id)
-            family = get_family(c.stat_type)
-            if c.tier == Tier.DEMON:
-                if sc_c:
-                    ds = score_demon(c, sc_c, dnp_p, game_total=game_script.run_env * 8.5)
-                    win_score_map[c.prop_id] = ds.composite
-                else:
-                    win_score_map[c.prop_id] = 0.0
-            else:
-                if sc_c:
-                    sc_result = score_side(c, c.direction, sc_c, dnp_p, game_script, family, {})
-                    # Edge gate: if GOTit cannot produce a strong reason, score=0
-                    # so MILP will never select this leg.
-                    if not sc_result.has_edge:
-                        log.info("[no_edge] %s %s %.1f %s — no strong reason, excluded",
-                                 c.player_name, c.stat_type, c.line, c.direction.value)
-                        win_score_map[c.prop_id] = 0.0
-                        c.ev_corr_adj = 0.0
-                    else:
-                        win_score_map[c.prop_id] = sc_result.scripted_winner_score
-                        c.ev_corr_adj = sc_result.scripted_winner_score
-                        # Update p_win with script-adjusted value
-                        c.p_win = sc_result.p_win
-                    # Always store reasons for transparency
-                    c.edge_reasons = sc_result.edge_reasons
-                else:
-                    win_score_map[c.prop_id] = 0.0
+        kills: List[str] = []
+        if ctx.get('news_kill', False):
+            kills.append('news_kill')
+        if frag >= frag_kill:
+            kills.append('fragility')
+        if is_demon and side != 'more':
+            kills.append('demon_side')
+        if is_demon and pt < cfg.get('demon_min_p', 0.50):
+            kills.append('demon_p_floor')
+        if is_goblin and cfg.get('ban_goblins', False):
+            kills.append('goblin_ban')
+        if pt < abs_floor:
+            kills.append('below_floor')
 
-        # Keep Shapley for EV metadata in output (not used in objective)
-        shapley = shapley_marginal_ev(game_cands, BREAKEVEN_R)
-        for c in game_cands:
-            c.ev_marginal = shapley.get(c.prop_id, 0.0)
-        shapley_all.update(shapley)
+        eligible = len(kills) == 0
 
-        selected = solve_game_milp(game_cands, win_score_map, r_star_6)
-        if not selected:
-            log.info("Game %s: no qualifying slip (MILP infeasible or board too weak)", game_id)
+        legs.append(ScoredLeg(
+            prop_id      = prop_id,
+            player_id    = player_id,
+            player_name  = player_name,
+            stat_type    = stat_type,
+            game_id      = game_id,
+            side         = side,
+            line         = L,
+            p_model      = pm,
+            p_sharp      = ps,
+            p_true       = pt,
+            p_be_5flex   = p_be_5f,
+            count        = count(pt, p_be_5f),
+            sharp_gap    = gap,
+            fragility    = frag,
+            trap_flags   = traps,
+            eligible     = eligible,
+            kill_reasons = kills,
+            is_demon     = is_demon,
+            is_goblin    = is_goblin,
+            sport        = sport,
+            team         = team,
+        ))
+
+    return legs
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Path A — LOCKED scan (Section 7, v1 stub)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def lock_scan(scored_legs: List[ScoredLeg], cfg: Dict) -> Optional[Dict]:
+    """
+    v1 stub — no multi-book odds feed yet.
+    Always returns None; Path B runs full System.
+    Wire real arb/middle logic when book odds feed is available.
+    """
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Path B — Package builder (Section 8)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _dedup_pool(eligible: List[ScoredLeg]) -> List[ScoredLeg]:
+    """One prop_id → best side by p_true. One player_id → best prop by count."""
+    # Step 1: best side per prop
+    best_by_prop: Dict[str, ScoredLeg] = {}
+    for leg in eligible:
+        prev = best_by_prop.get(leg.prop_id)
+        if prev is None or leg.p_true > prev.p_true:
+            best_by_prop[leg.prop_id] = leg
+
+    # Step 2: best prop per player
+    best_by_player: Dict[str, ScoredLeg] = {}
+    for leg in best_by_prop.values():
+        prev = best_by_player.get(leg.player_id)
+        if prev is None or leg.count > prev.count:
+            best_by_player[leg.player_id] = leg
+
+    return list(best_by_player.values())
+
+
+def _select_combos(pool: List[ScoredLeg], n: int, max_same_game: int):
+    """
+    v1: take top combo_head by count, enumerate C(head, n), filter same-game cap.
+    Yields lists of ScoredLeg.
+    """
+    head = pool[:12]
+    for combo in combinations(head, n):
+        game_counts = Counter(leg.game_id for leg in combo)
+        if max(game_counts.values(), default=0) > max_same_game:
+            continue
+        yield list(combo)
+
+
+def build_packages(eligible: List[ScoredLeg], cfg: Dict) -> Dict:
+    """Path B — find best flex package that clears avg_p >= p_be and EV > min_ev."""
+    pool = sorted(_dedup_pool(eligible), key=lambda x: x.count, reverse=True)
+    p_be_map      = cfg.get('p_be', DEFAULT_CFG['p_be'])
+    min_ev        = cfg.get('min_package_ev', 0.02)
+    max_same_game = cfg.get('max_same_game_legs', 2)
+    preferred     = cfg.get('preferred_slips', ['5_flex', '6_flex'])
+
+    best_decision: Optional[Dict] = None
+
+    for slip in preferred:
+        n      = int(slip.split('_')[0])
+        p_be   = p_be_map.get(slip, 0.543)
+        payouts = PAYOUTS.get(slip, {})
+
+        if len(pool) < n:
             continue
 
-        # ── Separate pools — source of truth from MILP ────────────────────────
-        non_demons = [lg for lg in selected if lg.tier != Tier.DEMON]
-        demons     = [lg for lg in selected if lg.tier == Tier.DEMON]
-
-        # Post-solve validation assertions (mirrors MILP internal assertions)
-        if len(non_demons) != 6:
-            log.error(
-                "ASSERTION_FAIL: non_demons.length == %d, expected 6 — game=%s",
-                len(non_demons), game_id,
-            )
-        unique_nd_players = len({lg.player_id for lg in non_demons})
-        if unique_nd_players != 6:
-            log.error(
-                "ASSERTION_FAIL: unique(non_demons.player_id).length == %d, expected 6 — game=%s",
-                unique_nd_players, game_id,
-            )
-        if demons and not (1 <= len(demons) <= 2):
-            log.error(
-                "ASSERTION_FAIL: demons.length == %d, expected 1–2 — game=%s",
-                len(demons), game_id,
-            )
-        # Cross-pool uniqueness is NOT checked — demon player duplication is allowed.
-
-        port_ev = sum(win_score_map.get(lg.prop_id, 0.0) for lg in selected)
-        slip_hit_prob = 1.0
-        for lg in non_demons:   # hit prob based on non-demon legs only
-            slip_hit_prob *= lg.p_win
-
-        def leg_to_dict(lg: LegCandidate) -> Dict:
-            d = {
-                "prop_id":     lg.prop_id,
-                "player_name": lg.player_name,
-                "stat_type":   lg.stat_type,
-                "tier":        lg.tier.value,
-                "line":        lg.line,
-                "direction":   lg.direction.value,
-                "p_win":       round(lg.p_win, 4),
-                "ev_marginal": round(lg.ev_marginal, 6),
-                "ev_corr_adj": round(lg.ev_corr_adj, 6),
-                "edge_reasons": lg.edge_reasons,  # why GOTit picked this side
+        for combo in _select_combos(pool, n, max_same_game):
+            probs = [c.p_true for c in combo]
+            avg_p = sum(probs) / n
+            if avg_p < p_be:
+                continue
+            ev = flex_ev(probs, payouts)
+            if ev < min_ev:
+                continue
+            cand = {
+                'path':       'SYSTEM_FIRE',
+                'slip_type':  slip,
+                'legs':       combo,
+                'avg_p':      avg_p,
+                'p_be':       p_be,
+                'package_ev': ev,
             }
-            # For demons, attach the 5-layer qualification score
-            if lg.tier == Tier.DEMON:
-                sc_d = sharp_consensus.get(lg.prop_id)
-                if sc_d:
-                    dnp_p = dnp_model.get(lg.player_id, dnp_model.get(lg.prop_id, 0.0))
-                    ds = score_demon(lg, sc_d, dnp_p, game_total=0.0)
-                    d["demon_score"] = {
-                        "composite":       ds.composite,
-                        "market_anchor":   ds.market_anchor,
-                        "dist_hit_rate":   ds.dist_hit_rate,
-                        "game_script_fit": ds.game_script_fit,
-                        "role_certainty":  ds.role_certainty,
-                        "pair_diversity":  ds.pair_diversity,
-                    }
-            # For UNDER standard legs, attach the 5-layer under score
-            if lg.direction == Direction.UNDER and lg.under_score is not None:
-                us = lg.under_score
-                d["under_score"] = {
-                    "composite":                  us.composite,
-                    "market_anchor":              us.u1_market_anchor,
-                    "dist_hit_rate":              us.u2_dist_hit_rate,
-                    "volume_weakness":            us.u3_volume_weakness,
-                    "game_script_suppression":    us.u4_game_script_suppression,
-                    "pair_diversity":             us.u5_pair_diversity,
-                }
-            return d
+            if best_decision is None or cand['package_ev'] > best_decision['package_ev']:
+                best_decision = cand
 
-        # ── Output integrity: enforce separation before emit ─────────────────
-        # Defense 1: six_legs must contain ZERO demons.
-        # Defense 2: two_demons must contain ZERO non-demons.
-        # These fire as hard assertions — if either fails, the game is dropped.
-        six_legs_out  = [lg for lg in non_demons if lg.tier != Tier.DEMON]
-        two_demons_out = [lg for lg in demons    if lg.tier == Tier.DEMON]
+    if best_decision:
+        return best_decision
 
-        if len(six_legs_out) != len(non_demons):
-            log.error(
-                "EMIT_ASSERT: demon leaked into six_legs — game=%s dropped "
-                "(%d non_demons → %d after filter)",
-                game_id, len(non_demons), len(six_legs_out),
-            )
-            continue  # drop game — never emit a poisoned card
+    # Report best avg_p seen for diagnostics
+    best_avg = 0.0
+    if pool:
+        for slip in preferred:
+            n = int(slip.split('_')[0])
+            if len(pool) >= n:
+                top = pool[:n]
+                avg = sum(l.p_true for l in top) / n
+                best_avg = max(best_avg, avg)
 
-        if len(two_demons_out) != len(demons):
-            log.error(
-                "EMIT_ASSERT: non-demon leaked into two_demons — game=%s "
-                "(%d demons → %d after filter)",
-                game_id, len(demons), len(two_demons_out),
-            )
-            continue
-
-        if len(six_legs_out) != 6:
-            log.error(
-                "EMIT_ASSERT: six_legs.length == %d, expected 6 — game=%s dropped",
-                len(six_legs_out), game_id,
-            )
-            continue
-
-        unique_emit_players = len({lg.player_id for lg in six_legs_out})
-        if unique_emit_players != 6:
-            log.error(
-                "EMIT_ASSERT: unique players in six_legs == %d, expected 6 — game=%s dropped",
-                unique_emit_players, game_id,
-            )
-            continue
-
-        output[game_id] = {
-            "six_legs":   [leg_to_dict(lg) for lg in six_legs_out],
-            "two_demons": [leg_to_dict(lg) for lg in two_demons_out],
-            "meta": {
-                "slate_breakeven_r6":    round(r_star_6, 4),
-                "portfolio_win_score":    round(port_ev / 6, 6),
-                "slip_hit_prob":         round(slip_hit_prob, 6),
-                "calibration_version":   calibration.version,
-                "calibration_hash":      calibration.sha256[:16],
-            },
-        }
-
-    log.info("Leg selector: %d games with feasible solutions out of %d games",
-             len(output), len(set(c.game_id for c in all_candidates)))
-    return output
+    return {
+        'path':        'NO_GO',
+        'reason':      'no_package_clears_gate',
+        'best_avg_p':  round(best_avg, 4),
+    }
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 12. RUNTIME GUARDS
-# ──────────────────────────────────────────────────────────────────────────────
-def validate_output(output: Dict, sharp_freshness_sec: int) -> bool:
-    if not output:
-        return False
-    for g, data in output.items():
-        if len(data["six_legs"]) != 6:
-            return False
-        if len(data["two_demons"]) != 2:
-            return False
-        if data["meta"]["portfolio_ev_per_$1"] < 0.01:   # relaxed from 0.08 until calibration is trained
-            return False
-    if sharp_freshness_sec > 300:   # relaxed from 90 until Pinnacle integration is live
-        return False
-    return True
+# ─────────────────────────────────────────────────────────────────────────────
+# Master entrypoint (Section 9)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_the_system(
+    board:   List[Dict],
+    models:  Dict[Tuple[str, str], Dict],   # (player_id, stat_type) → {mu, sigma}
+    sharps:  Dict[str, List[Dict]],          # player_id → [SharpQuote]
+    context: Dict[str, Dict],               # player_id → ContextFlags
+    cfg:     Optional[Dict] = None,
+) -> Dict:
+    """
+    Run The System over a slate board.
+
+    Returns a SystemDecision dict:
+      { path: "LOCKED" | "SYSTEM_FIRE" | "NO_GO", ... }
+    """
+    cfg = {**DEFAULT_CFG, **(cfg or {})}
+
+    scored: List[ScoredLeg] = []
+    for row in board:
+        player_id = str(row.get('playerId') or row.get('player_id') or row.get('playerName') or '')
+        stat_type = str(row.get('statType') or row.get('stat_type') or '')
+        m   = models.get((player_id, stat_type))
+        sh  = sharps.get(player_id, [])
+        ctx = context.get(player_id, {})
+        scored.extend(score_prop(row, m, sh, ctx, cfg))
+
+    # Validate sides
+    for leg in scored:
+        assert leg.side in ('more', 'less'), f'invalid side {leg.side}'
+
+    # Path A
+    locked = lock_scan(scored, cfg)
+    if locked:
+        assert locked.get('path') == 'LOCKED'
+        return locked
+
+    eligible = [s for s in scored if s.eligible]
+    if len(eligible) < 2:
+        return {'path': 'NO_GO', 'reason': 'insufficient_eligible_legs', 'best_avg_p': 0.0}
+
+    # Path B
+    decision = build_packages(eligible, cfg)
+
+    # Validate
+    assert decision.get('path') in ('LOCKED', 'SYSTEM_FIRE', 'NO_GO'), \
+        f"bad decision path: {decision.get('path')}"
+    if decision.get('path') == 'SYSTEM_FIRE':
+        assert decision['avg_p'] >= decision['p_be'], \
+            f"avg_p {decision['avg_p']} < p_be {decision['p_be']}"
+        assert decision['package_ev'] >= cfg['min_package_ev'], \
+            f"ev {decision['package_ev']} < min {cfg['min_package_ev']}"
+
+    return decision
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Format output for API / frontend (Section 10)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _leg_to_dict(leg: ScoredLeg) -> Dict:
+    return {
+        'prop_id':     leg.prop_id,
+        'player':      leg.player_name,
+        'player_id':   leg.player_id,
+        'stat':        leg.stat_type,
+        'side':        leg.side,
+        'line':        leg.line,
+        'p_true':      round(leg.p_true, 4),
+        'p_model':     round(leg.p_model, 4),
+        'p_sharp':     round(leg.p_sharp, 4),
+        'count':       round(leg.count, 4),
+        'sharp_gap':   round(leg.sharp_gap, 3),
+        'fragility':   round(leg.fragility, 3),
+        'traps':       leg.trap_flags,
+        'kill_reasons': leg.kill_reasons,
+        'eligible':    leg.eligible,
+        'game_id':     leg.game_id,
+        'is_demon':    leg.is_demon,
+        'is_goblin':   leg.is_goblin,
+    }
+
+
+def format_system_output(decision: Dict, slate_id: str = '') -> Dict:
+    """
+    Convert internal SystemDecision to the API response shape (Section 10).
+    """
+    path = decision.get('path', 'NO_GO')
+    out: Dict[str, Any] = {
+        'system_version': '1.0',
+        'slate_id':       slate_id,
+        'decision':       path,
+        'path':           path,
+        'no_go_reason':   None,
+        'lock':           None,
+    }
+
+    if path == 'SYSTEM_FIRE':
+        legs = decision.get('legs', [])
+        out.update({
+            'slip_type':   decision.get('slip_type', '5_flex'),
+            'avg_p':       round(decision.get('avg_p', 0.0), 4),
+            'p_be':        round(decision.get('p_be', 0.543), 4),
+            'package_ev':  round(decision.get('package_ev', 0.0), 4),
+            'unit_stake_pct': DEFAULT_CFG['unit_pct_bankroll'],
+            'legs':        [_leg_to_dict(l) for l in legs],
+            'rejected_top': [],
+        })
+    elif path == 'LOCKED':
+        out.update({
+            'guaranteed_roi': decision.get('guaranteed_roi', 0.0),
+            'stakes':         decision.get('stakes', {}),
+            'hedges':         decision.get('hedges', []),
+            'legs':           [_leg_to_dict(l) for l in decision.get('legs', [])],
+        })
+    else:  # NO_GO
+        out['no_go_reason'] = decision.get('reason', 'unknown')
+        out['best_avg_p']   = decision.get('best_avg_p', 0.0)
+        out['legs']         = []
+
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI entry point (called from optimize.py via subprocess / direct import)
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO, stream=sys.stderr)
+    try:
+        payload  = json.loads(sys.stdin.read())
+        board    = payload.get('props', [])
+        slate_id = payload.get('slate_id', '')
+        cfg      = payload.get('cfg', {})
+
+        # No model/sharp/context feed in v1 — pass empty dicts, system estimates from line
+        decision = run_the_system(board, {}, {}, {}, cfg)
+        output   = format_system_output(decision, slate_id)
+        print(json.dumps(output))
+    except Exception as exc:
+        log.exception('leg_selector fatal error')
+        print(json.dumps({'path': 'NO_GO', 'decision': 'NO_GO',
+                          'no_go_reason': str(exc), 'legs': []}))
+        sys.exit(1)
