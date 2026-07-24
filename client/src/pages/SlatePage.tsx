@@ -768,29 +768,64 @@ function GameCard({ game, optResult, selectedIds, onToggle, atMax, onSave, isSav
               ⚠ DIRECT PATH (fallback_render_used) — MILP bypassed
             </div>
           )}
-          {/* Demon section — exactly top 2 GOTit-qualified demons from qualify_demons.py */}
-          {gameSelection.demons.length === 0 ? (
-            <div style={{ fontSize: '0.65rem', color: 'hsl(0 60% 55%)', fontWeight: 600, padding: '10px 0 6px', letterSpacing: '0.04em' }}>
-              ⚠ PIPELINE RETURNED 0 DEMONS — all candidates failed gating for this game
-            </div>
-          ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginTop: 10, marginBottom: 8 }}>
-              {gameSelection.demons.map((d: any, i: number) => (
-                <DemonCard key={d.id} prop={d} rank={i + 1} />
-              ))}
-            </div>
-          )}
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 5, marginTop: 4 }}>
-            {gameSelection.demons.map((d: any) => (
-              <PropRow
-                key={`sel-${d.id}`}
-                prop={d}
-                isSelected={selectedIds.has(d.id)}
-                onToggle={() => onToggle(d)}
-                disabled={atMax && !selectedIds.has(d.id)}
-              />
-            ))}
-          </div>
+          {/* Demon section — Demontime picks shown as cards, all demon props individually selectable */}
+          {(() => {
+            // All raw demon props for this game — for individual selection
+            const allDemonProps = [...(game.standards ?? []), ...(game.goblins ?? []), ...(game.demons ?? [])]
+              .filter((p: any) => p.isDemon)
+              .reduce((acc: any[], p: any) => {
+                if (!acc.find((x: any) => x.id === p.id)) acc.push(p);
+                return acc;
+              }, []);
+
+            // Demontime-selected pair IDs for highlighting
+            const demontimeIds = new Set(gameSelection.demons.map((d: any) => d.id));
+
+            return (
+              <>
+                {gameSelection.demons.length === 0 && allDemonProps.length === 0 ? (
+                  <div style={{ fontSize: '0.65rem', color: 'hsl(0 60% 55%)', fontWeight: 600, padding: '10px 0 6px', letterSpacing: '0.04em' }}>
+                    ⚠ NO DEMON PROPS FOR THIS GAME
+                  </div>
+                ) : (
+                  <>
+                    {/* Demontime-picked pair — shown as cards */}
+                    {gameSelection.demons.length > 0 && (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginTop: 10, marginBottom: 4 }}>
+                        {gameSelection.demons.map((d: any, i: number) => (
+                          <DemonCard key={d.id} prop={d} rank={i + 1} />
+                        ))}
+                      </div>
+                    )}
+
+                    {/* All demon props as individually selectable rows */}
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 5, marginTop: 6 }}>
+                      {(allDemonProps.length > 0 ? allDemonProps : gameSelection.demons).map((d: any) => (
+                        <div key={`sel-${d.id}`} style={{ position: 'relative' }}>
+                          {demontimeIds.has(d.id) && (
+                            <span style={{
+                              position: 'absolute', top: '50%', right: 8, transform: 'translateY(-50%)',
+                              fontSize: '0.5rem', fontWeight: 800, letterSpacing: '0.08em',
+                              color: 'hsl(0 72% 60%)', textTransform: 'uppercase', zIndex: 1,
+                              pointerEvents: 'none',
+                            }}>
+                              DEMONTIME
+                            </span>
+                          )}
+                          <PropRow
+                            prop={d}
+                            isSelected={selectedIds.has(d.id)}
+                            onToggle={() => onToggle(d)}
+                            disabled={atMax && !selectedIds.has(d.id)}
+                          />
+                        </div>
+                      ))}
+                    </div>
+                  </>
+                )}
+              </>
+            );
+          })()}
         </div>
       )}
     </div>
