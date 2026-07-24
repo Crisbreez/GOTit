@@ -235,9 +235,33 @@ export async function pullPrizePicks(league: string): Promise<RawCanonicalProp[]
     includedMap.set(`${item.type}:${item.id}`, item);
   }
 
+  // MLB minor-league team abbrs that show up in PP MLB feed — filter them out
+  const MLB_MINOR_TEAM_NAMES = new Set([
+    'Tulo Toros', 'Toros', 'Drive', 'Crawdads', 'Mudcats', 'RubberDucks',
+    'Biscuits', 'Barons', 'Shuckers', 'BayBears', 'Lookouts', 'Travs',
+    'Tourists', 'Woodpeckers', 'Pelicans', 'Jumbo Shrimp', 'Tides',
+    'IronPigs', 'Chiefs', 'RailRiders', 'Knights', 'Clippers', 'Express',
+    'Sounds', 'Bisons', 'Wings', 'Mud Hens', 'Redbirds', 'Storm Chasers',
+    'Rainiers', 'Tacoma', 'Las Vegas', 'Salt Lake', 'Reno', 'Albuquerque',
+    'El Paso', 'Fresno', 'Memphis', 'Nashville',
+  ]);
+
   const results: RawCanonicalProp[] = [];
   for (const proj of data) {
     if (proj.type !== 'projection') continue;
+
+    // Filter out minor league props — check team display name from included
+    if (league === 'MLB') {
+      const rels = proj.relationships ?? {};
+      const teamId = rels.new_player?.data?.id;
+      const playerData = includedMap.get(`new_player:${teamId}`) ?? {};
+      const teamDisplay: string = playerData.attributes?.team ?? '';
+      if (teamDisplay && MLB_MINOR_TEAM_NAMES.has(teamDisplay)) continue;
+      // Also filter by game_id prefix — minor league game IDs often contain 'milb' or 'aaa'
+      const gameId: string = proj.attributes?.game_id ?? '';
+      if (gameId && (gameId.toLowerCase().includes('milb') || gameId.toLowerCase().includes('aaa'))) continue;
+    }
+
     const row = normalizeToCanonical(proj, includedMap, league);
     if (row) results.push(row);
   }

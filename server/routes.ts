@@ -307,7 +307,19 @@ export function registerRoutes(httpServer: Server, app: Express) {
     }
 
     // Run demon pipeline for each game in parallel — exact route pattern
-    const rawGames = Array.from(gameMap.values()).filter(g => !!g.gameId);
+    // Drop minor league games that leaked through PP MLB feed
+    const MINOR_TEAM_NAMES = [
+      'Tulo Toros', 'Toros', 'Drive', 'Crawdads', 'Mudcats', 'RubberDucks',
+      'Biscuits', 'Barons', 'Shuckers', 'Lookouts', 'Travs', 'Tourists',
+      'Woodpeckers', 'Pelicans', 'Jumbo Shrimp', 'Tides', 'IronPigs',
+      'RailRiders', 'Knights', 'Clippers', 'Express', 'Sounds', 'Bisons',
+      'Wings', 'Mud Hens', 'Redbirds', 'Storm Chasers', 'Rainiers',
+    ];
+    const isMinorLeagueGame = (g: any) => {
+      const matchup = (g.matchup || '').toLowerCase();
+      return MINOR_TEAM_NAMES.some(t => matchup.includes(t.toLowerCase()));
+    };
+    const rawGames = Array.from(gameMap.values()).filter(g => !!g.gameId && !isMinorLeagueGame(g));
     const demonResults = await Promise.all(
       rawGames.map(g => runDemonPipeline(g.props))
     );
