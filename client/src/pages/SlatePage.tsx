@@ -537,7 +537,13 @@ function GameCard({ game, optResult, selectedIds, onToggle, atMax, onSave, isSav
 
   // Show skeleton while optimizer is loading
   if (!gameSelection.ready) {
-    return null; // parent shows skeleton for all cards until ready
+    return (
+      <div className="game-card animate-in" style={{ opacity: 0.5 }}>
+        <div style={{ padding: '16px', fontSize: '13px', color: '#888', textAlign: 'center' }}>
+          Loading picks...
+        </div>
+      </div>
+    );
   }
 
   // Validate selection before rendering — no raw fallback
