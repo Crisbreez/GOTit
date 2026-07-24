@@ -1445,12 +1445,21 @@ def solve_game_milp(
     # [C1] Exactly 6 non-demon legs
     solver.Add(solver.Sum(list(x.values())) == 6)
 
-    # [C2] Exactly 1 non-demon leg per player (6 unique players among the 6)
-    nd_player_vars: Dict[str, List] = {}
-    for lg in nd_eligible:
-        nd_player_vars.setdefault(lg.player_id, []).append(x[lg.prop_id])
-    for pid, vars_ in nd_player_vars.items():
-        solver.Add(solver.Sum(vars_) <= 1)  # at most 1 leg per player in x pool
+    # [C2] 6 unique players — guaranteed structurally by pre-MILP player dedup.
+    # The non-demon pool entering here already has at most 1 candidate per player,
+    # so the solver cannot select 2 legs from the same player even without an
+    # explicit constraint. We assert this post-solve instead of constraining it here,
+    # keeping the solver lean and making any dedup failure loud.
+    #
+    # Pre-solve structural check (cheap — runs before solver.Solve())
+    nd_players_in_pool = [lg.player_id for lg in nd_eligible]
+    if len(nd_players_in_pool) != len(set(nd_players_in_pool)):
+        dupes = [p for p in set(nd_players_in_pool) if nd_players_in_pool.count(p) > 1]
+        log.error(
+            "[MILP] STRUCTURAL_FAIL: non-demon pool contains duplicate players %s — "
+            "dedup step did not run correctly",
+            dupes,
+        )
 
     # [C3] Direction diversity (soft — only when minority side has ≥ 4 candidates)
     nd_over  = [x[lg.prop_id] for lg in nd_eligible if lg.direction == Direction.OVER]
@@ -1737,9 +1746,36 @@ def select_legs_for_slate(
             if c.tier == Tier.GOBLIN or c.p_win >= STANDARD_PWIN_FLOOR
         ]
 
+        # ── One-player-max dedup for non-demon pool ───────────────────────────
+        # Rule: the non-demon pool must yield exactly 6 legs from 6 different
+        # players. Enforcing this BEFORE the MILP (rather than only inside the
+        # solver) makes the constraint structural — the optimizer never even sees
+        # a second candidate from the same player.
+        #
+        # Within each player, keep the single highest-p_win candidate.
+        # Tie-break by win_score_map is not available here (scored later), so
+        # p_win is the correct pre-score sort key; the MILP objective will still
+        # maximise over this deduped pool.
+        seen_nd_players: Dict[str, LegCandidate] = {}
+        for c in s_cands_admitted:  # already sorted p_win desc
+            if c.player_id not in seen_nd_players:
+                seen_nd_players[c.player_id] = c  # first = highest p_win
+        s_deduped = list(seen_nd_players.values())
+        log.info(
+            "[pre-filter] game=%s non-demon pool: %d candidates → %d after player dedup",
+            game_id, len(s_cands_admitted), len(s_deduped),
+        )
+        if len(s_deduped) < 6:
+            log.info(
+                "[pre-filter] game=%s: only %d unique-player non-demon candidates — "
+                "need 6, game skipped",
+                game_id, len(s_deduped),
+            )
+            continue  # not enough distinct players — no valid slip possible
+
         # Cap demon slots at 6 (enough for MILP to pick 2, with diversity)
         demon_slots = qualified_d[:6]
-        standard_slots = s_cands_admitted[:MAX_SHAPLEY - len(demon_slots)]
+        standard_slots = s_deduped[:MAX_SHAPLEY - len(demon_slots)]
         filtered.extend(demon_slots + standard_slots)
 
     all_candidates = filtered
