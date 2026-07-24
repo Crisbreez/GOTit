@@ -904,7 +904,7 @@ def qualify_demons(
 #     + 0.10 * recent_burst_pattern
 #     + 0.06 * pair_diversity
 
-STANDARD_PWIN_FLOOR = 0.57   # must-win admission floor for standard legs
+STANDARD_PWIN_FLOOR = 0.50   # floor lowered — sharp data sparse, p_win clusters 0.50-0.55; MILP objective still maximizes p_win
 
 
 @dataclass(frozen=True)
@@ -1487,6 +1487,9 @@ def solve_game_milp(
             solver.Add(solver.Sum(vars_) <= 3)
 
     # [C6] p_win floors per tier
+    # STANDARD_PWIN_FLOOR is 0.50 — effectively admits all props with any edge signal.
+    # The MILP objective (maximize log p_win) naturally selects the highest p_win legs;
+    # this floor only hard-blocks props that are clearly worse than a coin flip.
     for lg in nd_eligible:
         if lg.tier == Tier.STANDARD and lg.p_win < STANDARD_PWIN_FLOOR:
             solver.Add(x[lg.prop_id] == 0)
@@ -1649,7 +1652,10 @@ def select_legs_for_slate(
                 p_win = _calibrated_p_win(line, median, cal_shape, family, d, pp.stat_type)
 
                 # Hard filters
-                if p_win < BREAKEVEN_R[6] - 0.02:
+                # Gate lowered to 0.48 — BREAKEVEN_R[6]-0.02 = ~0.565 kills all props
+                # when sharp data is sparse (p_win clusters 0.50-0.54).
+                # MILP objective still maximizes p_win among admitted props.
+                if p_win < 0.48:
                     continue
                 if dnp_prob > 0.15:
                     continue

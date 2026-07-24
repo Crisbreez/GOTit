@@ -829,9 +829,12 @@ def run_demon_pipeline(
     if len(final_selected) == 0 and candidates:
         # Sort by estimated p_win descending — best raw demon wins
         last_resort = sorted(candidates, key=lambda r: r.proj_hit_prob, reverse=True)
-        # Prefer non-hard-excluded (bucket not None) first
-        ordered = [r for r in last_resort if r.bucket is not None] +                   [r for r in last_resort if r.bucket is None]
-        if ordered:
+        # Never force HARD_EXCLUDED stats even in last resort
+        ordered = [r for r in last_resort
+                   if r.stat_type not in HARD_EXCLUDED and r.bucket is not None]
+        if not ordered:
+            log.warning('[demon_pipeline] LAST_RESORT: no non-excluded candidates — 0 demons')
+        else:
             forced = ordered[0]
             forced.tier_used = 'last_resort'
             final_selected = [forced]
@@ -1055,8 +1058,12 @@ def run_demon_pipeline_full(
     # ── Last-resort: guarantee minimum 1 demon ───────────────────────────────
     if len(selected) == 0 and candidates:
         last_resort = sorted(candidates, key=lambda r: r.proj_hit_prob, reverse=True)
-        ordered = [r for r in last_resort if r.bucket is not None] +                   [r for r in last_resort if r.bucket is None]
-        if ordered:
+        # Never force HARD_EXCLUDED stats even in last resort
+        ordered = [r for r in last_resort
+                   if r.stat_type not in HARD_EXCLUDED and r.bucket is not None]
+        if not ordered:
+            log.warning('[demon_pipeline] LAST_RESORT: no non-excluded candidates — 0 demons')
+        else:
             forced = ordered[0]
             forced.tier_used = 'last_resort'
             selected = [forced]
