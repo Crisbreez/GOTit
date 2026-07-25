@@ -278,8 +278,9 @@ export function registerRoutes(httpServer: Server, app: Express) {
     });
   });
 
-  app.get('/api/slate', async (req, res) => {
-    const league = (req.query.league as string || 'MLB').toUpperCase();
+  // Support both /api/slate/MLB and /api/slate?league=MLB
+  app.get(['/api/slate', '/api/slate/:league'], async (req, res) => {
+    const league = ((req.params as any).league || req.query.league as string || 'MLB').toUpperCase();
     const rawProps = await storage.getProps(league);
 
     if (rawProps.length === 0) {
