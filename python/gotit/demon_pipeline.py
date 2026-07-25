@@ -208,8 +208,8 @@ def _solo_hit_prob_more(raw: Dict[str, Any]) -> Tuple[float, str]:
                 p_raw = 0.50
         return max(0.01, min(0.99, p_raw)), 'REAL'
 
-    # No real signal — ineligible
-    return None, 'BLIND'
+    # No real signal — BLIND, still eligible for forced top-2
+    return 0.50 * UNCERTAINTY_HAIRCUT_BLIND, 'BLIND'
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -221,19 +221,6 @@ def _score(raw: Dict[str, Any]) -> Dict[str, Any]:
     line      = float(raw.get('lineScore', raw.get('line', 0)) or 0)
 
     p_raw, quality = _solo_hit_prob_more(raw)
-
-    # No signal → ineligible, never enters sort
-    if p_raw is None:
-        return {
-            **raw,
-            'p_raw': None, 'p_adj': None, 'p_hit': 0.0, 'propScore': 0.0,
-            'confidenceLevel': 0, 'data_quality': 'BLIND', 'fragility': 1.0,
-            'below_confidence_floor': True, 'flags': ['insufficient_projection_data'],
-            'direction': 'over', 'isDemon': True,
-            'eligible': False,
-            'ineligible_reason': 'insufficient_projection_data',
-            'blank_history': False, 'blank_reason': '',
-        }
 
     zero_string, crush, blank_reason = _blank_history_flags(raw)
     league = str(raw.get('league', raw.get('sport', '')) or '').upper()
@@ -348,16 +335,21 @@ def run_demon_pipeline(props: List[Dict[str, Any]], game_id: str) -> Dict[str, A
     # Score ALL demons
     all_scored = [_score(d) for d in demons]
 
-    # Only eligible props enter the sort — no signal = ineligible
-    eligible   = [d for d in all_scored if d.get('eligible', False) and d.get('p_adj') is not None]
+    # Eligible = passed MLB allowlist + not hard-blocked
+    eligible   = [d for d in all_scored if d.get('eligible', False)]
     ineligible = [d for d in all_scored if not d.get('eligible', False)]
 
-    # Sort eligible: p_adj DESC, then p_raw DESC, then lower fragility
-    eligible.sort(key=lambda x: (-x['p_adj'], -(x['p_raw'] or 0), x['fragility']))
+    # Sort: REAL before BLIND, then p_adj DESC, then p_raw DESC, then lower fragility
+    eligible.sort(key=lambda x: (
+        0 if x.get('data_quality') == 'REAL' else 1,
+        -(x.get('p_adj') or 0),
+        -(x.get('p_raw') or 0),
+        x.get('fragility', 1.0)
+    ))
 
-    # Top-2 from eligible only
+    # Forced top-2 from eligible pool
     picks  = eligible[:2]
-    others = eligible[2:] + ineligible  # ineligible listed but not pickable
+    others = eligible[2:] + ineligible
 
     # Annotate picks with rank
     for i, p in enumerate(picks):
