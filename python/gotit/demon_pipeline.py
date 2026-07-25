@@ -28,19 +28,7 @@ log = logging.getLogger(__name__)
 
 TAU = 0.50   # per-demon P_hit floor (relaxed to 0.45 if < 2 survive strict)
 
-# Stat allowlist: only these stats are eligible as demons when no sharp/history data
-DEMON_STAT_ALLOWLIST = {
-    # MLB
-    'Total Bases', 'Hits+Runs+RBIs', 'Pitcher Strikeouts', 'Pitches Thrown',
-    'Hitter Fantasy Score', 'Hits', 'Runs',
-    # MMA
-    'Significant Strikes', 'Round 1 Significant Strikes', 'R1 Significant Strikes',
-    'Takedowns', 'Fight Time (Mins)', 'Total Strikes',
-    # NBA/NFL
-    'Points', 'Rebounds', 'Assists', 'Passing Yards', 'Rushing Yards', 'Receiving Yards',
-}
-
-# Stats barred from Demontime entirely
+# Stats barred from Demontime entirely regardless of data quality
 DEMON_STAT_BLOCKLIST = {
     'Singles', 'Doubles', 'Triples', 'Home Runs', 'RBIs', 'Walks',
     'Stolen Bases', 'Hitter Strikeouts', 'Plate Appearances',
@@ -193,8 +181,8 @@ def _score(raw: Dict[str, Any]) -> Dict[str, Any]:
     if stat_type in DEMON_STAT_BLOCKLIST:
         return _ineligible(f'stat_blocklisted:{stat_type}')
 
-    # Gate 2: no sharp data AND stat not in allowlist
-    if not has_sharp and stat_type not in DEMON_STAT_ALLOWLIST:
+    # Gate 2: no real signal = ineligible, period
+    if not has_sharp:
         return _ineligible('insufficient_projection_data')
 
     # Gate 3: blank/zero history
