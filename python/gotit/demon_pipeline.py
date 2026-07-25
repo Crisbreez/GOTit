@@ -46,14 +46,28 @@ def _p_hit(mu: float, sigma: float, line: float) -> float:
 
 def _estimate_sigma(line: float, stat_type: str) -> float:
     ratios = {
+        # MLB
         'Total Bases': 0.38, 'Hits': 0.55, 'Hits+Runs+RBIs': 0.40,
         'Pitcher Strikeouts': 0.32, 'Pitches Thrown': 0.14,
         'Pitching Outs': 0.28, 'Hits Allowed': 0.42,
         'Earned Runs Allowed': 0.70, 'Walks Allowed': 0.75,
         'Significant Strikes': 0.22, 'Hitter Fantasy Score': 0.40,
+        # NBA/NFL
         'Points': 0.26, 'Rebounds': 0.40, 'Assists': 0.45,
-        'Points+Rebounds+Assists': 0.28, 'Takedowns': 0.55,
-        'Fight Time': 0.30, 'Rushing Attempts': 0.35,
+        'Points+Rebounds+Assists': 0.28, 'Rushing Attempts': 0.35,
+        'Receiving Yards': 0.40, 'Passing Yards': 0.22,
+        # MMA/UFC
+        'Takedowns': 0.55,
+        'Takedowns Landed': 0.55,
+        'Fight Time': 0.30,
+        'Fight Time (Mins)': 0.30,
+        'Significant Strikes': 0.22,
+        'Significant Strikes Landed': 0.22,
+        'Total Strikes': 0.25,
+        'Total Strikes Landed': 0.25,
+        'Knockdowns': 0.90,           # high variance — low line, big sigma
+        'Submission Attempts': 0.85,
+        'Ground Control Time': 0.40,
     }
     return max(0.5, line * ratios.get(stat_type, 0.40))
 
