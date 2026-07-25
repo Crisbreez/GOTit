@@ -270,10 +270,37 @@ def _detect_traps(row: Dict, side: str, ctx: Dict, cfg: Dict) -> List[str]:
 # Score one prop → two ScoredLegs (Section 5)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _has_real_signal(row: Dict, sharps: List[Dict], model: Optional[Dict]) -> bool:
+    """
+    True only when at least one real external signal exists.
+    mu = line * 1.05 or line * 1.03 are NOT real signals.
+    """
+    if model:
+        return True
+    if sharps:
+        return True
+    # Real data fields on the prop itself
+    mu_raw    = float(row.get('mu', 0) or 0)
+    sigma_raw = float(row.get('sigma', 0) or 0)
+    hit_rate  = row.get('hitRate') or row.get('hit_rate')
+    avg_stat  = row.get('avgStat') or row.get('avg_stat')
+    sharp_gap = abs(float(row.get('sharpGap', row.get('sharp_gap', 0)) or 0))
+    line_move = abs(float(row.get('lineMove', row.get('line_move', 0)) or 0))
+    return (
+        mu_raw > 0
+        or sigma_raw > 0
+        or hit_rate is not None
+        or avg_stat is not None
+        or sharp_gap > 0.01
+        or line_move > 0.01
+    )
+
+
 def _estimate_mu_sigma(row: Dict, sharps: List[Dict]) -> Tuple[float, float]:
     """
     Estimate mu/sigma when no model projection is available.
-    Use sharp line gap as signal; fall back to line * calibrated ratio.
+    ONLY use sharp lines as signal — never invent mu from line * constant.
+    If no real signal: return mu = L (50/50 baseline, no edge).
     """
     L = float(row.get('lineScore', row.get('line', 0)) or 0)
     stat_type = str(row.get('statType', row.get('stat_type', '')) or '')
@@ -293,11 +320,14 @@ def _estimate_mu_sigma(row: Dict, sharps: List[Dict]) -> Tuple[float, float]:
     }
     sigma = max(0.5, L * sigma_ratios.get(stat_type, 0.40))
 
-    # Sharp-informed mu
-    sharp_lines = [q.get('line', L) for q in sharps if q.get('line') is not None]
-    sharp_mu = sum(sharp_lines) / len(sharp_lines) if sharp_lines else L * 1.03
+    # Sharp-informed mu — ONLY real sharp lines, never L * constant
+    sharp_lines = [q.get('line', None) for q in sharps if q.get('line') is not None]
+    if sharp_lines:
+        sharp_mu = sum(sharp_lines) / len(sharp_lines)
+        return sharp_mu, sigma
 
-    return sharp_mu, sigma
+    # No real signal — return exact line (50/50 baseline, p_more = 0.50)
+    return L, sigma
 
 
 def score_prop(row: Dict, model: Optional[Dict], sharps: List[Dict],
@@ -317,6 +347,8 @@ def score_prop(row: Dict, model: Optional[Dict], sharps: List[Dict],
     sport     = str(row.get('sport') or '')
     team      = str(row.get('teamAbbr') or row.get('team') or '')
 
+    has_signal = _has_real_signal(row, sharps, model)
+
     if model:
         mu    = float(model.get('mu', L) or L)
         sigma = float(model.get('sigma', 1.0) or 1.0)
@@ -324,6 +356,10 @@ def score_prop(row: Dict, model: Optional[Dict], sharps: List[Dict],
             sigma = 1.0
     else:
         mu, sigma = _estimate_mu_sigma(row, sharps)
+
+    # No real signal: lock to 50/50 — do not invent edge
+    if not has_signal:
+        mu = L
 
     p_m_model = p_more(mu, sigma, L)
     p_l_model = p_less(mu, sigma, L)
@@ -364,6 +400,8 @@ def score_prop(row: Dict, model: Optional[Dict], sharps: List[Dict],
             kills.append('below_floor')
         if 'mma_sig_strikes_less_trap' in traps:
             kills.append('mma_sig_strikes_less_trap')
+        if not has_signal:
+            kills.append('no_real_signal')
 
         eligible = len(kills) == 0
 
