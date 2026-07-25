@@ -130,7 +130,7 @@ DEFAULT_CFG: Dict[str, Any] = {
     "require_role":      False,   # relax v1 — no role feed yet
     "min_package_ev":    0.02,
     "min_lock_roi":      0.005,
-    "max_same_game_legs": 2,
+    "max_same_game_legs": 6,  # per-game: all 6 legs can be from the same game
     "unit_pct_bankroll": 0.01,
     "lock_unit_pct":     0.02,
     "preferred_slips":   ["5_flex", "6_flex"],
