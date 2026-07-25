@@ -257,11 +257,25 @@ def _score(raw: Dict[str, Any]) -> Dict[str, Any]:
 
     is_trash_stat = (not is_mlb and stat_type in DEMON_STAT_BLOCKLIST) or mlb_blocked
 
+    # MLB allowlist blocked → hard ineligible, never enters sort
+    if mlb_blocked:
+        return {
+            **raw,
+            'p_raw': None, 'p_adj': None, 'p_hit': 0.0, 'propScore': 0.0,
+            'confidenceLevel': 0, 'data_quality': quality, 'fragility': 1.0,
+            'below_confidence_floor': True,
+            'flags': [f'mlb_stat_not_allowed:{stat_type}'],
+            'direction': 'over', 'isDemon': True,
+            'eligible': False,
+            'ineligible_reason': f'mlb_stat_not_allowed:{stat_type}',
+            'blank_history': False, 'blank_reason': '',
+        }
+
     p_adj = p_raw
 
     # Adjustments
     if is_trash_stat:
-        p_adj *= TRASH_STAT_PENALTY       # 0.70x — stays in pool, ranks last
+        p_adj *= TRASH_STAT_PENALTY       # 0.70x — stays in pool, ranks last (non-MLB only)
     if zero_string:
         p_adj *= ZERO_STRING_PENALTY      # 0.05x — effectively last resort
     elif crush:
