@@ -47,7 +47,30 @@ try:
 except ImportError:
     _HAS_REQUESTS = False
 
-from gotit.leg_selector import PPProp, SharpConsensus, Tier
+# PPProp, SharpConsensus, Tier — defined inline (leg_selector was rewritten)
+from dataclasses import dataclass, field as dc_field
+
+class Tier:
+    STANDARD = "standard"
+    GOBLIN   = "goblin"
+    DEMON    = "demon"
+
+@dataclass
+class PPProp:
+    prop_id:       str
+    player_name:   str
+    stat_type:     str
+    lines:         dict   # {tier: line_score}
+    tiers_offered: list
+
+@dataclass
+class SharpConsensus:
+    prop_id:       str
+    median:        float
+    shape_params:  dict
+    timestamp:     str
+    books_used:    list
+    freshness_sec: float = 9999.0
 
 log = logging.getLogger("gotit.sharp_consensus")
 
@@ -56,6 +79,45 @@ log = logging.getLogger("gotit.sharp_consensus")
 # ─────────────────────────────────────────────────────────────────────────────
 SGO_BASE = "https://api.sportsgameodds.com/v2"
 SGO_KEY  = "cdcc1cf23a44326b7e4d190616787462"
+
+# MoneyLine API — sharp consensus source (DraftKings + FanDuel)
+ML_BASE = "https://mlapi.bet/v1"
+ML_KEY  = "ml_live_86fb5b9700f67e4b3789a9af1692496f"
+ML_SHARP_BOOKS = {"draftkings", "fanduel"}   # sharpest available in ML feed
+
+# MoneyLine market key → PP stat type
+ML_TO_PP: Dict[str, str] = {
+    "batter_hits":          "Hits",
+    "batter_home_runs":     "Home Runs",
+    "batter_rbis":          "RBIs",
+    "batter_total_bases":   "Total Bases",
+    "batter_stolen_bases":  "Stolen Bases",
+    "batter_walks":         "Walks",
+    "batter_runs_scored":   "Runs",
+    "batter_doubles":       "Doubles",
+    "batter_triples":       "Triples",
+    "batter_strikeouts":    "Hitter Strikeouts",
+    "pitcher_strikeouts":   "Pitcher Strikeouts",
+    "pitcher_earned_runs":  "Earned Runs Allowed",
+    "pitcher_outs":         "Pitching Outs",
+    "pitcher_walks":        "Walks Allowed",
+    "pitcher_hits_allowed": "Hits Allowed",
+    "player_points":        "Points",
+    "player_rebounds":      "Rebounds",
+    "player_assists":       "Assists",
+    "player_threes":        "3-Pointers Made",
+    "player_blocks":        "Blocks",
+    "player_steals":        "Steals",
+    "player_pass_yds":      "Passing Yards",
+    "player_rush_yds":      "Rushing Yards",
+    "player_rec_yds":       "Receiving Yards",
+    "player_receptions":    "Receptions",
+    "player_pass_tds":      "Passing TDs",
+    "player_rush_tds":      "Rushing TDs",
+}
+ML_LEAGUE: Dict[str, str] = {
+    "MLB": "mlb", "NBA": "nba", "NFL": "nfl", "MMA": "mma",
+}
 
 # Freshness: consider sharp data stale after 30 minutes
 FRESH_SEC     = 1800
@@ -211,9 +273,9 @@ def _fallback_sc(prop_id: str, line: float, tier: Tier, stat_type: str) -> Sharp
 # ─────────────────────────────────────────────────────────────────────────────
 # HTTP helper (sync, works without async framework)
 # ─────────────────────────────────────────────────────────────────────────────
-def _get_json(url: str, params: dict) -> Optional[dict]:
+def _get_json(url: str, params: dict, headers: Optional[dict] = None) -> Optional[dict]:
     """Simple sync HTTP GET → JSON. Uses requests or httpx."""
-    headers = {"User-Agent": "GOTit/2.0"}
+    headers = {"User-Agent": "GOTit/2.0", **(headers or {})}
     if _HAS_REQUESTS:
         try:
             r = _requests.get(url, params=params, headers=headers, timeout=15)
@@ -239,6 +301,96 @@ def _get_json(url: str, params: dict) -> Optional[dict]:
 # ─────────────────────────────────────────────────────────────────────────────
 # SGO fetch: all player props for a league
 # ─────────────────────────────────────────────────────────────────────────────
+def _fetch_ml_props(league: str) -> List[dict]:
+    """
+    Fetch player prop odds from MoneyLine API.
+    Uses DraftKings + FanDuel implied probabilities to compute a sharp fair line.
+    Returns same shape as _fetch_sgo_props for drop-in compatibility.
+    """
+    ml_league = ML_LEAGUE.get(league.upper())
+    if not ml_league:
+        log.warning(f"[sharp-ml] unsupported league: {league}")
+        return []
+
+    data = _get_json(
+        f"{ML_BASE}/player-props",
+        {"league": ml_league},
+        headers={"x-api-key": ML_KEY},
+    )
+    if not data:
+        log.warning(f"[sharp-ml] no data returned for {league}")
+        return []
+
+    events = data.get("data") or []
+    props_out: List[dict] = []
+    fetched_at = datetime.now(timezone.utc).isoformat()
+
+    for event in events:
+        for player in (event.get("players") or []):
+            player_name = player.get("playerName", "")
+            if not player_name:
+                continue
+            for market in (player.get("markets") or []):
+                market_type = market.get("marketType", "")
+                pp_stat = ML_TO_PP.get(market_type)
+                if not pp_stat:
+                    continue
+                if market.get("isAlternate"):
+                    continue
+
+                for line_data in (market.get("lines") or []):
+                    point = line_data.get("point")
+                    if point is None:
+                        continue
+
+                    # Collect sharp book implied probs for OVER
+                    over_probs = []
+                    under_probs = []
+                    books_used = []
+                    for offer in (line_data.get("offers") or []):
+                        if offer.get("bookmakerId") not in ML_SHARP_BOOKS:
+                            continue
+                        imp = offer.get("impliedProbability")
+                        if imp is None:
+                            continue
+                        sel = str(offer.get("selection", "")).lower()
+                        if sel == "over":
+                            over_probs.append(float(imp))
+                            books_used.append(offer.get("bookmakerId", ""))
+                        elif sel == "under":
+                            under_probs.append(float(imp))
+
+                    if not over_probs:
+                        continue
+
+                    # Average across sharp books, then de-vig
+                    raw_over  = sum(over_probs)  / len(over_probs)
+                    raw_under = sum(under_probs) / len(under_probs) if under_probs else (1 - raw_over)
+                    total     = raw_over + raw_under
+                    p_over    = raw_over  / total if total > 0 else 0.5
+                    p_under   = raw_under / total if total > 0 else 0.5
+
+                    # Fair line = line where p_over ~= 0.50 is the point itself.
+                    # We store the line as fair_line and let p_over signal direction.
+                    fair_line = float(point)
+
+                    props_out.append({
+                        "player_name":      player_name,
+                        "stat_type_pp":     pp_stat,
+                        "fair_line":        fair_line,
+                        "fair_p_win_over":  round(p_over,  4),
+                        "fair_p_win_under": round(p_under, 4),
+                        "books_used":       list(set(books_used)),
+                        "fetched_at":       fetched_at,
+                    })
+
+    stat_counts: Dict[str, int] = {}
+    for p in props_out:
+        stat_counts[p["stat_type_pp"]] = stat_counts.get(p["stat_type_pp"], 0) + 1
+    log.info(f"[sharp-ml] fetched {len(props_out)} ML props for {league}: {stat_counts}")
+    return props_out
+
+
 def _fetch_sgo_props(league: str) -> List[dict]:
     """
     Fetch all player prop odds for a league from SGO.
@@ -497,8 +649,12 @@ def pull_sharp_consensus(league: str, pp_props: List[PPProp]) -> Dict[str, Sharp
     """
     log.info(f"[sharp] pulling SGO for {league} ({len(pp_props)} PP props)")
 
-    sgo_props = _fetch_sgo_props(league)
-    consensus = _match_props(pp_props, sgo_props)
+    # Use MoneyLine (DraftKings + FanDuel) as sharp source — SGO subscription lapsed
+    ml_props = _fetch_ml_props(league)
+    if not ml_props:
+        log.warning(f"[sharp] MoneyLine returned no props for {league} — falling back to SGO")
+        ml_props = _fetch_sgo_props(league)
+    consensus = _match_props(pp_props, ml_props)
 
     # Merge into persistent store
     store = _load_store()

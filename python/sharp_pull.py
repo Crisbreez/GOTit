@@ -18,7 +18,23 @@ logging.basicConfig(level=logging.WARNING)
 sys.path.insert(0, str(Path(__file__).parent))
 
 from gotit.sharp_consensus import pull_sharp_consensus
-from optimize import build_pp_prop
+from gotit.sharp_consensus import PPProp, Tier
+
+
+def _make_pp_prop(d: dict):
+    """Convert a webapp prop dict → PPProp for sharp matching."""
+    prop_id    = str(d.get('id') or d.get('prizepicks_id') or '')
+    player     = str(d.get('playerName') or d.get('player_name') or '')
+    stat_type  = str(d.get('statType')   or d.get('stat_type')   or '')
+    line       = float(d.get('lineScore') or d.get('line_score') or 0)
+    tier_str   = Tier.DEMON if d.get('isDemon') else (Tier.GOBLIN if d.get('isGoblin') else Tier.STANDARD)
+    return PPProp(
+        prop_id=prop_id,
+        player_name=player,
+        stat_type=stat_type,
+        lines={tier_str: line},
+        tiers_offered=[tier_str],
+    )
 
 
 def main():
@@ -44,7 +60,7 @@ def main():
     pp_props = []
     for d in props_data:
         try:
-            pp_props.append(build_pp_prop(d))
+            pp_props.append(_make_pp_prop(d))
         except Exception as e:
             logging.warning(f"skip prop {d.get('playerName','?')}: {e}")
 
