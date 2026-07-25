@@ -280,12 +280,15 @@ def _has_real_signal(row: Dict, sharps: List[Dict], model: Optional[Dict]) -> bo
     if sharps:
         return True
     # Real data fields on the prop itself
-    mu_raw    = float(row.get('mu', 0) or 0)
-    sigma_raw = float(row.get('sigma', 0) or 0)
-    hit_rate  = row.get('hitRate') or row.get('hit_rate')
-    avg_stat  = row.get('avgStat') or row.get('avg_stat')
-    sharp_gap = abs(float(row.get('sharpGap', row.get('sharp_gap', 0)) or 0))
-    line_move = abs(float(row.get('lineMove', row.get('line_move', 0)) or 0))
+    mu_raw      = float(row.get('mu', 0) or 0)
+    sigma_raw   = float(row.get('sigma', 0) or 0)
+    hit_rate    = row.get('hitRate')        or row.get('hit_rate')
+    avg_stat    = row.get('avgStat')        or row.get('avg_stat')
+    sharp_gap   = abs(float(row.get('sharpGap',   row.get('sharp_gap',   0)) or 0))
+    line_move   = abs(float(row.get('lineMove',   row.get('line_move',   0)) or 0))
+    shade       = row.get('ppShadeSignal')  or row.get('pp_shade_signal') or ''
+    line_moves  = int(row.get('lineMoveCount', row.get('line_move_count', 0)) or 0)
+    sharp_fair  = row.get('sharpFairLine')  or row.get('sharp_fair_line')
     return (
         mu_raw > 0
         or sigma_raw > 0
@@ -293,6 +296,9 @@ def _has_real_signal(row: Dict, sharps: List[Dict], model: Optional[Dict]) -> bo
         or avg_stat is not None
         or sharp_gap > 0.01
         or line_move > 0.01
+        or shade not in ('', 'no_data', None)
+        or line_moves > 0
+        or sharp_fair is not None
     )
 
 

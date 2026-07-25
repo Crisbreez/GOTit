@@ -39,6 +39,14 @@ function mapProp(r: any) {
     ppDisplayStat: r.pp_display_stat,
     ppDisplayTeam: r.pp_display_team,
     ppEventTitle: r.pp_event_title,
+    // Sharp signal fields — needed by Demontime + The System signal gate
+    sharpFairLine: r.sharp_fair_line ?? null,
+    ppShadeSignal: r.pp_shade_signal ?? null,
+    sharpGap: r.sharp_fair_line != null
+      ? parseFloat(r.line_score ?? 0) - parseFloat(r.sharp_fair_line)
+      : null,
+    lineMoveCount: r.line_move_count ?? 0,
+    lineMove: r.line_move ?? null,
   };
 }
 

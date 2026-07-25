@@ -144,17 +144,25 @@ def _is_blank_history(raw: Dict[str, Any]) -> Tuple[bool, str]:
 
 def _has_sharp_data(raw: Dict[str, Any]) -> bool:
     """True if prop has real sharp/model data beyond line-derived estimates."""
-    sharp_gap = float(raw.get('sharpGap', raw.get('sharp_gap', 0)) or 0)
-    mu_raw    = float(raw.get('mu', 0) or 0)
-    sigma_raw = float(raw.get('sigma', 0) or 0)
-    hit_rate  = raw.get('hitRate') or raw.get('hit_rate')
-    avg_stat  = raw.get('avgStat') or raw.get('avg_stat')
+    sharp_gap    = float(raw.get('sharpGap',    raw.get('sharp_gap',    0)) or 0)
+    mu_raw       = float(raw.get('mu',          0) or 0)
+    sigma_raw    = float(raw.get('sigma',       0) or 0)
+    hit_rate     = raw.get('hitRate')     or raw.get('hit_rate')
+    avg_stat     = raw.get('avgStat')     or raw.get('avg_stat')
+    shade        = raw.get('ppShadeSignal') or raw.get('pp_shade_signal') or ''
+    line_move    = abs(float(raw.get('lineMove', raw.get('line_move', 0)) or 0))
+    line_moves   = int(raw.get('lineMoveCount', raw.get('line_move_count', 0)) or 0)
+    sharp_fair   = raw.get('sharpFairLine') or raw.get('sharp_fair_line')
     return (
         abs(sharp_gap) > 0.01
         or mu_raw > 0
         or sigma_raw > 0
         or hit_rate is not None
         or avg_stat is not None
+        or shade not in ('', 'no_data', None)
+        or line_move > 0.01
+        or line_moves > 0
+        or sharp_fair is not None
     )
 
 
