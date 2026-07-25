@@ -253,6 +253,16 @@ def _detect_traps(row: Dict, side: str, ctx: Dict, cfg: Dict) -> List[str]:
         flags.append('public_over_lean')
     if row.get('isDemon') or row.get('is_demon'):
         flags.append('demon')
+
+    # MMA trap: Round 1 Significant Strikes — line set very low (< 15).
+    # These props almost always go over — picking less is a trap.
+    stat_type = str(row.get('statType') or row.get('stat_type') or '')
+    line = float(row.get('lineScore') or row.get('line') or 0)
+    if stat_type in ('Round 1 Significant Strikes', 'R1 Significant Strikes',
+                     'Significant Strikes', 'Significant Strikes Landed'):
+        if side == 'less' and line < 20.0:
+            flags.append('mma_sig_strikes_less_trap')
+
     return flags
 
 
@@ -352,6 +362,8 @@ def score_prop(row: Dict, model: Optional[Dict], sharps: List[Dict],
             kills.append('goblin_ban')
         if pt < abs_floor:
             kills.append('below_floor')
+        if 'mma_sig_strikes_less_trap' in traps:
+            kills.append('mma_sig_strikes_less_trap')
 
         eligible = len(kills) == 0
 
