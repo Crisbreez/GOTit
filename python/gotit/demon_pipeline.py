@@ -20,6 +20,17 @@ from typing import Any, Dict, List, Optional, Tuple
 log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
+# MLB demon allowlist — only these stats enter Demontime for MLB
+# ─────────────────────────────────────────────────────────────────────────────
+MLB_DEMON_ALLOWLIST = {
+    "Total Bases",
+    "Hits+Runs+RBIs",
+    "Hitter Fantasy Score",
+    "Singles",          # only allowed at line == 0.5
+}
+MLB_SINGLES_MAX_LINE = 0.5
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Config (all tunable)
 # ─────────────────────────────────────────────────────────────────────────────
 CFG = {
@@ -377,6 +388,18 @@ def run_demon_pipeline(
     # Infer sport from first demon if not passed
     if demons and sport == "MLB":
         sport = str(demons[0].get("league", "MLB") or "MLB").upper()
+
+    # MLB allowlist — filter before scoring
+    if sport == "MLB":
+        def _mlb_allowed(p: Dict) -> bool:
+            st   = str(p.get("statType", "") or "")
+            line = float(p.get("lineScore", 0) or 0)
+            if st not in MLB_DEMON_ALLOWLIST:
+                return False
+            if st == "Singles" and line > MLB_SINGLES_MAX_LINE:
+                return False
+            return True
+        demons = [p for p in demons if _mlb_allowed(p)]
 
     if not demons:
         return {
