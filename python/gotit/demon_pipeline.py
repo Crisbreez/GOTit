@@ -22,7 +22,7 @@ import math
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
@@ -79,6 +79,58 @@ def _estimate_mu(line: float, sharp_gap: float) -> float:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Blank / zero-string detection
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _is_blank_history(raw: Dict[str, Any]) -> Tuple[bool, str]:
+    """
+    Detect players with zero-heavy or blank recent stat histories.
+    A demon whose last N games are all 0 or missing is a trap — reject it.
+
+    Checks:
+      1. recentStats / recent_stats array — if ≥ 60% of last 5+ entries are 0 → REJECT
+      2. hitRate / hit_rate is 0 or None — REJECT
+      3. avgStat / avg_stat == 0 — REJECT
+      4. dnpProb / dnp_prob >= 0.25 — REJECT (high did-not-play risk)
+    """
+    # Check recent stats array
+    recent = raw.get('recentStats') or raw.get('recent_stats') or []
+    if isinstance(recent, list) and len(recent) >= 3:
+        zeros = sum(1 for v in recent if v == 0 or v is None)
+        if zeros / len(recent) >= 0.60:
+            return True, f'zero_heavy_history: {zeros}/{len(recent)} zeros in recent stats'
+
+    # Check hit rate
+    hit_rate = raw.get('hitRate') or raw.get('hit_rate')
+    if hit_rate is not None:
+        try:
+            if float(hit_rate) == 0.0:
+                return True, 'hit_rate=0'
+        except (ValueError, TypeError):
+            pass
+
+    # Check average stat
+    avg = raw.get('avgStat') or raw.get('avg_stat')
+    if avg is not None:
+        try:
+            if float(avg) == 0.0:
+                return True, 'avg_stat=0'
+        except (ValueError, TypeError):
+            pass
+
+    # Check DNP probability
+    dnp = raw.get('dnpProb') or raw.get('dnp_prob')
+    if dnp is not None:
+        try:
+            if float(dnp) >= 0.25:
+                return True, f'dnp_prob={float(dnp):.2f} >= 0.25'
+        except (ValueError, TypeError):
+            pass
+
+    return False, ''
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Score one demon prop
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -92,19 +144,26 @@ def _score(raw: Dict[str, Any]) -> Dict[str, Any]:
     z     = (mu - line) / sigma if sigma > 0 else 0.0
     p     = _phi(z)
 
+    # Blank/zero history check — penalize p_hit heavily, mark as ineligible
+    is_blank, blank_reason = _is_blank_history(raw)
+    if is_blank:
+        p = 0.0   # force to 0 — will be filtered out by tau
+
     # Map p_hit → propScore and confidenceLevel so frontend renders correctly
-    confidence_level = max(1, min(5, round(p * 5)))   # 0.50→2.5→3, 0.70→3.5→4
+    confidence_level = max(1, min(5, round(p * 5))) if p > 0 else 0
 
     return {
         **raw,
         'p_hit':           round(p, 4),
-        'propScore':       round(p, 4),       # frontend uses propScore for bar
-        'confidenceLevel': confidence_level,  # frontend uses this for dots
+        'propScore':       round(p, 4),
+        'confidenceLevel': confidence_level,
         'mu':              round(mu, 3),
         'sigma':           round(sigma, 3),
         'z_score':         round(z, 3),
         'direction':       'over',
         'isDemon':         True,
+        'blank_history':   is_blank,
+        'blank_reason':    blank_reason if is_blank else '',
     }
 
 
