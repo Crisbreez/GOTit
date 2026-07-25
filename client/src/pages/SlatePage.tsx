@@ -771,10 +771,11 @@ function GameCard({ game, optResult, selectedIds, onToggle, atMax, onSave, isSav
           {/* Demon section — Demontime picks shown as cards, all demon props individually selectable */}
           {(() => {
             // All raw demon props for this game — for individual selection
+            // Demons allow duplicate players — only dedup by prop id (not player)
             const allDemonProps = [...(game.standards ?? []), ...(game.goblins ?? []), ...(game.demons ?? [])]
               .filter((p: any) => p.isDemon)
               .reduce((acc: any[], p: any) => {
-                if (!acc.find((x: any) => x.id === p.id)) acc.push(p);
+                if (!acc.find((x: any) => x.id === p.id)) acc.push(p); // dedup by id only, not player
                 return acc;
               }, []);
 
@@ -878,6 +879,13 @@ export default function SlatePage() {
         setSelectedPropMap(m => { const n = { ...m }; delete n[prop.id]; return n; });
       } else {
         if (next.size >= MAX_PICKS) return prev; // hard cap
+        // Duplicate player check — only demon props can share a player already in the slip
+        if (!prop.isDemon) {
+          const alreadyHasPlayer = Object.values(selectedPropMap).some(
+            (p: any) => p.playerName === prop.playerName && p.id !== prop.id
+          );
+          if (alreadyHasPlayer) return prev; // block non-demon duplicate
+        }
         next.add(prop.id);
         setSelectedPropMap(m => ({ ...m, [prop.id]: prop }));
       }

@@ -154,7 +154,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
   //   game.demon_pipeline_trace = pipeline.trace
   //
   // Returns { demons: Prop[], trace: object }
-  async function runDemonPipeline(gameProps: any[]): Promise<{ demons: any[]; trace: any }> {
+  async function runDemonPipeline(gameProps: any[]): Promise<{ demons: any[]; otherDemons: any[]; trace: any }> {
     return new Promise((resolve) => {
       const scriptPath = path.resolve(process.cwd(), 'python', 'qualify_demons.py');
       const python = process.env.PYTHON_BIN || 'python3';
@@ -175,7 +175,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
             .filter((p: any) => { if (seen.has(p.playerName)) return false; seen.add(p.playerName); return true; })
             .slice(0, 2)
             .map((p: any) => ({ ...p, fallback_render_used: true, fallback_reason: 'process_crash' }));
-          return resolve({ demons: raw, trace: { error: 'process_crash', exit_code: code } });
+          return resolve({ demons: raw, otherDemons: [], trace: { error: 'process_crash', exit_code: code } });
         }
 
         let pipeline: any = null;
@@ -183,7 +183,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
           pipeline = JSON.parse(out);
         } catch (e) {
           console.warn('[Demons] JSON parse failed:', e);
-          return resolve({ demons: [], trace: { error: 'json_parse_failed' } });
+          return resolve({ demons: [], otherDemons: [], trace: { error: 'json_parse_failed' } });
         }
 
         // ── Exact route pattern ────────────────────────────────────────────────
@@ -213,11 +213,12 @@ export function registerRoutes(httpServer: Server, app: Express) {
           selected = selected.slice(0, 2);
         }
 
-        resolve({ demons: selected, trace });
+        const otherDemons: any[] = Array.isArray(pipeline?.other_demons) ? pipeline.other_demons : [];
+        resolve({ demons: selected, otherDemons, trace });
       });
       child.on('error', (e: Error) => {
         console.warn('[Demons] spawn error:', e.message);
-        resolve({ demons: [], trace: { error: e.message } });
+        resolve({ demons: [], otherDemons: [], trace: { error: e.message } });
       });
     });
   }
@@ -356,6 +357,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
         return {
           ...g,
           demons,                              // source of truth: pipeline.selected_demons
+          other_demons: pipeline.otherDemons ?? [],  // remaining demons for individual selection
           demon_pipeline_trace: pipeline.trace, // full 8-stage trace
           goblins:   (g.props as any[]).filter((p: any) => p.isGoblin),
           standards: (g.props as any[]).filter((p: any) => !p.isDemon && !p.isGoblin),

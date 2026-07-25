@@ -25,9 +25,19 @@ log = logging.getLogger(__name__)
 
 TAU = 0.52   # below_confidence_floor warning threshold — does NOT drop from pool
 
-# Stats hard-excluded from Demontime — scored with heavy penalty, rank last
+# MLB Demontime allowlist — ONLY these stats qualify for MLB demons
+# Singles allowed only at line 0.5
+MLB_DEMON_ALLOWLIST = {
+    'Total Bases',
+    'Hits+Runs+RBIs',
+    'Hitter Fantasy Score',
+    'Singles',
+}
+MLB_SINGLES_MAX_LINE = 0.5
+
+# Non-MLB: keep old blocklist approach (no allowlist restriction)
 DEMON_STAT_BLOCKLIST = {
-    'Singles', 'Doubles', 'Triples', 'Home Runs', 'RBIs', 'Walks',
+    'Doubles', 'Triples', 'Home Runs', 'RBIs', 'Walks',
     'Stolen Bases', 'Hitter Strikeouts', 'Plate Appearances',
 }
 
@@ -213,7 +223,26 @@ def _score(raw: Dict[str, Any]) -> Dict[str, Any]:
 
     p_raw, quality = _solo_hit_prob_more(raw)
     zero_string, crush, blank_reason = _blank_history_flags(raw)
-    is_trash_stat = stat_type in DEMON_STAT_BLOCKLIST
+    league = str(raw.get('league', raw.get('sport', '')) or '').upper()
+    # MLB stat fingerprints — used when league field missing
+    _MLB_STATS = {
+        'Total Bases','Hits+Runs+RBIs','Hitter Fantasy Score','Singles','Hits',
+        'Home Runs','RBIs','Pitcher Strikeouts','Pitches Thrown','Pitching Outs',
+        'Earned Runs Allowed','Hits Allowed','Walks Allowed','Stolen Bases',
+        'Hitter Strikeouts','Plate Appearances','Doubles','Triples','Runs',
+        'Hitter Fantasy Score',
+    }
+    is_mlb = league == 'MLB' or (not league and stat_type in _MLB_STATS)
+
+    # MLB allowlist enforcement
+    mlb_blocked = False
+    if is_mlb:
+        if stat_type not in MLB_DEMON_ALLOWLIST:
+            mlb_blocked = True
+        elif stat_type == 'Singles' and line > MLB_SINGLES_MAX_LINE:
+            mlb_blocked = True
+
+    is_trash_stat = (not is_mlb and stat_type in DEMON_STAT_BLOCKLIST) or mlb_blocked
 
     p_adj = p_raw
 
