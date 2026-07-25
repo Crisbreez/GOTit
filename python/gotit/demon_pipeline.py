@@ -51,7 +51,9 @@ def _estimate_sigma(line: float, stat_type: str) -> float:
         'Pitcher Strikeouts': 0.32, 'Pitches Thrown': 0.14,
         'Pitching Outs': 0.28, 'Hits Allowed': 0.42,
         'Earned Runs Allowed': 0.70, 'Walks Allowed': 0.75,
-        'Significant Strikes': 0.22, 'Hitter Fantasy Score': 0.40,
+        'Significant Strikes': 0.22,
+        'Round 1 Significant Strikes': 0.28,
+        'R1 Significant Strikes': 0.28, 'Hitter Fantasy Score': 0.40,
         # NBA/NFL
         'Points': 0.26, 'Rebounds': 0.40, 'Assists': 0.45,
         'Points+Rebounds+Assists': 0.28, 'Rushing Attempts': 0.35,

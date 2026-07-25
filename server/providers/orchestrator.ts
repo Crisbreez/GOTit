@@ -213,6 +213,8 @@ export async function orchestratePull(league: string, forceRefresh = false): Pro
         'Pitcher Fantasy Score': 25.0,
         'Hitter Fantasy Score':  7.0,
         'Significant Strikes':  25.0,
+        'Round 1 Significant Strikes': 10.0,
+        'R1 Significant Strikes': 10.0,
         'Takedowns':             1.5,
         'Fight Time (Mins)':     8.0,
       };
