@@ -1,17 +1,15 @@
 """
 demon_pipeline.py — Demontime
 
-Analyzes every demon prop in a game.
-Produces exactly 2 demons per game — top 2 by P_hit.
+Demontime: per game, score every PP demon individually on adjusted solo More
+hit prob; always take top 2; never joint-pair; never fake mu=line*1.05 as
+real signal.
 
-P_hit = Phi((mu - line) / sigma)   # More-only (over), standard normal CDF
-tau   = 0.50                        # per-demon floor; relax to 0.45 if needed
-
-Rules:
-  - Demons are over only
-  - Separate pipeline from standard/goblin legs entirely
-  - Always return top 2 by P_hit — no joint optimization, no pairing logic
-  - If fewer than 2 props exist for a game → return however many exist (min 0)
+Mode: forced_top2_individual
+  - Always emit exactly 2 picks per game (if ≥2 demon props exist)
+  - Score alone, sort by p_adj DESC
+  - No tau gate to DROP from pool — tau only sets a below_confidence_floor flag
+  - No signal → BLIND → p_raw = 0.50 * 0.88 — still eligible for forced fill
 """
 
 from __future__ import annotations
@@ -21,18 +19,22 @@ import logging
 import math
 import sys
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
-TAU = 0.50   # per-demon P_hit floor (relaxed to 0.45 if < 2 survive strict)
+TAU = 0.52   # below_confidence_floor warning threshold — does NOT drop from pool
 
-# Stats barred from Demontime entirely regardless of data quality
+# Stats hard-excluded from Demontime — scored with heavy penalty, rank last
 DEMON_STAT_BLOCKLIST = {
     'Singles', 'Doubles', 'Triples', 'Home Runs', 'RBIs', 'Walks',
     'Stolen Bases', 'Hitter Strikeouts', 'Plate Appearances',
 }
+
+UNCERTAINTY_HAIRCUT_BLIND    = 0.88
+UNCERTAINTY_HAIRCUT_DEGRADED = 0.92
+TRASH_STAT_PENALTY           = 0.70
+ZERO_STRING_PENALTY          = 0.05
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -43,7 +45,7 @@ def _phi(z: float) -> float:
     return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
 
 
-def _p_hit(mu: float, sigma: float, line: float) -> float:
+def _p_more(mu: float, sigma: float, line: float) -> float:
     """P(stat > line) — More only."""
     if sigma <= 1e-9:
         return 1.0 if mu > line else 0.0
@@ -52,109 +54,47 @@ def _p_hit(mu: float, sigma: float, line: float) -> float:
 
 def _estimate_sigma(line: float, stat_type: str) -> float:
     ratios = {
-        # MLB
         'Total Bases': 0.38, 'Hits': 0.55, 'Hits+Runs+RBIs': 0.40,
         'Pitcher Strikeouts': 0.32, 'Pitches Thrown': 0.14,
         'Pitching Outs': 0.28, 'Hits Allowed': 0.42,
         'Earned Runs Allowed': 0.70, 'Walks Allowed': 0.75,
-        'Significant Strikes': 0.22,
-        'Round 1 Significant Strikes': 0.28,
-        'R1 Significant Strikes': 0.28, 'Hitter Fantasy Score': 0.40,
-        # NBA/NFL
+        'Hitter Fantasy Score': 0.40,
         'Points': 0.26, 'Rebounds': 0.40, 'Assists': 0.45,
-        'Points+Rebounds+Assists': 0.28, 'Rushing Attempts': 0.35,
-        'Receiving Yards': 0.40, 'Passing Yards': 0.22,
-        # MMA/UFC
-        'Takedowns': 0.55,
-        'Takedowns Landed': 0.55,
-        'Fight Time': 0.30,
-        'Fight Time (Mins)': 0.30,
-        'Significant Strikes': 0.22,
-        'Significant Strikes Landed': 0.22,
-        'Total Strikes': 0.25,
-        'Total Strikes Landed': 0.25,
-        'Knockdowns': 0.90,           # high variance — low line, big sigma
-        'Submission Attempts': 0.85,
+        'Points+Rebounds+Assists': 0.28,
+        'Rushing Attempts': 0.35, 'Receiving Yards': 0.40, 'Passing Yards': 0.22,
+        'Takedowns': 0.55, 'Takedowns Landed': 0.55,
+        'Fight Time': 0.30, 'Fight Time (Mins)': 0.30,
+        'Significant Strikes': 0.22, 'Significant Strikes Landed': 0.22,
+        'Round 1 Significant Strikes': 0.28, 'R1 Significant Strikes': 0.28,
+        'Total Strikes': 0.25, 'Total Strikes Landed': 0.25,
+        'Knockdowns': 0.90, 'Submission Attempts': 0.85,
         'Ground Control Time': 0.40,
     }
     return max(0.5, line * ratios.get(stat_type, 0.40))
 
 
-def _estimate_mu(line: float, sharp_gap: float) -> float:
-    if sharp_gap != 0.0:
-        return line + sharp_gap
-    return line * 1.05  # slight positive edge assumed on PP demon lines
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Blank / zero-string detection
+# Signal detection
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _is_blank_history(raw: Dict[str, Any]) -> Tuple[bool, str]:
+def _data_quality(raw: Dict[str, Any]) -> str:
     """
-    Detect players with zero-heavy or blank recent stat histories.
-    A demon whose last N games are all 0 or missing is a trap — reject it.
-
-    Checks:
-      1. recentStats / recent_stats array — if ≥ 60% of last 5+ entries are 0 → REJECT
-      2. hitRate / hit_rate is 0 or None — REJECT
-      3. avgStat / avg_stat == 0 — REJECT
-      4. dnpProb / dnp_prob >= 0.25 — REJECT (high did-not-play risk)
+    REAL   — has sharp line, model mu/sigma, or hit rate / avg stat
+    BLIND  — no external signal whatsoever
     """
-    # Check recent stats array
-    recent = raw.get('recentStats') or raw.get('recent_stats') or []
-    if isinstance(recent, list) and len(recent) >= 3:
-        zeros = sum(1 for v in recent if v == 0 or v is None)
-        if zeros / len(recent) >= 0.60:
-            return True, f'zero_heavy_history: {zeros}/{len(recent)} zeros in recent stats'
+    sharp_fair  = raw.get('sharpFairLine') or raw.get('sharp_fair_line')
+    sharp_gap   = abs(float(raw.get('sharpGap',   raw.get('sharp_gap',   0)) or 0))
+    mu_raw      = float(raw.get('mu',   0) or 0)
+    sigma_raw   = float(raw.get('sigma', 0) or 0)
+    hit_rate    = raw.get('hitRate')  or raw.get('hit_rate')
+    avg_stat    = raw.get('avgStat')  or raw.get('avg_stat')
+    shade       = raw.get('ppShadeSignal') or raw.get('pp_shade_signal') or ''
+    line_move   = abs(float(raw.get('lineMove',       raw.get('line_move',       0)) or 0))
+    line_moves  = int(raw.get('lineMoveCount', raw.get('line_move_count', 0)) or 0)
 
-    # Check hit rate
-    hit_rate = raw.get('hitRate') or raw.get('hit_rate')
-    if hit_rate is not None:
-        try:
-            if float(hit_rate) == 0.0:
-                return True, 'hit_rate=0'
-        except (ValueError, TypeError):
-            pass
-
-    # Check average stat
-    avg = raw.get('avgStat') or raw.get('avg_stat')
-    if avg is not None:
-        try:
-            if float(avg) == 0.0:
-                return True, 'avg_stat=0'
-        except (ValueError, TypeError):
-            pass
-
-    # Check DNP probability
-    dnp = raw.get('dnpProb') or raw.get('dnp_prob')
-    if dnp is not None:
-        try:
-            if float(dnp) >= 0.25:
-                return True, f'dnp_prob={float(dnp):.2f} >= 0.25'
-        except (ValueError, TypeError):
-            pass
-
-    return False, ''
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Score one demon prop
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _has_sharp_data(raw: Dict[str, Any]) -> bool:
-    """True if prop has real sharp/model data beyond line-derived estimates."""
-    sharp_gap    = float(raw.get('sharpGap',    raw.get('sharp_gap',    0)) or 0)
-    mu_raw       = float(raw.get('mu',          0) or 0)
-    sigma_raw    = float(raw.get('sigma',       0) or 0)
-    hit_rate     = raw.get('hitRate')     or raw.get('hit_rate')
-    avg_stat     = raw.get('avgStat')     or raw.get('avg_stat')
-    shade        = raw.get('ppShadeSignal') or raw.get('pp_shade_signal') or ''
-    line_move    = abs(float(raw.get('lineMove', raw.get('line_move', 0)) or 0))
-    line_moves   = int(raw.get('lineMoveCount', raw.get('line_move_count', 0)) or 0)
-    sharp_fair   = raw.get('sharpFairLine') or raw.get('sharp_fair_line')
-    return (
-        abs(sharp_gap) > 0.01
+    has_real = (
+        sharp_fair is not None
+        or sharp_gap > 0.01
         or mu_raw > 0
         or sigma_raw > 0
         or hit_rate is not None
@@ -162,63 +102,165 @@ def _has_sharp_data(raw: Dict[str, Any]) -> bool:
         or shade not in ('', 'no_data', None)
         or line_move > 0.01
         or line_moves > 0
-        or sharp_fair is not None
     )
+    return 'REAL' if has_real else 'BLIND'
 
 
-def _score(raw: Dict[str, Any]) -> Dict[str, Any]:
+# ─────────────────────────────────────────────────────────────────────────────
+# Blank / zero-string detection
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _blank_history_flags(raw: Dict[str, Any]) -> Tuple[bool, bool, str]:
+    """
+    Returns (zero_string_fail, crush, reason).
+    zero_string_fail  → ZERO_STRING_PENALTY (0.05x)
+    crush             → smaller penalty (0.10x) for hit_rate=0 / avg=0 / dnp
+    """
+    recent = raw.get('recentStats') or raw.get('recent_stats') or []
+    if isinstance(recent, list) and len(recent) >= 3:
+        zeros = sum(1 for v in recent if v == 0 or v is None)
+        if zeros / len(recent) >= 0.60:
+            return True, True, f'zero_heavy:{zeros}/{len(recent)}'
+
+    hit_rate = raw.get('hitRate') or raw.get('hit_rate')
+    if hit_rate is not None:
+        try:
+            if float(hit_rate) == 0.0:
+                return False, True, 'hit_rate=0'
+        except (ValueError, TypeError):
+            pass
+
+    avg = raw.get('avgStat') or raw.get('avg_stat')
+    if avg is not None:
+        try:
+            if float(avg) == 0.0:
+                return False, True, 'avg_stat=0'
+        except (ValueError, TypeError):
+            pass
+
+    dnp = raw.get('dnpProb') or raw.get('dnp_prob')
+    if dnp is not None:
+        try:
+            if float(dnp) >= 0.25:
+                return False, True, f'dnp_prob={float(dnp):.2f}'
+        except (ValueError, TypeError):
+            pass
+
+    return False, False, ''
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Solo hit probability
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _solo_hit_prob_more(raw: Dict[str, Any]) -> Tuple[float, str]:
+    """
+    Returns (p_raw, data_quality).
+    Never uses mu = line * 1.05 as REAL signal.
+    """
+    quality = _data_quality(raw)
     line      = float(raw.get('lineScore', raw.get('line', 0)) or 0)
     stat_type = str(raw.get('statType', raw.get('stat_type', '')) or '')
-    sharp_gap = float(raw.get('sharpGap', raw.get('sharp_gap', 0)) or 0)
 
-    has_sharp            = _has_sharp_data(raw)
-    is_blank, blank_rsn  = _is_blank_history(raw)
+    mu_raw    = float(raw.get('mu',    0) or 0)
+    sigma_raw = float(raw.get('sigma', 0) or 0)
 
-    def _ineligible(reason: str) -> Dict[str, Any]:
-        return {
-            **raw,
-            'p_hit': 0.0, 'propScore': 0.0, 'confidenceLevel': 0,
-            'mu': 0.0, 'sigma': 0.0, 'z_score': 0.0,
-            'direction': 'over', 'isDemon': True,
-            'eligible': False,
-            'ineligible_reason': reason,
-            'blank_history': is_blank, 'blank_reason': blank_rsn,
-        }
+    # Sharp fair line from MoneyLine/SGO
+    sharp_fair     = raw.get('sharpFairLine') or raw.get('sharp_fair_line')
+    sharp_p_more   = None
+    if sharp_fair is not None:
+        try:
+            sf = float(sharp_fair)
+            sigma_est = _estimate_sigma(line, stat_type)
+            sharp_p_more = _p_more(sf, sigma_est, line)
+        except (ValueError, TypeError):
+            pass
 
-    # Gate 1: blocklisted stat
-    if stat_type in DEMON_STAT_BLOCKLIST:
-        return _ineligible(f'stat_blocklisted:{stat_type}')
+    if quality == 'REAL':
+        if mu_raw > 0 and sigma_raw > 0:
+            p_model = _p_more(mu_raw, sigma_raw, line)
+            if sharp_p_more is not None:
+                p_raw = min(p_model, sharp_p_more)   # conservative
+            else:
+                p_raw = p_model
+        elif sharp_p_more is not None:
+            p_raw = sharp_p_more
+        else:
+            # Has other real signal (shade, line move) but no numeric anchor
+            # Use hit_rate or avg_stat if available
+            hit_rate = raw.get('hitRate') or raw.get('hit_rate')
+            if hit_rate is not None:
+                try:
+                    p_raw = float(hit_rate)
+                except (ValueError, TypeError):
+                    p_raw = 0.50
+            else:
+                p_raw = 0.50
+        return max(0.01, min(0.99, p_raw)), 'REAL'
 
-    # Gate 2: no real signal = ineligible, period
-    if not has_sharp:
-        return _ineligible('insufficient_projection_data')
+    # BLIND — no real signal — eligible but ranked last among any REAL legs
+    p_raw = 0.50 * UNCERTAINTY_HAIRCUT_BLIND   # = 0.44
+    return p_raw, 'BLIND'
 
-    # Gate 3: blank/zero history
-    if is_blank:
-        return _ineligible(f'blank_history:{blank_rsn}')
 
-    # Score
-    mu    = float(raw.get('mu', 0) or 0) or _estimate_mu(line, sharp_gap)
-    sigma = float(raw.get('sigma', 0) or 0) or _estimate_sigma(line, stat_type)
-    z     = (mu - line) / sigma if sigma > 0 else 0.0
-    p     = _phi(z)
+# ─────────────────────────────────────────────────────────────────────────────
+# Score one demon prop → p_adj
+# ─────────────────────────────────────────────────────────────────────────────
 
-    confidence_level = max(1, min(5, round(p * 5))) if p > 0 else 0
+def _score(raw: Dict[str, Any]) -> Dict[str, Any]:
+    stat_type = str(raw.get('statType', raw.get('stat_type', '')) or '')
+    line      = float(raw.get('lineScore', raw.get('line', 0)) or 0)
+
+    p_raw, quality = _solo_hit_prob_more(raw)
+    zero_string, crush, blank_reason = _blank_history_flags(raw)
+    is_trash_stat = stat_type in DEMON_STAT_BLOCKLIST
+
+    p_adj = p_raw
+
+    # Adjustments
+    if is_trash_stat:
+        p_adj *= TRASH_STAT_PENALTY       # 0.70x — stays in pool, ranks last
+    if zero_string:
+        p_adj *= ZERO_STRING_PENALTY      # 0.05x — effectively last resort
+    elif crush:
+        p_adj *= 0.10                     # heavy crush — near-zero but not gone
+
+    # Clamp
+    p_adj = max(0.01, min(0.99, p_adj))
+
+    fragility = round(1.0 - p_adj, 4)
+    below_floor = p_adj < TAU
+
+    flags = []
+    if is_trash_stat:
+        flags.append('trash_stat')
+    if zero_string:
+        flags.append('zero_string')
+    elif crush:
+        flags.append('crushed')
+    if below_floor:
+        flags.append('below_confidence_floor')
+    if quality == 'BLIND':
+        flags.append('low_data')
 
     return {
         **raw,
-        'p_hit':           round(p, 4),
-        'propScore':       round(p, 4),
-        'confidenceLevel': confidence_level,
-        'mu':              round(mu, 3),
-        'sigma':           round(sigma, 3),
-        'z_score':         round(z, 3),
-        'direction':       'over',
-        'isDemon':         True,
-        'eligible':        True,
-        'ineligible_reason': '',
-        'blank_history':   False,
-        'blank_reason':    '',
+        'p_raw':                round(p_raw, 4),
+        'p_adj':                round(p_adj, 4),
+        'p_hit':                round(p_adj, 4),   # alias for compat
+        'propScore':            round(p_adj, 4),
+        'confidenceLevel':      max(1, min(5, round(p_adj * 5))),
+        'data_quality':         quality,
+        'fragility':            fragility,
+        'below_confidence_floor': below_floor,
+        'flags':                flags,
+        'direction':            'over',
+        'isDemon':              True,
+        # eligibility — always True (forced mode — pool never drained)
+        'eligible':             True,
+        'ineligible_reason':    '',
+        'blank_history':        crush or zero_string,
+        'blank_reason':         blank_reason,
     }
 
 
@@ -229,57 +271,59 @@ def _score(raw: Dict[str, Any]) -> Dict[str, Any]:
 def run_demon_pipeline(props: List[Dict[str, Any]], game_id: str) -> Dict[str, Any]:
     """
     Run Demontime for a single game.
-    Returns top 2 demon props by P_hit.
+    Always returns top 2 demon props (forced). Never empty if ≥2 demons exist.
     """
-    # Filter to demons, over only
-    demons = [p for p in props
-              if p.get('isDemon') or p.get('is_demon')]
-    demons = [p for p in demons
-              if str(p.get('direction', 'over')).lower() != 'under']
+    # Filter to demons, over only (synthetic unders excluded)
+    demons = [p for p in props if p.get('isDemon') or p.get('is_demon')]
+    demons = [p for p in demons if str(p.get('direction', 'over')).lower() != 'under']
+    demons = [p for p in demons if not p.get('isSynthetic')]
 
     if not demons:
         return {
             'selected_demons': [],
-            'post_relaxation_demons': [],
+            'other_demons': [],
             'status': 'NO-GO',
-            'trace': {'game_id': game_id, 'reason': 'no demon props'},
+            'strategy': 'Demontime',
+            'mode': 'forced_top2_individual',
+            'trace': {'game_id': game_id, 'reason': 'no demon props in game'},
             'error': None,
         }
 
-    # Score all then filter ineligible (blocklisted, no projection data, blank history)
+    # Score ALL demons — none removed from pool
     all_scored = [_score(d) for d in demons]
-    scored = sorted(
-        [d for d in all_scored if d.get('eligible', True) and d['p_hit'] > 0],
-        key=lambda x: x['p_hit'], reverse=True
-    )
-    ineligible_count = len(all_scored) - len(scored)
 
-    # Apply tau floor — top 2 that pass
-    passed = [d for d in scored if d['p_hit'] >= TAU]
+    # Sort: REAL before BLIND, then p_adj DESC, then p_raw DESC, then lower fragility
+    def _sort_key(x):
+        quality_rank = 0 if x['data_quality'] == 'REAL' else 1
+        return (quality_rank, -x['p_adj'], -x['p_raw'], x['fragility'])
 
-    # Relax tau if fewer than 2 pass
-    if len(passed) < 2:
-        relaxed_tau = TAU - 0.05
-        passed = [d for d in scored if d['p_hit'] >= relaxed_tau]
+    all_scored.sort(key=_sort_key)
 
-    # Take top 2
-    selected = passed[:2] if len(passed) >= 2 else passed
+    # Forced top-2
+    picks  = all_scored[:2]
+    others = all_scored[2:]
 
-    # If still 0, take absolute top 2 regardless of floor
-    if not selected and scored:
-        selected = scored[:2]
+    # Annotate picks with rank
+    for i, p in enumerate(picks):
+        p['rank'] = i + 1
+
+    real_count  = sum(1 for d in all_scored if d['data_quality'] == 'REAL')
+    blind_count = sum(1 for d in all_scored if d['data_quality'] == 'BLIND')
 
     return {
-        'selected_demons':        selected,
-        'post_relaxation_demons': selected,
-        'status':  'CLEAR' if selected else 'NO-GO',
+        'selected_demons':        picks,
+        'post_relaxation_demons': picks,   # compat alias
+        'other_demons':           others,
+        'status':  'CLEAR' if picks else 'NO-GO',
+        'strategy': 'Demontime',
+        'mode': 'forced_top2_individual',
+        'notes': 'forced top2 by solo p_adj; not joint pair',
         'trace': {
             'game_id':           game_id,
             'total_demon_props': len(demons),
-            'ineligible':        ineligible_count,
-            'eligible':          len(scored),
-            'passed_tau':        len(passed),
-            'selected':          len(selected),
+            'real_signal':       real_count,
+            'blind':             blind_count,
+            'selected':          len(picks),
         },
         'error': None,
     }
