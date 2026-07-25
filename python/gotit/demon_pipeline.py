@@ -28,6 +28,24 @@ log = logging.getLogger(__name__)
 
 TAU = 0.50   # per-demon P_hit floor (relaxed to 0.45 if < 2 survive strict)
 
+# Stat allowlist: only these stats are eligible as demons when no sharp/history data
+DEMON_STAT_ALLOWLIST = {
+    # MLB
+    'Total Bases', 'Hits+Runs+RBIs', 'Pitcher Strikeouts', 'Pitches Thrown',
+    'Hitter Fantasy Score', 'Hits', 'Runs',
+    # MMA
+    'Significant Strikes', 'Round 1 Significant Strikes', 'R1 Significant Strikes',
+    'Takedowns', 'Fight Time (Mins)', 'Total Strikes',
+    # NBA/NFL
+    'Points', 'Rebounds', 'Assists', 'Passing Yards', 'Rushing Yards', 'Receiving Yards',
+}
+
+# Stats barred from Demontime entirely
+DEMON_STAT_BLOCKLIST = {
+    'Singles', 'Doubles', 'Triples', 'Home Runs', 'RBIs', 'Walks',
+    'Stolen Bases', 'Hitter Strikeouts', 'Plate Appearances',
+}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Math
@@ -136,22 +154,59 @@ def _is_blank_history(raw: Dict[str, Any]) -> Tuple[bool, str]:
 # Score one demon prop
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _has_sharp_data(raw: Dict[str, Any]) -> bool:
+    """True if prop has real sharp/model data beyond line-derived estimates."""
+    sharp_gap = float(raw.get('sharpGap', raw.get('sharp_gap', 0)) or 0)
+    mu_raw    = float(raw.get('mu', 0) or 0)
+    sigma_raw = float(raw.get('sigma', 0) or 0)
+    hit_rate  = raw.get('hitRate') or raw.get('hit_rate')
+    avg_stat  = raw.get('avgStat') or raw.get('avg_stat')
+    return (
+        abs(sharp_gap) > 0.01
+        or mu_raw > 0
+        or sigma_raw > 0
+        or hit_rate is not None
+        or avg_stat is not None
+    )
+
+
 def _score(raw: Dict[str, Any]) -> Dict[str, Any]:
     line      = float(raw.get('lineScore', raw.get('line', 0)) or 0)
     stat_type = str(raw.get('statType', raw.get('stat_type', '')) or '')
     sharp_gap = float(raw.get('sharpGap', raw.get('sharp_gap', 0)) or 0)
 
+    has_sharp            = _has_sharp_data(raw)
+    is_blank, blank_rsn  = _is_blank_history(raw)
+
+    def _ineligible(reason: str) -> Dict[str, Any]:
+        return {
+            **raw,
+            'p_hit': 0.0, 'propScore': 0.0, 'confidenceLevel': 0,
+            'mu': 0.0, 'sigma': 0.0, 'z_score': 0.0,
+            'direction': 'over', 'isDemon': True,
+            'eligible': False,
+            'ineligible_reason': reason,
+            'blank_history': is_blank, 'blank_reason': blank_rsn,
+        }
+
+    # Gate 1: blocklisted stat
+    if stat_type in DEMON_STAT_BLOCKLIST:
+        return _ineligible(f'stat_blocklisted:{stat_type}')
+
+    # Gate 2: no sharp data AND stat not in allowlist
+    if not has_sharp and stat_type not in DEMON_STAT_ALLOWLIST:
+        return _ineligible('insufficient_projection_data')
+
+    # Gate 3: blank/zero history
+    if is_blank:
+        return _ineligible(f'blank_history:{blank_rsn}')
+
+    # Score
     mu    = float(raw.get('mu', 0) or 0) or _estimate_mu(line, sharp_gap)
     sigma = float(raw.get('sigma', 0) or 0) or _estimate_sigma(line, stat_type)
     z     = (mu - line) / sigma if sigma > 0 else 0.0
     p     = _phi(z)
 
-    # Blank/zero history check — penalize p_hit heavily, mark as ineligible
-    is_blank, blank_reason = _is_blank_history(raw)
-    if is_blank:
-        p = 0.0   # force to 0 — will be filtered out by tau
-
-    # Map p_hit → propScore and confidenceLevel so frontend renders correctly
     confidence_level = max(1, min(5, round(p * 5))) if p > 0 else 0
 
     return {
@@ -164,8 +219,10 @@ def _score(raw: Dict[str, Any]) -> Dict[str, Any]:
         'z_score':         round(z, 3),
         'direction':       'over',
         'isDemon':         True,
-        'blank_history':   is_blank,
-        'blank_reason':    blank_reason if is_blank else '',
+        'eligible':        True,
+        'ineligible_reason': '',
+        'blank_history':   False,
+        'blank_reason':    '',
     }
 
 
@@ -193,8 +250,13 @@ def run_demon_pipeline(props: List[Dict[str, Any]], game_id: str) -> Dict[str, A
             'error': None,
         }
 
-    # Score all
-    scored = sorted([_score(d) for d in demons], key=lambda x: x['p_hit'], reverse=True)
+    # Score all then filter ineligible (blocklisted, no projection data, blank history)
+    all_scored = [_score(d) for d in demons]
+    scored = sorted(
+        [d for d in all_scored if d.get('eligible', True) and d['p_hit'] > 0],
+        key=lambda x: x['p_hit'], reverse=True
+    )
+    ineligible_count = len(all_scored) - len(scored)
 
     # Apply tau floor — top 2 that pass
     passed = [d for d in scored if d['p_hit'] >= TAU]
@@ -216,10 +278,12 @@ def run_demon_pipeline(props: List[Dict[str, Any]], game_id: str) -> Dict[str, A
         'post_relaxation_demons': selected,
         'status':  'CLEAR' if selected else 'NO-GO',
         'trace': {
-            'game_id':    game_id,
-            'total_scored': len(scored),
-            'passed_tau':   len(passed),
-            'selected':     len(selected),
+            'game_id':           game_id,
+            'total_demon_props': len(demons),
+            'ineligible':        ineligible_count,
+            'eligible':          len(scored),
+            'passed_tau':        len(passed),
+            'selected':          len(selected),
         },
         'error': None,
     }
