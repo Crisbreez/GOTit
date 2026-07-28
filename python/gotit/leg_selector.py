@@ -136,6 +136,16 @@ DEFAULT_CFG: Dict[str, Any] = {
     "preferred_slips":   ["5_flex", "6_flex"],
     "fat_count":         0.03,
     "combo_head":        12,      # top-N by count to enumerate combos from
+    # PLAY vs LEAN thresholds (run_system_for_game spec)
+    "play_ev_min":       0.04,    # EV >= this → PLAY status
+    "lean_ev_min":       0.00,    # EV >= this → LEAN (else NO_GO)
+    "stake_play":        0.02,    # 2% of bankroll
+    "stake_lean":        0.01,    # 1% of bankroll
+    # p_true blend weights
+    "w_market":          0.50,    # sharpFairLine weight
+    "w_model":           0.30,    # mu/sigma model weight
+    "w_hitrate":         0.20,    # historical hit rate weight
+    "p_haircut":         0.005,   # small haircut on blended p_true
 }
 
 
@@ -547,6 +557,192 @@ def build_packages(eligible: List[ScoredLeg], cfg: Dict) -> Dict:
 # ─────────────────────────────────────────────────────────────────────────────
 # Master entrypoint (Section 9)
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# fair_p_market — extract fair P from sharpFairLine (MoneyLine DK/FD)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fair_p_market(row: Dict, side: str) -> Optional[float]:
+    """
+    Use sharpFairLine from MoneyLine (DK/FD) as the market fair probability.
+    Converts fair line → P(More) via CDF estimate.
+    Returns None if no sharp data.
+    """
+    sharp_fair = row.get('sharpFairLine') or row.get('sharp_fair_line')
+    if sharp_fair is None:
+        return None
+    try:
+        sf = float(sharp_fair)
+        L  = float(row.get('lineScore', row.get('line', 0)) or 0)
+        stat_type = str(row.get('statType', row.get('stat_type', '')) or '')
+        sigma_ratios = {
+            'Total Bases': 0.38, 'Hits': 0.55, 'Hits+Runs+RBIs': 0.40,
+            'Pitcher Strikeouts': 0.32, 'Pitches Thrown': 0.14,
+            'Pitching Outs': 0.28, 'Hits Allowed': 0.42,
+            'Earned Runs Allowed': 0.70, 'Walks Allowed': 0.75,
+            'Significant Strikes': 0.22, 'Hitter Fantasy Score': 0.40,
+            'Points': 0.26, 'Rebounds': 0.40, 'Assists': 0.45,
+            'Takedowns': 0.55, 'Fight Time (Mins)': 0.30,
+        }
+        sigma = max(0.5, L * sigma_ratios.get(stat_type, 0.40))
+        p_more_val = _phi((sf - L) / sigma) if sigma > 0 else (1.0 if sf > L else 0.0)
+        return p_more_val if side == 'more' else 1.0 - p_more_val
+    except (ValueError, TypeError):
+        return None
+
+
+def _blend_p_true(p_mkt: Optional[float], p_mod: float, p_hr: Optional[float], cfg: Dict) -> float:
+    """
+    Weighted blend: market 50%, model 30%, hit_rate 20%.
+    Falls back gracefully when signals are missing.
+    """
+    w_m = cfg.get('w_market', 0.50)
+    w_p = cfg.get('w_model', 0.30)
+    w_h = cfg.get('w_hitrate', 0.20)
+    haircut = cfg.get('p_haircut', 0.005)
+
+    total_w = 0.0
+    total_p = 0.0
+
+    if p_mkt is not None:
+        total_p += w_m * p_mkt
+        total_w += w_m
+    if p_mod is not None:
+        total_p += w_p * p_mod
+        total_w += w_p
+    if p_hr is not None:
+        total_p += w_h * float(p_hr)
+        total_w += w_h
+
+    if total_w <= 0:
+        return 0.50
+
+    blended = total_p / total_w
+    return _clamp(blended - haircut, 0.01, 0.99)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# run_system_for_game — per-game System run (spec §run_system_for_game)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_system_for_game(
+    game_id: str,
+    tiles:   List[Dict],
+    models:  Dict,
+    sharps:  Dict,
+    context: Dict,
+    cfg:     Dict,
+) -> Dict:
+    """
+    Per-game version of The System per spec:
+      - fair_p_market (weakness attack via sharpFairLine)
+      - blend(p_mkt, p_mod, p_hr) - p_haircut
+      - no_real_signal → kill
+      - build best package across n_legs_options × slip_types
+      - compute_ev → PLAY if ev >= play_ev_min, else LEAN, else NO_GO
+    """
+    # Filter to this game, non-demons only
+    game_tiles = [t for t in tiles if
+                  (t.get('gameId') or t.get('game_id') or '') == game_id
+                  and not (t.get('isDemon') or t.get('is_demon'))]
+
+    scored: List[ScoredLeg] = []
+    for row in game_tiles:
+        player_id = str(row.get('playerId') or row.get('player_id') or row.get('playerName') or '')
+        stat_type = str(row.get('statType') or row.get('stat_type') or '')
+        m   = models.get((player_id, stat_type))
+        sh  = sharps.get(player_id, [])
+        ctx = context.get(player_id, {})
+
+        # Score both sides
+        legs = score_prop(row, m, sh, ctx, cfg)
+
+        # Apply spec blend: replace p_true with fair blend
+        for leg in legs:
+            p_mkt = fair_p_market(row, leg.side)
+            p_hr_raw = row.get('hitRate') or row.get('hit_rate')
+            p_hr = float(p_hr_raw) if p_hr_raw is not None else None
+            if _has_real_signal(row, sh, m):
+                blended = _blend_p_true(p_mkt, leg.p_model, p_hr, cfg)
+                leg = ScoredLeg(
+                    **{**leg.__dict__,
+                       'p_true': blended,
+                       'count': count(blended, leg.p_be_5flex)}
+                )
+                # Re-check floor with blended p
+                if blended < cfg.get('absolute_floor_p', 0.50):
+                    leg.kill_reasons.append('below_floor_blend')
+                    leg.eligible = False
+            scored.append(leg)
+
+    eligible = [s for s in scored if s.eligible]
+
+    if len(eligible) < 2:
+        return {
+            'path': 'NO_GO', 'decision': 'NO_GO', 'status': 'NO_GO',
+            'reason': 'lean_inventory_short', 'best_avg_p': 0.0,
+            'game_id': game_id, 'legs': [],
+        }
+
+    # Build best package across all slip types
+    play_ev_min = cfg.get('play_ev_min', 0.04)
+    lean_ev_min = cfg.get('lean_ev_min', 0.00)
+
+    candidates = []
+    preferred = cfg.get('preferred_slips', ['5_flex', '6_flex'])
+    p_be_map  = cfg.get('p_be', DEFAULT_CFG['p_be'])
+    max_same  = cfg.get('max_same_game_legs', 6)
+
+    for slip in preferred:
+        n      = int(slip.split('_')[0])
+        p_be   = p_be_map.get(slip, 0.543)
+        payouts = PAYOUTS.get(slip, {})
+        if len(eligible) < n:
+            continue
+        pool = sorted(_dedup_pool(eligible), key=lambda x: x.count, reverse=True)
+        for combo in _select_combos(pool, n, max_same):
+            probs = [c.p_true for c in combo]
+            avg_p = sum(probs) / n
+            ev = flex_ev(probs, payouts)
+            candidates.append({
+                'path': 'SYSTEM_FIRE', 'slip_type': slip,
+                'legs': combo, 'avg_p': avg_p, 'p_be': p_be,
+                'package_ev': ev, 'game_id': game_id,
+            })
+
+    if not candidates:
+        return {
+            'path': 'NO_GO', 'decision': 'NO_GO', 'status': 'NO_GO',
+            'reason': 'no_package_clears_gate', 'best_avg_p': 0.0,
+            'game_id': game_id, 'legs': [],
+        }
+
+    best = max(candidates, key=lambda p: p['package_ev'])
+    playable = [p for p in candidates if p['package_ev'] >= play_ev_min]
+
+    if playable:
+        chosen = max(playable, key=lambda p: p['package_ev'])
+        status = 'PLAY'
+        stake_key = 'stake_play'
+    elif best['package_ev'] >= lean_ev_min:
+        chosen = best
+        status = 'LEAN'
+        stake_key = 'stake_lean'
+    else:
+        return {
+            'path': 'NO_GO', 'decision': 'NO_GO', 'status': 'NO_GO',
+            'reason': 'ev_below_lean_floor',
+            'best_ev': round(best['package_ev'], 4),
+            'best_avg_p': round(best['avg_p'], 4),
+            'game_id': game_id, 'legs': [],
+        }
+
+    chosen['path'] = 'SYSTEM_FIRE'
+    chosen['decision'] = 'SYSTEM_FIRE'
+    chosen['status'] = status
+    chosen['stake_pct'] = cfg.get(stake_key, 0.01)
+    return chosen
+
 
 def run_the_system(
     board:   List[Dict],

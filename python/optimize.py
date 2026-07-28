@@ -5,7 +5,7 @@ optimize.py — GOTit optimizer entry point.
 Input  (stdin): JSON array of web-app props (from /api/slate)
 Output (stdout): JSON { game_id: SystemDecision }
 
-Calls The System (leg_selector.run_the_system) per game.
+Calls run_system_for_game (The System spec) per game.
 Demons are handled separately by qualify_demons.py — never mixed here.
 """
 
@@ -19,7 +19,11 @@ from typing import Any, Dict, List
 logging.basicConfig(level=logging.WARNING)
 sys.path.insert(0, str(Path(__file__).parent))
 
-from gotit.leg_selector import run_the_system, format_system_output
+from gotit.leg_selector import (
+    run_system_for_game,
+    format_system_output,
+    DEFAULT_CFG,
+)
 
 log = logging.getLogger(__name__)
 
@@ -37,7 +41,7 @@ def main() -> None:
         print(json.dumps({'error': str(exc)}))
         sys.exit(1)
 
-    # ── Group props by game, strip demons (demon pipeline is separate) ────────
+    # Collect all game IDs from non-demon props
     by_game: Dict[str, List[Dict]] = defaultdict(list)
     for p in props:
         if p.get('isDemon') or p.get('is_demon'):
@@ -50,34 +54,42 @@ def main() -> None:
 
     for game_id, game_props in by_game.items():
         try:
-            decision = run_the_system(
-                board   = game_props,
-                models  = {},
-                sharps  = {},
-                context = {},
+            # run_system_for_game — spec-compliant per-game System
+            decision = run_system_for_game(
+                game_id  = game_id,
+                tiles    = game_props,
+                models   = {},       # no model feed yet
+                sharps   = {},       # sharp quotes via sharpFairLine on prop row
+                context  = {},       # no context feed yet
+                cfg      = DEFAULT_CFG,
             )
-            formatted = format_system_output(decision, slate_id=game_id)
 
-            legs = formatted.get('legs', [])
+            formatted = format_system_output(decision, slate_id=game_id)
+            legs      = formatted.get('legs', [])
+            status    = decision.get('status', decision.get('path', 'NO_GO'))
+
             output[game_id] = {
                 'six_legs':     legs,
                 'two_demons':   [],
                 'system':       formatted,
                 'path':         formatted.get('path', 'NO_GO'),
+                'status':       status,            # PLAY | LEAN | NO_GO
                 'slip_type':    formatted.get('slip_type'),
                 'avg_p':        formatted.get('avg_p'),
                 'p_be':         formatted.get('p_be'),
                 'package_ev':   formatted.get('package_ev'),
                 'no_go_reason': formatted.get('no_go_reason'),
+                'stake_pct':    decision.get('stake_pct'),
             }
         except Exception as exc:
             log.exception('optimize.py: game %s failed', game_id)
             output[game_id] = {
-                'six_legs':   [],
-                'two_demons': [],
-                'path':       'NO_GO',
+                'six_legs':     [],
+                'two_demons':   [],
+                'path':         'NO_GO',
+                'status':       'NO_GO',
                 'no_go_reason': str(exc),
-                'system':     None,
+                'system':       None,
             }
 
     print(json.dumps(output))
