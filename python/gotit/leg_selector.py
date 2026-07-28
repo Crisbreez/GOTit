@@ -89,6 +89,16 @@ PAYOUTS: Dict[str, Dict[int, float]] = {
 }
 
 
+# Multiplier tables (maximize multiplier subject to EV >= play_ev_min)
+MULTIPLIERS: Dict[str, float] = {
+    "2_power": 3.0,
+    "3_power": 5.0,
+    "4_power": 10.0,
+    "5_flex":  10.0,   # all-hit tier
+    "6_flex":  25.0,   # all-hit tier
+}
+
+
 def flex_ev(probs: List[float], payout_by_hits: Dict[int, float], stake: float = 1.0) -> float:
     """Full enumeration over 2^n hit patterns (n <= 6)."""
     n = len(probs)
@@ -688,26 +698,45 @@ def run_system_for_game(
     play_ev_min = cfg.get('play_ev_min', 0.04)
     lean_ev_min = cfg.get('lean_ev_min', 0.00)
 
-    candidates = []
-    preferred = cfg.get('preferred_slips', ['5_flex', '6_flex'])
+    # Score all candidate packages across all slip types
+    # Goal: maximize multiplier subject to EV >= play_ev_min
+    # Among feasible (EV >= play_ev_min): pick highest multiplier
+    # Else: highest EV (LEAN)
+    # Optional ceiling: second slip at 0.25u if EV>0 but high variance
+
+    all_slips = ['2_power', '3_power', '4_power', '5_flex', '6_flex']
     p_be_map  = cfg.get('p_be', DEFAULT_CFG['p_be'])
     max_same  = cfg.get('max_same_game_legs', 6)
 
-    for slip in preferred:
-        n      = int(slip.split('_')[0])
-        p_be   = p_be_map.get(slip, 0.543)
+    candidates = []
+    pool = sorted(_dedup_pool(eligible), key=lambda x: x.count, reverse=True)
+
+    for slip in all_slips:
+        n       = int(slip.split('_')[0])
+        p_be    = p_be_map.get(slip, 0.543)
         payouts = PAYOUTS.get(slip, {})
-        if len(eligible) < n:
+        mult    = MULTIPLIERS.get(slip, 1.0)
+        if len(pool) < n:
             continue
-        pool = sorted(_dedup_pool(eligible), key=lambda x: x.count, reverse=True)
         for combo in _select_combos(pool, n, max_same):
             probs = [c.p_true for c in combo]
             avg_p = sum(probs) / n
-            ev = flex_ev(probs, payouts)
+            if avg_p < p_be * 0.90:   # pre-filter obvious losers
+                continue
+            ev = flex_ev(probs, payouts) if 'flex' in slip else power_ev(probs, mult)
+            # Variance proxy: std dev of probs
+            mean_p = avg_p
+            variance = sum((p - mean_p) ** 2 for p in probs) / n
             candidates.append({
-                'path': 'SYSTEM_FIRE', 'slip_type': slip,
-                'legs': combo, 'avg_p': avg_p, 'p_be': p_be,
-                'package_ev': ev, 'game_id': game_id,
+                'path':       'SYSTEM_FIRE',
+                'slip_type':  slip,
+                'legs':       combo,
+                'avg_p':      avg_p,
+                'p_be':       p_be,
+                'package_ev': ev,
+                'multiplier': mult,
+                'variance':   variance,
+                'game_id':    game_id,
             })
 
     if not candidates:
@@ -717,30 +746,47 @@ def run_system_for_game(
             'game_id': game_id, 'legs': [],
         }
 
-    best = max(candidates, key=lambda p: p['package_ev'])
-    playable = [p for p in candidates if p['package_ev'] >= play_ev_min]
+    # Feasible = EV >= play_ev_min (subject to constraint)
+    feasible = [c for c in candidates if c['package_ev'] >= play_ev_min]
 
-    if playable:
-        chosen = max(playable, key=lambda p: p['package_ev'])
+    ceiling_slip = None
+
+    if feasible:
+        # Primary: among feasible, maximize multiplier (then EV as tiebreak)
+        chosen = max(feasible, key=lambda c: (c['multiplier'], c['package_ev']))
         status = 'PLAY'
         stake_key = 'stake_play'
-    elif best['package_ev'] >= lean_ev_min:
-        chosen = best
-        status = 'LEAN'
-        stake_key = 'stake_lean'
-    else:
-        return {
-            'path': 'NO_GO', 'decision': 'NO_GO', 'status': 'NO_GO',
-            'reason': 'ev_below_lean_floor',
-            'best_ev': round(best['package_ev'], 4),
-            'best_avg_p': round(best['avg_p'], 4),
-            'game_id': game_id, 'legs': [],
-        }
 
-    chosen['path'] = 'SYSTEM_FIRE'
+        # Optional ceiling slip: highest EV feasible slip if it differs from chosen
+        # and has high variance → offer as 0.25u side bet
+        by_ev = max(feasible, key=lambda c: c['package_ev'])
+        if (by_ev['slip_type'] != chosen['slip_type']
+                and by_ev['package_ev'] > chosen['package_ev']
+                and by_ev['variance'] > 0.04):
+            ceiling_slip = {**by_ev, 'stake_pct': 0.0025, 'status': 'CEILING'}
+
+    else:
+        # No feasible — fall back to best EV (LEAN)
+        best = max(candidates, key=lambda c: c['package_ev'])
+        if best['package_ev'] >= lean_ev_min:
+            chosen = best
+            status = 'LEAN'
+            stake_key = 'stake_lean'
+        else:
+            return {
+                'path': 'NO_GO', 'decision': 'NO_GO', 'status': 'NO_GO',
+                'reason': 'ev_below_lean_floor',
+                'best_ev': round(best['package_ev'], 4),
+                'best_avg_p': round(best['avg_p'], 4),
+                'game_id': game_id, 'legs': [],
+            }
+
+    chosen['path']     = 'SYSTEM_FIRE'
     chosen['decision'] = 'SYSTEM_FIRE'
-    chosen['status'] = status
+    chosen['status']   = status
     chosen['stake_pct'] = cfg.get(stake_key, 0.01)
+    if ceiling_slip:
+        chosen['ceiling_slip'] = ceiling_slip
     return chosen
 
 
