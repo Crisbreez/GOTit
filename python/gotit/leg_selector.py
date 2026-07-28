@@ -84,6 +84,55 @@ def p_true_blend(p_model: float, p_sharp: Optional[float], mode: str = "min") ->
 def count(pt: float, p_be: float) -> float:
     return pt - p_be
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Canonical sigma_ratios — single source of truth for all CDF estimates.
+# sigma = line * ratio (floored at 0.5).
+# Hitters and pitchers use the same math — no position bias.
+# Calibrated to approximate real hit-rate dispersion at typical PP line values.
+# ─────────────────────────────────────────────────────────────────────────────
+SIGMA_RATIOS: Dict[str, float] = {
+    # ── MLB Hitter ───────────────────────────────────────────────────────────
+    'Total Bases':          0.38,   # line ~2.5; σ≈0.95 — moderate dispersion
+    'Hits':                 0.42,   # line ~1.0; σ≈0.42 — corrected down from 0.55
+    'Hits+Runs+RBIs':       0.40,   # line ~2.5; σ≈1.0
+    'Hitter Fantasy Score': 0.36,   # line ~7-9; σ≈2.7 — tighter than generic
+    # ── MLB Pitcher ──────────────────────────────────────────────────────────
+    'Pitcher Strikeouts':   0.32,   # line ~4-7; σ≈1.6-2.2
+    'Pitches Thrown':       0.14,   # line ~70-95; σ≈10-13 — tight
+    'Pitching Outs':        0.28,   # line ~12-18; σ≈3.4-5.0
+    'Hits Allowed':         0.42,
+    'Earned Runs Allowed':  0.70,
+    'Walks Allowed':        0.75,
+    'Pitcher Fantasy Score':0.34,
+    # ── MMA / UFC ────────────────────────────────────────────────────────────
+    'Significant Strikes':       0.22,
+    'Round 1 Significant Strikes': 0.28,
+    'R1 Significant Strikes':    0.28,
+    'Total Strikes':             0.25,
+    'Takedowns':                 0.55,
+    'Fight Time (Mins)':         0.30,
+    'Fight Time':                0.30,
+    'Knockdowns':                0.90,
+    'Submission Attempts':       0.85,
+    # ── NBA ─────────────────────────────────────────────────────────────────
+    'Points':                    0.26,
+    'Rebounds':                  0.40,
+    'Assists':                   0.45,
+    'Points+Rebounds+Assists':   0.28,
+    'Fantasy Score':             0.40,
+    # ── NFL ──────────────────────────────────────────────────────────────────
+    'Rushing Attempts':          0.35,
+    'Receiving Yards':           0.45,
+    'Passing Yards':             0.22,
+    'Rushing Yards':             0.40,
+}
+
+
+def _sigma_for(stat_type: str, line: float) -> float:
+    """Return calibrated sigma for a stat/line pair. Never below 0.5."""
+    ratio = SIGMA_RATIOS.get(stat_type, 0.40)
+    return max(0.5, line * ratio)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Payout tables (PrizePicks standard)
@@ -394,20 +443,7 @@ def _estimate_mu_sigma(row: Dict, sharps: List[Dict]) -> Tuple[float, float]:
     L = float(row.get('lineScore', row.get('line', 0)) or 0)
     stat_type = str(row.get('statType', row.get('stat_type', '')) or '')
 
-    sigma_ratios = {
-        'Total Bases': 0.38, 'Hits': 0.55, 'Hits+Runs+RBIs': 0.40,
-        'Pitcher Strikeouts': 0.32, 'Pitches Thrown': 0.14,
-        'Pitching Outs': 0.28, 'Hits Allowed': 0.42,
-        'Earned Runs Allowed': 0.70, 'Walks Allowed': 0.75,
-        'Significant Strikes': 0.22,
-        'Round 1 Significant Strikes': 0.28,
-        'R1 Significant Strikes': 0.28, 'Hitter Fantasy Score': 0.40,
-        'Points': 0.26, 'Rebounds': 0.40, 'Assists': 0.45,
-        'Points+Rebounds+Assists': 0.28, 'Takedowns': 0.55,
-        'Fight Time': 0.30, 'Rushing Attempts': 0.35,
-        'Strikeouts': 0.32, 'Fantasy Score': 0.40,
-    }
-    sigma = max(0.5, L * sigma_ratios.get(stat_type, 0.40))
+    sigma = _sigma_for(stat_type, L)
 
     # Sharp-informed mu — ONLY real sharp lines, never L * constant
     sharp_lines = [q.get('line', None) for q in sharps if q.get('line') is not None]
@@ -482,16 +518,7 @@ def _conf_score(
         try:
             sf = float(sharp_fair)
             stat_type = str(row.get('statType', row.get('stat_type', '')) or '')
-            sigma_ratios = {
-                'Total Bases': 0.38, 'Hits': 0.55, 'Hits+Runs+RBIs': 0.40,
-                'Pitcher Strikeouts': 0.32, 'Pitches Thrown': 0.14,
-                'Pitching Outs': 0.28, 'Hits Allowed': 0.42,
-                'Earned Runs Allowed': 0.70, 'Walks Allowed': 0.75,
-                'Significant Strikes': 0.22, 'Hitter Fantasy Score': 0.40,
-                'Points': 0.26, 'Rebounds': 0.40, 'Assists': 0.45,
-                'Takedowns': 0.55, 'Fight Time (Mins)': 0.30,
-            }
-            sigma = max(0.5, L * sigma_ratios.get(stat_type, 0.40))
+            sigma = _sigma_for(stat_type, L)
             p_more_val = _phi((sf - L) / sigma) if sigma > 0 else 0.5
             p_mkt_val = p_more_val if side == 'more' else 1.0 - p_more_val
         except (ValueError, TypeError):
@@ -878,16 +905,7 @@ def fair_p_market(row: Dict, side: str) -> Optional[float]:
         sf = float(sharp_fair)
         L  = float(row.get('lineScore', row.get('line', 0)) or 0)
         stat_type = str(row.get('statType', row.get('stat_type', '')) or '')
-        sigma_ratios = {
-            'Total Bases': 0.38, 'Hits': 0.55, 'Hits+Runs+RBIs': 0.40,
-            'Pitcher Strikeouts': 0.32, 'Pitches Thrown': 0.14,
-            'Pitching Outs': 0.28, 'Hits Allowed': 0.42,
-            'Earned Runs Allowed': 0.70, 'Walks Allowed': 0.75,
-            'Significant Strikes': 0.22, 'Hitter Fantasy Score': 0.40,
-            'Points': 0.26, 'Rebounds': 0.40, 'Assists': 0.45,
-            'Takedowns': 0.55, 'Fight Time (Mins)': 0.30,
-        }
-        sigma = max(0.5, L * sigma_ratios.get(stat_type, 0.40))
+        sigma = _sigma_for(stat_type, L)
         p_more_val = _phi((sf - L) / sigma) if sigma > 0 else (1.0 if sf > L else 0.0)
         return p_more_val if side == 'more' else 1.0 - p_more_val
     except (ValueError, TypeError):
