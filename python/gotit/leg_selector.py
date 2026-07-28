@@ -156,6 +156,12 @@ DEFAULT_CFG: Dict[str, Any] = {
     "w_model":           0.30,    # mu/sigma model weight
     "w_hitrate":         0.20,    # historical hit rate weight
     "p_haircut":         0.005,   # small haircut on blended p_true
+    # Sample-size / games-played gates
+    "min_games_played":      5,    # kill if n_games < this AND no p_mkt AND no non-prior model
+    "min_games_lean_only":  10,    # cap to LEAN tier if n_games < this (soft gate)
+    "min_hit_rate_sample":   5,    # hit_rate only counts as signal if n >= this
+    "sample_shrink_n":      10,    # denominator for sample_factor = clamp(n/10, 0, 1)
+    "min_role_score_callup": 0.7,  # role_score must be >= this for call-ups
 }
 
 
@@ -183,10 +189,15 @@ class ScoredLeg:
     eligible:    bool
     kill_reasons: List[str]
     # raw prop fields for frontend
-    is_demon:    bool = False
-    is_goblin:   bool = False
-    sport:       str  = ''
-    team:        str  = ''
+    is_demon:      bool  = False
+    is_goblin:     bool  = False
+    sport:         str   = ''
+    team:          str   = ''
+    # sample-quality fields
+    sample_factor: float = 1.0   # clamp(n_games/10, 0, 1)
+    low_confidence: bool = False  # sample_factor < 0.5
+    lean_only:     bool  = False  # soft cap: n_games < min_games_lean_only
+    n_games:       int   = 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -290,35 +301,68 @@ def _detect_traps(row: Dict, side: str, ctx: Dict, cfg: Dict) -> List[str]:
 # Score one prop → two ScoredLegs (Section 5)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _has_real_signal(row: Dict, sharps: List[Dict], model: Optional[Dict]) -> bool:
+def _sample_fields(row: Dict) -> Tuple[int, int]:
+    """
+    Extract (n_games, n_hit_rate_sample) from prop row.
+    Looks for gamesPlayed / games_played / nGames / sample_n etc.
+    Returns (0, 0) if not present.
+    """
+    n_games = int(
+        row.get('gamesPlayed') or row.get('games_played') or
+        row.get('nGames') or row.get('n_games') or
+        row.get('sampleN') or row.get('sample_n') or 0
+    )
+    n_hr = int(
+        row.get('hitRateSample') or row.get('hit_rate_sample') or
+        row.get('nHitRate') or row.get('n_hit_rate') or
+        n_games  # fall back to n_games if specific sample not given
+    )
+    return n_games, n_hr
+
+
+def _has_real_signal(row: Dict, sharps: List[Dict], model: Optional[Dict],
+                     cfg: Optional[Dict] = None) -> bool:
     """
     True only when at least one real external signal exists.
     mu = line * 1.05 or line * 1.03 are NOT real signals.
+    hit_rate only counts if n_hit_rate >= min_hit_rate_sample.
     """
+    min_hr_n = (cfg or DEFAULT_CFG).get('min_hit_rate_sample', 5)
+
+    # p_mkt via sharpFairLine or live sharps quotes
+    p_mkt_present = bool(
+        (row.get('sharpFairLine') or row.get('sharp_fair_line')) or sharps
+    )
+    if p_mkt_present:
+        return True
+
+    # Non-prior model (mu/sigma injected externally, not derived from line)
     if model:
         return True
-    if sharps:
-        return True
+
     # Real data fields on the prop itself
-    mu_raw      = float(row.get('mu', 0) or 0)
-    sigma_raw   = float(row.get('sigma', 0) or 0)
-    hit_rate    = row.get('hitRate')        or row.get('hit_rate')
-    avg_stat    = row.get('avgStat')        or row.get('avg_stat')
-    sharp_gap   = abs(float(row.get('sharpGap',   row.get('sharp_gap',   0)) or 0))
-    line_move   = abs(float(row.get('lineMove',   row.get('line_move',   0)) or 0))
-    shade       = row.get('ppShadeSignal')  or row.get('pp_shade_signal') or ''
-    line_moves  = int(row.get('lineMoveCount', row.get('line_move_count', 0)) or 0)
-    sharp_fair  = row.get('sharpFairLine')  or row.get('sharp_fair_line')
+    mu_raw    = float(row.get('mu', 0) or 0)
+    sigma_raw = float(row.get('sigma', 0) or 0)
+    avg_stat  = row.get('avgStat') or row.get('avg_stat')
+    sharp_gap = abs(float(row.get('sharpGap',  row.get('sharp_gap',  0)) or 0))
+    line_move = abs(float(row.get('lineMove',  row.get('line_move',  0)) or 0))
+    shade     = row.get('ppShadeSignal') or row.get('pp_shade_signal') or ''
+    line_moves = int(row.get('lineMoveCount', row.get('line_move_count', 0)) or 0)
+
+    # hit_rate only counts if sample is large enough
+    _, n_hr = _sample_fields(row)
+    hit_rate_raw = row.get('hitRate') or row.get('hit_rate')
+    hit_rate_valid = (hit_rate_raw is not None) and (n_hr >= min_hr_n)
+
     return (
         mu_raw > 0
         or sigma_raw > 0
-        or hit_rate is not None
+        or hit_rate_valid
         or avg_stat is not None
         or sharp_gap > 0.01
         or line_move > 0.01
         or shade not in ('', 'no_data', None)
         or line_moves > 0
-        or sharp_fair is not None
     )
 
 
@@ -373,7 +417,36 @@ def score_prop(row: Dict, model: Optional[Dict], sharps: List[Dict],
     sport     = str(row.get('sport') or '')
     team      = str(row.get('teamAbbr') or row.get('team') or '')
 
-    has_signal = _has_real_signal(row, sharps, model)
+    has_signal = _has_real_signal(row, sharps, model, cfg)
+
+    # ── Sample-size fields ──────────────────────────────────────────────────
+    n_games, n_hr = _sample_fields(row)
+    min_games        = cfg.get('min_games_played', 5)
+    min_games_lean   = cfg.get('min_games_lean_only', 10)
+    min_hr_n         = cfg.get('min_hit_rate_sample', 5)
+    shrink_n         = cfg.get('sample_shrink_n', 10)
+    min_role_callup  = cfg.get('min_role_score_callup', 0.7)
+
+    # sample_factor: shrinks p_true back to 50/50 when sample is thin
+    sample_factor = _clamp(n_games / shrink_n if n_games > 0 else 0.0, 0.0, 1.0)
+    # If n_games is unknown (0) but we have p_mkt → trust the market, don't shrink
+    p_mkt_present = bool(row.get('sharpFairLine') or row.get('sharp_fair_line') or sharps)
+    if n_games == 0 and p_mkt_present:
+        sample_factor = 1.0
+
+    # Call-up / role flag
+    is_callup = bool(ctx.get('is_callup') or ctx.get('callup'))
+    role_score = float(ctx.get('role_score', 1.0) or 1.0)
+
+    # Hard kill: too few games AND no market AND no model → not slipable
+    no_market_no_model = not p_mkt_present and not model
+    sample_kill = (
+        n_games > 0
+        and n_games < min_games
+        and no_market_no_model
+    )
+    # Role kill for call-ups with unconfirmed role
+    role_kill = is_callup and role_score < min_role_callup
 
     if model:
         mu    = float(model.get('mu', L) or L)
@@ -406,10 +479,17 @@ def score_prop(row: Dict, model: Optional[Dict], sharps: List[Dict],
         if is_demon and side == 'less':
             continue
 
-        pt = p_true_blend(pm, ps_raw, cfg.get('p_true_mode', 'min'))
+        pt_raw = p_true_blend(pm, ps_raw, cfg.get('p_true_mode', 'min'))
+
+        # ── Sample shrinkage: p_true_adj = 0.5 + (p_true - 0.5) * sample_factor ──
+        pt = 0.5 + (pt_raw - 0.5) * sample_factor
+
         ps = ps_raw if ps_raw is not None else pm
         gap = _sharp_gap(sharps, L, side)
         traps = _detect_traps(row, side, ctx, cfg)
+
+        # Low sample_factor → low confidence flag
+        low_confidence = sample_factor < 0.5
 
         kills: List[str] = []
         if ctx.get('news_kill', False):
@@ -428,8 +508,14 @@ def score_prop(row: Dict, model: Optional[Dict], sharps: List[Dict],
             kills.append('mma_sig_strikes_less_trap')
         if not has_signal:
             kills.append('no_real_signal')
+        if sample_kill:
+            kills.append('thin_sample')       # hard kill: < min_games, no market/model
+        if role_kill:
+            kills.append('callup_role_unconfirmed')
 
         eligible = len(kills) == 0
+        # Soft gate: n_games < min_games_lean_only → cap at LEAN (flag only, not kill)
+        lean_only = n_games > 0 and n_games < min_games_lean and not sample_kill
 
         legs.append(ScoredLeg(
             prop_id      = prop_id,
@@ -447,12 +533,16 @@ def score_prop(row: Dict, model: Optional[Dict], sharps: List[Dict],
             sharp_gap    = gap,
             fragility    = frag,
             trap_flags   = traps,
-            eligible     = eligible,
-            kill_reasons = kills,
-            is_demon     = is_demon,
-            is_goblin    = is_goblin,
-            sport        = sport,
-            team         = team,
+            eligible       = eligible,
+            kill_reasons   = kills,
+            is_demon       = is_demon,
+            is_goblin      = is_goblin,
+            sport          = sport,
+            team           = team,
+            sample_factor  = sample_factor,
+            low_confidence = low_confidence,
+            lean_only      = lean_only,
+            n_games        = n_games,
         ))
 
     return legs
@@ -781,6 +871,16 @@ def run_system_for_game(
                 'game_id': game_id, 'legs': [],
             }
 
+    # Soft gate: if ANY leg in chosen is lean_only → cap to LEAN
+    chosen_legs = chosen.get('legs', [])
+    if status == 'PLAY' and any(
+        getattr(leg, 'lean_only', False) for leg in chosen_legs
+    ):
+        status    = 'LEAN'
+        stake_key = 'stake_lean'
+        # also cap ceiling slip (remove it — LEAN doesn't offer ceiling)
+        ceiling_slip = None
+
     chosen['path']     = 'SYSTEM_FIRE'
     chosen['decision'] = 'SYSTEM_FIRE'
     chosen['status']   = status
@@ -863,10 +963,14 @@ def _leg_to_dict(leg: ScoredLeg) -> Dict:
         'fragility':   round(leg.fragility, 3),
         'traps':       leg.trap_flags,
         'kill_reasons': leg.kill_reasons,
-        'eligible':    leg.eligible,
-        'game_id':     leg.game_id,
-        'is_demon':    leg.is_demon,
-        'is_goblin':   leg.is_goblin,
+        'eligible':        leg.eligible,
+        'game_id':         leg.game_id,
+        'is_demon':        leg.is_demon,
+        'is_goblin':       leg.is_goblin,
+        'sample_factor':   round(getattr(leg, 'sample_factor', 1.0), 3),
+        'low_confidence':  getattr(leg, 'low_confidence', False),
+        'lean_only':       getattr(leg, 'lean_only', False),
+        'n_games':         getattr(leg, 'n_games', 0),
     }
 
 
