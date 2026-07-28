@@ -716,6 +716,200 @@ def slip_to_dict(p: SlipPlan) -> Dict[str, Any]:
 
 
 # =============================================================================
+# PropContext — 6-factor prop context scorer
+# Factors:
+#   1. role         — expected usage (minutes, PA, pitch count, snap%)
+#   2. matchup      — opponent defense, pitcher handedness, stack context
+#   3. game_env     — total, pace, spread/script, weather, park
+#   4. recent_form  — L5/L10 rate vs baseline (baked in the number — context only)
+#   5. market_anchor— where sharp books sit on similar props
+#   6. liability    — move or limited (sharp action, steam, reverse)
+# =============================================================================
+
+@dataclass
+class PropContext:
+    # Factor 1 — Role
+    role_confirmed: bool = True       # starter/regular, not capped
+    role_score: float = 0.75          # 0–1; 1 = full usage confirmed
+    usage_cap_risk: float = 0.0       # 0–1; injury/rest/limit risk
+    is_callup: bool = False
+
+    # Factor 2 — Matchup
+    opp_rank: float = 0.50            # 0–1; 1 = weakest opponent
+    pitcher_adv: float = 0.50         # 0–1; 1 = big platoon / handedness adv
+    stack_context: float = 0.50       # 0–1; 1 = strong positive game stack
+
+    # Factor 3 — Game environment
+    game_total: float = 0.0           # O/U total (0 = unknown)
+    game_total_z: float = 0.0         # z-score vs league avg total (+= more runs/pts)
+    pace_factor: float = 0.50         # 0–1; 1 = fast pace (helps volume stats)
+    park_factor: float = 0.50         # 0–1; 1 = hitter-friendly park
+    spread_script: float = 0.0        # positive = favored (usage preservation)
+    weather_risk: float = 0.0         # 0–1; 1 = high weather kill risk
+    bullpen_day: bool = False
+
+    # Factor 4 — Recent form (context only — baked into line)
+    l10_rate: Optional[float] = None  # fraction of last 10 games that hit (prop-specific)
+    baseline_rate: Optional[float] = None  # season baseline hit rate
+    form_trend: float = 0.0           # +1 = hot, -1 = cold, 0 = neutral
+
+    # Factor 5 — Market anchor
+    book_consensus: Optional[float] = None  # 0–1 fair P from sharp books
+    line_move: float = 0.0            # units moved (positive = moved up/harder)
+    line_move_count: int = 0          # number of moves
+
+    # Factor 6 — Liability / sharp action
+    sharp_action: float = 0.0        # 0–1; 1 = heavy sharp action on More
+    reverse_line_move: bool = False   # public on under, sharp on more
+    is_limited: bool = False          # book limiting bets (too sharp)
+    liability_flag: bool = False      # book moving for liability (move = fade signal)
+
+
+def score_prop_context(ctx: PropContext) -> Dict[str, float]:
+    """
+    Convert a PropContext into scored components used by both
+    The System (leg_selector ctx dict) and Demontime (RawLeg fields).
+
+    Returns dict with:
+      role_score      → RawLeg.role_score, conf_score factor 'role_locked'
+      ctx_score       → RawLeg.ctx_score (matchup + env composite)
+      boost_score     → RawLeg.boost_score (sharp action / liability edge)
+      matchup_score   → leg_selector ctx['matchup_score']
+      park_boost      → leg_selector ctx['park_boost']
+      pace_boost      → leg_selector ctx['pace_boost']
+      pitcher_adv     → leg_selector ctx['pitcher_adv']
+      game_total_boost→ leg_selector ctx['game_total_boost']
+      news_kill       → leg_selector ctx['news_kill'] (bool)
+      weather_risk    → leg_selector ctx['weather_risk']
+      fragility       → pre-computed fragility float (passed to _fragility_score)
+      form_edge       → mild signal from form trend (not a primary driver)
+    """
+    # ── Factor 1: Role ───────────────────────────────────────────────────────
+    role_score = clamp(ctx.role_score * (1.0 - ctx.usage_cap_risk * 0.5), 0.0, 1.0)
+    if ctx.is_callup:
+        role_score = clamp(role_score * 0.6, 0.0, 1.0)  # call-up penalty
+
+    # ── Factor 2: Matchup ────────────────────────────────────────────────────
+    matchup_raw = (ctx.opp_rank * 0.40 + ctx.pitcher_adv * 0.35 + ctx.stack_context * 0.25)
+    matchup_score = clamp(matchup_raw, 0.0, 1.0)
+    pitcher_adv   = clamp(ctx.pitcher_adv, 0.0, 1.0)
+
+    # ── Factor 3: Game environment ───────────────────────────────────────────
+    total_boost = clamp(0.5 + ctx.game_total_z * 0.20, 0.0, 1.0)
+    park_boost  = clamp(ctx.park_factor, 0.0, 1.0)
+    pace_boost  = clamp(ctx.pace_factor, 0.0, 1.0)
+    env_score   = (total_boost * 0.40 + park_boost * 0.30 + pace_boost * 0.30)
+
+    # Script: if team heavily favored, volume risk late (negative)
+    script_pen = clamp(-ctx.spread_script * 0.02, 0.0, 0.10) if ctx.spread_script < -7 else 0.0
+    env_score  = clamp(env_score - script_pen, 0.0, 1.0)
+
+    # ── Factor 4: Recent form (mild — line already prices it) ────────────────
+    form_edge = 0.0
+    if ctx.l10_rate is not None and ctx.baseline_rate is not None and ctx.baseline_rate > 0:
+        # Deviation from baseline, capped at ±0.1 edge
+        form_edge = clamp((ctx.l10_rate - ctx.baseline_rate) * 0.5, -0.10, 0.10)
+    form_edge += clamp(ctx.form_trend * 0.03, -0.06, 0.06)
+
+    # ── Factor 5: Market anchor ──────────────────────────────────────────────
+    # Line moving up = harder; line_move_count > 2 = market has seen it
+    line_move_pen = clamp(ctx.line_move * 0.02, 0.0, 0.08)  # upward moves hurt
+    market_confidence = 0.0
+    if ctx.book_consensus is not None:
+        market_confidence = clamp(ctx.book_consensus - 0.5, 0.0, 0.30)  # edge above 50
+
+    # ── Factor 6: Liability / sharp action ──────────────────────────────────
+    # Sharp action on More = positive signal; liability move (book moving) = caution
+    sharp_edge = 0.0
+    if ctx.reverse_line_move:
+        sharp_edge = 0.15  # sharp on More despite public fading
+    elif ctx.sharp_action > 0.6:
+        sharp_edge = clamp((ctx.sharp_action - 0.6) / 0.4 * 0.10, 0.0, 0.10)
+
+    liability_pen = 0.08 if ctx.liability_flag else 0.0
+    limited_boost = 0.05 if ctx.is_limited else 0.0  # limits = sharp agreed
+    boost_score = clamp(0.50 + sharp_edge + limited_boost - liability_pen, 0.0, 1.0)
+
+    # ── Composite ctx_score (matchup + env + form mild + market) ────────────
+    ctx_score = clamp(
+        matchup_score * 0.35
+        + env_score   * 0.35
+        + market_confidence * 0.20
+        + form_edge   * 0.10
+        - line_move_pen,
+        0.0, 1.0
+    )
+
+    # ── Kill flags ───────────────────────────────────────────────────────────
+    news_kill    = (ctx.usage_cap_risk >= 0.90) or (ctx.weather_risk >= 0.90)
+    weather_risk = ctx.weather_risk
+    bullpen_day  = ctx.bullpen_day
+    fragility    = clamp(
+        ctx.usage_cap_risk * 0.30
+        + ctx.weather_risk * 0.25
+        + (0.20 if ctx.bullpen_day else 0.0)
+        + (0.15 if not ctx.role_confirmed else 0.0)
+        + (0.10 if ctx.is_callup else 0.0),
+        0.0, 1.0
+    )
+
+    return {
+        "role_score":       round(role_score, 3),
+        "ctx_score":        round(ctx_score, 3),
+        "boost_score":      round(boost_score, 3),
+        "matchup_score":    round(matchup_score, 3),
+        "park_boost":       round(park_boost, 3),
+        "pace_boost":       round(pace_boost, 3),
+        "pitcher_adv":      round(pitcher_adv, 3),
+        "game_total_boost": round(total_boost, 3),
+        "game_total_z":     round(ctx.game_total_z, 3),
+        "form_edge":        round(form_edge, 4),
+        "sharp_edge":       round(sharp_edge, 3),
+        "market_confidence":round(market_confidence, 3),
+        "news_kill":        news_kill,
+        "weather_risk":     round(weather_risk, 3),
+        "bullpen_day":      bullpen_day,
+        "fragility":        round(fragility, 3),
+        "role_confirmed":   ctx.role_confirmed,
+        "is_callup":        ctx.is_callup,
+    }
+
+
+def prop_context_from_dict(d: Dict[str, Any]) -> PropContext:
+    """
+    Build a PropContext from a flat dict of prop/context fields.
+    Used by prop_to_raw_leg when context data is embedded on the prop row.
+    All fields are optional — missing fields use PropContext defaults.
+    """
+    return PropContext(
+        role_confirmed   = bool(d.get('role_confirmed', True)),
+        role_score       = float(d.get('role_score', 0.75) or 0.75),
+        usage_cap_risk   = float(d.get('usage_cap_risk', 0) or 0),
+        is_callup        = bool(d.get('is_callup') or d.get('callup')),
+        opp_rank         = float(d.get('opp_rank', 0.50) or 0.50),
+        pitcher_adv      = float(d.get('pitcher_adv', 0.50) or 0.50),
+        stack_context    = float(d.get('stack_context', 0.50) or 0.50),
+        game_total       = float(d.get('game_total', 0) or 0),
+        game_total_z     = float(d.get('game_total_z', 0) or 0),
+        pace_factor      = float(d.get('pace_factor', 0.50) or 0.50),
+        park_factor      = float(d.get('park_factor', 0.50) or 0.50),
+        spread_script    = float(d.get('spread_script', 0) or 0),
+        weather_risk     = float(d.get('weather_risk', 0) or 0),
+        bullpen_day      = bool(d.get('bullpen_day')),
+        l10_rate         = float(d['l10_rate']) if d.get('l10_rate') is not None else None,
+        baseline_rate    = float(d['baseline_rate']) if d.get('baseline_rate') is not None else None,
+        form_trend       = float(d.get('form_trend', 0) or 0),
+        book_consensus   = float(d['book_consensus']) if d.get('book_consensus') is not None else None,
+        line_move        = float(d.get('lineMove', d.get('line_move', 0)) or 0),
+        line_move_count  = int(d.get('lineMoveCount', d.get('line_move_count', 0)) or 0),
+        sharp_action     = float(d.get('sharp_action', 0) or 0),
+        reverse_line_move= bool(d.get('reverse_line_move')),
+        is_limited       = bool(d.get('is_limited')),
+        liability_flag   = bool(d.get('liability_flag')),
+    )
+
+
+# =============================================================================
 # Live data adapter — converts GOTit DB props → RawLeg
 # =============================================================================
 
@@ -766,15 +960,36 @@ def prop_to_raw_leg(prop: Dict[str, Any]) -> Optional[RawLeg]:
         if team:
             corr_keys.append(f"team:{team}")
 
+        # Build PropContext from embedded fields on the prop row
+        pctx = prop_context_from_dict(prop)
+        scores = score_prop_context(pctx)
+
         return RawLeg(
             leg_id=prop_id, game_id=game_id, player_id=player_id,
             player_name=player, team=team, opponent=opponent,
             stat_type=stat_type, line=line, side="MORE",
             is_demon=is_demon, is_goblin=is_goblin,
             proj_mean=proj_mean, market=market,
-            role_score=0.80, ctx_score=0.50, boost_score=0.60 if is_demon else 0.0,
+            role_score=scores["role_score"],
+            ctx_score=scores["ctx_score"],
+            boost_score=scores["boost_score"] if not is_demon else clamp(scores["boost_score"] + 0.10, 0.0, 1.0),
             correlation_keys=corr_keys,
-            meta={"league": league},
+            meta={
+                "league":           league,
+                "news_kill":        scores["news_kill"],
+                "weather_risk":     scores["weather_risk"],
+                "bullpen_day":      scores["bullpen_day"],
+                "fragility":        scores["fragility"],
+                "matchup_score":    scores["matchup_score"],
+                "park_boost":       scores["park_boost"],
+                "pace_boost":       scores["pace_boost"],
+                "pitcher_adv":      scores["pitcher_adv"],
+                "game_total_boost": scores["game_total_boost"],
+                "form_edge":        scores["form_edge"],
+                "sharp_edge":       scores["sharp_edge"],
+                "role_confirmed":   scores["role_confirmed"],
+                "is_callup":        scores["is_callup"],
+            },
         )
     except Exception:
         return None

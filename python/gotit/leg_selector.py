@@ -16,6 +16,15 @@ Non-negotiable rules:
 
 from __future__ import annotations
 
+# PropContext helpers (re-used from gotit_engine)
+try:
+    import sys, os
+    sys.path.insert(0, os.path.dirname(__file__))
+    from gotit_engine import PropContext, prop_context_from_dict, score_prop_context as _engine_score_ctx
+    _HAVE_ENGINE_CTX = True
+except Exception:
+    _HAVE_ENGINE_CTX = False
+
 import json
 import logging
 import math
@@ -948,6 +957,15 @@ def run_system_for_game(
         sh  = sharps.get(player_id, [])
         ctx = context.get(player_id, {})
 
+        # Enrich ctx with PropContext 6-factor scores from the prop row
+        if _HAVE_ENGINE_CTX:
+            try:
+                _pctx   = prop_context_from_dict({**ctx, **row})
+                _scores = _engine_score_ctx(_pctx)
+                ctx = {**ctx, **_scores}
+            except Exception:
+                pass  # fall back to raw ctx if engine unavailable
+
         # Score both sides
         legs = score_prop(row, m, sh, ctx, cfg)
 
@@ -1105,7 +1123,15 @@ def run_the_system(
         stat_type = str(row.get('statType') or row.get('stat_type') or '')
         m   = models.get((player_id, stat_type))
         sh  = sharps.get(player_id, [])
-        ctx = context.get(player_id, {})
+        ctx = dict(context.get(player_id, {}))
+        # Enrich ctx with PropContext 6-factor scores from the prop row
+        if _HAVE_ENGINE_CTX:
+            try:
+                _pctx   = prop_context_from_dict({**ctx, **row})
+                _scores = _engine_score_ctx(_pctx)
+                ctx = {**ctx, **_scores}
+            except Exception:
+                pass
         scored.extend(score_prop(row, m, sh, ctx, cfg))
 
     # Validate sides
