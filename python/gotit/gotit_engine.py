@@ -60,6 +60,12 @@ class GotitConfig:
     flex_be_delta: float = -0.04
     demon_be_relief: float = 0.012
     goblin_be_tax: float = 0.015
+    # Demontime misprice scoring — PP alt-line fixed-multiplier edge
+    w_misprice: float = 0.12          # weight in Demontime final score
+    misprice_bump_sweet_spot: float = 0.5  # ideal bump size (±0.5 = full credit)
+    misprice_bump_max: float = 2.0    # bump > this → edge collapses
+    misprice_mult_jump_min: float = 2.0    # multiplier jump must be >= this to count
+    misprice_p_true_min: float = 0.50      # books/model must still like More at demon line
 
 
 class Tier(str, Enum):
@@ -281,6 +287,60 @@ def compute_p_true(leg: RawLeg, cfg: GotitConfig) -> Tuple[float, Optional[float
     return clamp(p, 0.01, 0.99), p_m, p_p, flags
 
 
+def misprice_score(leg: RawLeg, p_true: float, cfg: GotitConfig) -> float:
+    """
+    PP Demon alt-line misprice edge scorer.
+
+    PrizePicks pairs a harder More line with a fixed multiplier boost.
+    The edge is:
+      • line only moved a little (+0.5-ish from standard)  →  difficulty barely up
+      • multiplier jump is large                            →  payout disproportionate
+      • books/model still like More at that number         →  p_true >= threshold
+
+    Returns 0.0–1.0.  0.0 = no misprice edge; 1.0 = peak misprice.
+    """
+    if leg.standard_line is None:
+        return 0.0
+
+    bump = leg.line - leg.standard_line  # how much harder the demon line is
+    if bump <= 0:
+        return 0.0  # line didn't actually move up — not a demon alt-line scenario
+
+    # ── Bump-size score: sweet spot near +0.5, falls off for larger bumps ──
+    sweet  = cfg.misprice_bump_sweet_spot  # 0.5
+    b_max  = cfg.misprice_bump_max         # 2.0
+    if bump <= sweet:
+        # Small bump — very little extra difficulty, near-full credit
+        bump_score = bump / sweet
+    else:
+        # Larger bump — difficulty increases faster than payout scales
+        bump_score = clamp(1.0 - (bump - sweet) / (b_max - sweet), 0.0, 1.0)
+
+    # ── Multiplier-jump score: large jump = large edge ──────────────────────
+    # Estimate multiplier jump from demon boost_score field (0–1 proxy)
+    # boost_score=1.0 ≈ max demon multiplier; boost_score=0 ≈ no boost
+    # Also use leg.meta if it carries an explicit mult_jump
+    mult_jump = float(leg.meta.get('mult_jump', 0) or 0)
+    if mult_jump == 0:
+        # Fall back to boost_score as a proxy for mult jump magnitude
+        # boost_score maps linearly to implied mult jump 0→ min, 1→ ~5x
+        mult_jump = leg.boost_score * 5.0
+    min_jump = cfg.misprice_mult_jump_min  # 2.0
+    mult_score = clamp((mult_jump - min_jump) / 3.0, 0.0, 1.0)
+
+    # ── Market-still-likes-More gate ─────────────────────────────────────────
+    p_min = cfg.misprice_p_true_min  # 0.50
+    if p_true < p_min:
+        return 0.0  # books don't like More at demon line — no misprice edge
+
+    # Slight boost if p_true well clear of line
+    p_confidence = clamp((p_true - p_min) / 0.15, 0.0, 1.0)
+
+    # ── Composite ─────────────────────────────────────────────────────────────
+    score = 0.45 * bump_score + 0.35 * mult_score + 0.20 * p_confidence
+    return clamp(score, 0.0, 1.0)
+
+
 def bump_quality(leg: RawLeg) -> Tuple[Optional[float], float]:
     if leg.standard_line is None:
         return None, 0.45
@@ -318,11 +378,28 @@ def score_leg(leg: RawLeg, p_need: float, cfg: GotitConfig) -> ScoredLeg:
 
     kill_pen = 0.25 if leg.killed else 0.0
 
+    # Misprice edge — Demontime only: alt-line bump vs multiplier-jump vs p_true
+    misprice = 0.0
+    misprice_flag = ""
+    if leg.is_demon:
+        misprice = misprice_score(leg, p_true, cfg)
+        if misprice >= 0.6:
+            misprice_flag = f"misprice_edge={misprice:.2f}"
+            flags.append(misprice_flag)
+        elif misprice >= 0.3:
+            flags.append(f"misprice_moderate={misprice:.2f}")
+
+    # Adjust w_bump for demons: standard bump_quality captures difficulty only;
+    # replace with misprice when demon to avoid double-counting bump penalty
+    w_bump_eff = 0.0 if leg.is_demon else cfg.w_bump
+    w_misprice_eff = cfg.w_misprice if leg.is_demon else 0.0
+
     s = (
         cfg.w_p_true * p_true
         + cfg.w_p_edge * clamp(p_edge, -0.25, 0.25)
         + cfg.w_gap * tanh_norm(gap, 1.0)
-        + cfg.w_bump * bq
+        + w_bump_eff * bq
+        + w_misprice_eff * misprice
         + cfg.w_boost * clamp(leg.boost_score, 0.0, 1.0)
         + cfg.w_role * clamp(leg.role_score, 0.0, 1.0)
         + cfg.w_ctx * clamp(leg.ctx_score, 0.0, 1.0)
@@ -334,6 +411,7 @@ def score_leg(leg: RawLeg, p_need: float, cfg: GotitConfig) -> ScoredLeg:
         f"p_true={p_true:.3f}; need={p_need:.3f}; edge={p_edge:+.3f}; "
         f"gap={gap:+.2f}; role={leg.role_score:.2f}"
         + (f"; bump={bump:+.2f}" if bump is not None else "")
+        + (f"; misprice={misprice:.2f}" if leg.is_demon else "")
         + ("; DEMON" if leg.is_demon else "")
     )
 
@@ -593,13 +671,26 @@ def optimize_slips(
 # =============================================================================
 
 def scored_to_dict(s: ScoredLeg) -> Dict[str, Any]:
+    # Extract misprice_edge from flags if present
+    misprice_val = 0.0
+    for f in (s.flags or []):
+        if f.startswith("misprice_edge="):
+            try:
+                misprice_val = float(f.split("=")[1])
+            except (IndexError, ValueError):
+                pass
+            break
     return {
         "leg_id": s.raw.leg_id, "game_id": s.raw.game_id,
         "player": s.raw.player_name, "stat": s.raw.stat_type,
-        "line": s.raw.line, "side": s.raw.side, "is_demon": s.raw.is_demon,
+        "line": s.raw.line, "standard_line": s.raw.standard_line,
+        "side": s.raw.side, "is_demon": s.raw.is_demon,
         "tier": s.tier.value, "p_true": round(s.p_true, 4),
         "p_need": round(s.p_need, 4), "p_edge": round(s.p_edge, 4),
         "final_score": round(s.final_score, 4), "why": s.why, "flags": s.flags,
+        # Misprice edge fields (Demontime only)
+        "misprice_score": round(misprice_val, 3),
+        "bump": round(s.bump, 3) if s.bump is not None else None,
     }
 
 
