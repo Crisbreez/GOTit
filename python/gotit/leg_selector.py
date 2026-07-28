@@ -162,6 +162,11 @@ DEFAULT_CFG: Dict[str, Any] = {
     "min_hit_rate_sample":   5,    # hit_rate only counts as signal if n >= this
     "sample_shrink_n":      10,    # denominator for sample_factor = clamp(n/10, 0, 1)
     "min_role_score_callup": 0.7,  # role_score must be >= this for call-ups
+    # 6-factor confidence thresholds
+    "conf_sharp_margin":       0.04,  # p_mkt must be >= 0.5 + this to fire sharp_agree
+    "conf_model_room":         0.04,  # sigma-normalized gap for model_clear (z-score)
+    "conf_stable_sample_factor": 0.8, # sample_factor >= this for stable_sample
+    "conf_stable_n_games":    10,     # n_games >= this for stable_sample
 }
 
 
@@ -198,6 +203,11 @@ class ScoredLeg:
     low_confidence: bool = False  # sample_factor < 0.5
     lean_only:     bool  = False  # soft cap: n_games < min_games_lean_only
     n_games:       int   = 0
+    # 6-factor confidence score
+    conf_score:    float = 0.0   # 0.0–1.0 aggregate (more alignment = higher)
+    conf_tier:     str   = ''    # "STRONG" | "MODERATE" | "WEAK" | "NOISE"
+    conf_factors:  List[str] = None  # which factors fired
+    conf_missing:  List[str] = None  # which factors were absent
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -400,6 +410,180 @@ def _estimate_mu_sigma(row: Dict, sharps: List[Dict]) -> Tuple[float, float]:
     return L, sigma
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 6-factor confidence scorer
+# More alignment → higher confidence; never certainty.
+# Factors (each 0 or 1, weighted):
+#   1. sharp_agree   — de-vig fair P clearly on your side (sharp_margin >= thresh)
+#   2. role_locked   — starter / role confirmed, not capped
+#   3. model_clear   — mu clears line with room (not kissing it)
+#   4. matchup_boost — context pushes stat (park, pace, pitcher, total)
+#   5. stable_sample — sample_factor >= 0.8 and n_games >= 10
+#   6. no_kill_shots — no injury/weather/lineup/bullpen flags
+#
+# Tiers: STRONG ≥ 0.80 | MODERATE ≥ 0.55 | WEAK ≥ 0.30 | NOISE < 0.30
+# ─────────────────────────────────────────────────────────────────────────────
+
+CONF_WEIGHTS = {
+    'sharp_agree':   0.28,   # biggest signal
+    'model_clear':   0.22,
+    'stable_sample': 0.18,
+    'role_locked':   0.14,
+    'matchup_boost': 0.12,
+    'no_kill_shots': 0.06,
+}
+
+CONF_TIER_THRESHOLDS = [
+    (0.80, 'STRONG'),
+    (0.55, 'MODERATE'),
+    (0.30, 'WEAK'),
+    (0.00, 'NOISE'),
+]
+
+
+def _conf_score(
+    row:    Dict,
+    side:   str,
+    model:  Optional[Dict],
+    sharps: List[Dict],
+    ctx:    Dict,
+    pt:     float,        # blended p_true after haircut
+    sample_factor: float,
+    n_games: int,
+    frag:   float,
+    traps:  List[str],
+    kills:  List[str],
+    cfg:    Dict,
+) -> Tuple[float, str, List[str], List[str]]:
+    """
+    Compute 6-factor confidence score.
+    Returns (conf_score 0-1, tier str, fired_factors, missing_factors).
+    """
+    fired:   List[str] = []
+    missing: List[str] = []
+
+    L = float(row.get('lineScore', row.get('line', 0)) or 0)
+
+    # ── Factor 1: sharp_agree ─────────────────────────────────────────────
+    sharp_margin_thresh = float(cfg.get('conf_sharp_margin', 0.04))
+    p_mkt_val = None
+    sharp_fair = row.get('sharpFairLine') or row.get('sharp_fair_line')
+    if sharp_fair is not None:
+        # Estimate p_mkt from sharpFairLine using same CDF approach as fair_p_market
+        try:
+            sf = float(sharp_fair)
+            stat_type = str(row.get('statType', row.get('stat_type', '')) or '')
+            sigma_ratios = {
+                'Total Bases': 0.38, 'Hits': 0.55, 'Hits+Runs+RBIs': 0.40,
+                'Pitcher Strikeouts': 0.32, 'Pitches Thrown': 0.14,
+                'Pitching Outs': 0.28, 'Hits Allowed': 0.42,
+                'Earned Runs Allowed': 0.70, 'Walks Allowed': 0.75,
+                'Significant Strikes': 0.22, 'Hitter Fantasy Score': 0.40,
+                'Points': 0.26, 'Rebounds': 0.40, 'Assists': 0.45,
+                'Takedowns': 0.55, 'Fight Time (Mins)': 0.30,
+            }
+            sigma = max(0.5, L * sigma_ratios.get(stat_type, 0.40))
+            p_more_val = _phi((sf - L) / sigma) if sigma > 0 else 0.5
+            p_mkt_val = p_more_val if side == 'more' else 1.0 - p_more_val
+        except (ValueError, TypeError):
+            p_mkt_val = None
+
+    if p_mkt_val is not None and (p_mkt_val - 0.5) >= sharp_margin_thresh:
+        fired.append('sharp_agree')
+    else:
+        missing.append('sharp_agree')
+
+    # ── Factor 2: role_locked ─────────────────────────────────────────────
+    role_score = float(ctx.get('role_score', 0.0) or 0.0)
+    role_confirmed = ctx.get('role_confirmed', None)
+    is_callup = bool(ctx.get('is_callup') or ctx.get('callup'))
+    # Confirmed if role_confirmed explicitly True, or role_score high and not callup
+    if (role_confirmed is True) or (role_score >= 0.75 and not is_callup):
+        fired.append('role_locked')
+    elif role_confirmed is False or is_callup:
+        missing.append('role_locked')
+    else:
+        # role_score not provided → neutral, small partial credit
+        # give partial by not adding to missing; just skip
+        pass
+
+    # ── Factor 3: model_clear ─────────────────────────────────────────────
+    model_room_thresh = float(cfg.get('conf_model_room', 0.04))
+    if model:
+        mu    = float(model.get('mu', L) or L)
+        sigma = float(model.get('sigma', 1.0) or 1.0) or 1.0
+        gap   = (mu - L) / sigma if side == 'more' else (L - mu) / sigma
+        if gap >= model_room_thresh:
+            fired.append('model_clear')
+        else:
+            missing.append('model_clear')
+    else:
+        # No model — check if sharp fair line has clear room vs PP line
+        if sharp_fair is not None:
+            sf = float(sharp_fair)
+            gap_units = (sf - L) if side == 'more' else (L - sf)
+            if gap_units >= 0.25:
+                fired.append('model_clear')
+            else:
+                missing.append('model_clear')
+        else:
+            missing.append('model_clear')
+
+    # ── Factor 4: matchup_boost ───────────────────────────────────────────
+    # Driven by context flags: park_factor, pace_factor, pitcher_hand_adv, game_total_boost
+    matchup_keys = ('park_boost', 'pace_boost', 'pitcher_adv', 'game_total_boost',
+                    'matchup_score', 'opp_rank_boost')
+    matchup_score = max(
+        float(ctx.get(k, 0) or 0) for k in matchup_keys
+    )
+    shade = str(row.get('ppShadeSignal') or row.get('pp_shade_signal') or '')
+    # PP shade also counts as matchup signal
+    if shade in ('strong', 'moderate', 'bullish'):
+        matchup_score = max(matchup_score, 0.6)
+
+    if matchup_score >= 0.5:
+        fired.append('matchup_boost')
+    else:
+        missing.append('matchup_boost')
+
+    # ── Factor 5: stable_sample ───────────────────────────────────────────
+    stable_sf_thresh = float(cfg.get('conf_stable_sample_factor', 0.8))
+    stable_n_thresh  = int(cfg.get('conf_stable_n_games', 10))
+    if sample_factor >= stable_sf_thresh and n_games >= stable_n_thresh:
+        fired.append('stable_sample')
+    else:
+        missing.append('stable_sample')
+
+    # ── Factor 6: no_kill_shots ───────────────────────────────────────────
+    kill_flags = {'news_kill', 'fragility', 'weather_risk', 'lineup_downgrade',
+                  'bullpen_day', 'injury_risk', 'callup_role_unconfirmed'}
+    ctx_kills = {k for k in kill_flags if ctx.get(k)}
+    trap_kills = {k for k in traps if k in kill_flags}
+    kill_kill  = {k for k in kills if k in kill_flags}
+    has_kill   = bool(ctx_kills | trap_kills | kill_kill) or frag >= 0.35
+
+    if not has_kill:
+        fired.append('no_kill_shots')
+    else:
+        missing.append('no_kill_shots')
+
+    # ── Aggregate ─────────────────────────────────────────────────────────
+    raw_score = sum(CONF_WEIGHTS.get(f, 0) for f in fired)
+    # Bonus: all 6 fire → small boost (reflects true alignment)
+    if len(fired) == 6:
+        raw_score = min(1.0, raw_score + 0.02)
+
+    score = _clamp(raw_score, 0.0, 1.0)
+
+    tier = 'NOISE'
+    for thresh, label in CONF_TIER_THRESHOLDS:
+        if score >= thresh:
+            tier = label
+            break
+
+    return score, tier, fired, missing
+
+
 def score_prop(row: Dict, model: Optional[Dict], sharps: List[Dict],
                ctx: Dict, cfg: Dict) -> List[ScoredLeg]:
     """
@@ -544,6 +728,16 @@ def score_prop(row: Dict, model: Optional[Dict], sharps: List[Dict],
             lean_only      = lean_only,
             n_games        = n_games,
         ))
+        # Back-patch conf_score onto the leg we just appended
+        _cs, _ct, _cf, _cm = _conf_score(
+            row=row, side=side, model=model, sharps=sharps, ctx=ctx,
+            pt=pt, sample_factor=sample_factor, n_games=n_games,
+            frag=frag, traps=traps, kills=kills, cfg=cfg,
+        )
+        legs[-1].conf_score   = _cs
+        legs[-1].conf_tier    = _ct
+        legs[-1].conf_factors = _cf
+        legs[-1].conf_missing = _cm
 
     return legs
 
@@ -971,6 +1165,11 @@ def _leg_to_dict(leg: ScoredLeg) -> Dict:
         'low_confidence':  getattr(leg, 'low_confidence', False),
         'lean_only':       getattr(leg, 'lean_only', False),
         'n_games':         getattr(leg, 'n_games', 0),
+        # 6-factor confidence
+        'conf_score':      round(getattr(leg, 'conf_score', 0.0), 3),
+        'conf_tier':       getattr(leg, 'conf_tier', 'NOISE'),
+        'conf_factors':    getattr(leg, 'conf_factors', []),
+        'conf_missing':    getattr(leg, 'conf_missing', []),
     }
 
 
