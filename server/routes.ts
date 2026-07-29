@@ -288,6 +288,87 @@ export function registerRoutes(httpServer: Server, app: Express) {
       return res.json({ league, props: [], games: [], pulledAt: null });
     }
 
+    // ── Stamp learning data from player_performance onto each prop ──────────
+    // Closes the learning loop: Results → player_performance → scoring signals.
+    // Fields stamped: hitRate (fraction), avgMargin, gamesPlayed, last5
+    // The System reads these as: hit_rate → _has_real_signal, sample_factor, blend
+    try {
+      const allPerf = await storage.getAllPerformance();
+      if (allPerf && allPerf.length > 0) {
+        const perfMap = new Map<string, any>();
+        for (const row of allPerf) {
+          perfMap.set(`${row.playerName}||${row.statType}||${row.league}`, row);
+        }
+        for (const prop of rawProps as any[]) {
+          const key = `${prop.playerName}||${prop.statType}||${prop.league?.toUpperCase() ?? league}`;
+          const perf = perfMap.get(key);
+          if (perf) {
+            const total = (perf.hitCount ?? 0) + (perf.missCount ?? 0);
+            if (total > 0) {
+              prop.hitRate       = perf.hitCount / total;           // 0–1 fraction
+              prop.hitRateSample = total;                           // n for min_hit_rate_sample gate
+              prop.gamesPlayed   = total;                           // n for sample_factor
+              prop.avgMargin     = perf.avgMargin ?? null;          // actual − line
+              prop.last5         = perf.last5 ?? [];                // ring buffer
+              // form_trend: L5 hit rate vs season hit rate
+              const l5 = (perf.last5 ?? []) as string[];
+              if (l5.length >= 3) {
+                const l5Rate = l5.filter((x: string) => x === 'hit').length / l5.length;
+                prop.l10_rate      = l5Rate;
+                prop.baseline_rate = prop.hitRate;
+                prop.form_trend    = (l5Rate - prop.hitRate) > 0.15 ? 1 :
+                                     (l5Rate - prop.hitRate) < -0.15 ? -1 : 0;
+              }
+            }
+          }
+        }
+        console.log(`[learn] stamped performance data on ${rawProps.length} props (${allPerf.length} records)`);
+      }
+    } catch (e: any) {
+      console.warn('[learn] performance stamp failed:', e.message);
+    }
+
+    // ── Stamp demon_log history onto demon props ───────────────────────────
+    // Demontime reads boost_score; we inject demonHitRate so prop_to_raw_leg
+    // can set a more accurate boost_score for repeat demons.
+    try {
+      const supaUrl  = process.env.SUPABASE_URL;
+      const supaKey  = process.env.SUPABASE_ANON_KEY;
+      if (supaUrl && supaKey) {
+        const dlogResp = await fetch(
+          `${supaUrl}/rest/v1/demon_log?select=player_name,stat_type,result&result=neq.null&order=created_at.desc&limit=500`,
+          { headers: { 'apikey': supaKey, 'Authorization': `Bearer ${supaKey}` } }
+        );
+        if (dlogResp.ok) {
+          const dlog: any[] = await dlogResp.json();
+          // Aggregate: demon hit rate per player+stat
+          const dlogMap = new Map<string, { hits: number; total: number }>();
+          for (const row of dlog) {
+            const k = `${row.player_name}||${row.stat_type}`;
+            const cur = dlogMap.get(k) ?? { hits: 0, total: 0 };
+            cur.total++;
+            if (row.result === 'hit') cur.hits++;
+            dlogMap.set(k, cur);
+          }
+          for (const prop of rawProps as any[]) {
+            if (!prop.isDemon) continue;
+            const k = `${prop.playerName}||${prop.statType}`;
+            const d = dlogMap.get(k);
+            if (d && d.total >= 2) {
+              prop.demonHitRate  = d.hits / d.total;
+              prop.demonTotal    = d.total;
+              // boost_score proxy: demon with > 65% hit rate gets a mild signal lift
+              const baseBoost = 0.60;
+              prop.sharp_action  = Math.min(0.95, baseBoost + (d.hits / d.total - 0.50) * 0.8);
+            }
+          }
+          console.log(`[learn] demon_log stamped on demon props (${dlog.length} records)`);
+        }
+      }
+    } catch (e: any) {
+      console.warn('[learn] demon_log stamp failed:', e.message);
+    }
+
     // Group props by game
     const gameMap = new Map<string, any>();
     for (const p of rawProps) {
@@ -651,10 +732,42 @@ export function registerRoutes(httpServer: Server, app: Express) {
     if (!slip) return res.status(404).json({ error: 'Slip not found' });
 
     const legs = await storage.getLegsBySlip(id);
+    // req.body may contain { results: [{ legId, actualValue }] } from manual settle
+    const manualResults: Array<{ legId: number; actualValue: number }> = req.body?.results ?? [];
+    const manualMap = new Map(manualResults.map((r: any) => [r.legId, r.actualValue]));
+
     for (const leg of legs) {
       if (leg.status === 'pending' || leg.status === 'live') {
-        const hit = Math.random() > 0.40;
-        await storage.updateLegStatus(leg.id, hit ? 'hit' : 'miss', leg.lineScore * (hit ? 1.1 : 0.85));
+        const manualActual = manualMap.get(leg.id);
+
+        let hit: boolean;
+        let actualValue: number | null;
+
+        if (manualActual != null) {
+          // Real settle: user provided the actual stat value
+          actualValue = manualActual;
+          hit = actualValue > leg.lineScore;  // More wins if actual > line
+        } else {
+          // No actual value provided — mark as pending (not settled yet)
+          // Do NOT use Math.random() — never fake results
+          continue;
+        }
+
+        await storage.updateLegStatus(leg.id, hit ? 'hit' : 'miss', actualValue);
+
+        // ── Learning loop: write outcome to player_performance ──────────────
+        try {
+          await storage.updatePlayerPerformance(
+            leg.playerName,
+            leg.statType,
+            leg.league ?? 'MLB',
+            hit ? 'hit' : 'miss',
+            actualValue,
+            leg.lineScore,
+          );
+        } catch (e: any) {
+          console.warn('[learn] player_performance update failed:', e.message);
+        }
       }
     }
 
