@@ -1,6 +1,7 @@
 import { useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { apiRequest } from '@/lib/queryClient';
+import { RefreshCw, CheckCircle, AlertCircle } from 'lucide-react';
 
 interface SlipLeg {
   id: number; slipId: number;
@@ -486,12 +487,28 @@ function ScriptAuditView({ slips }: { slips: Slip[] }) {
 // ── Main ──────────────────────────────────────────────────────────────────────
 export default function ResultsPage() {
   const [activeTab, setActiveTab] = useState('History');
+  const [autoSettleMsg, setAutoSettleMsg] = useState<string | null>(null);
+  const qc = useQueryClient();
 
   const { data: slips = [], isLoading } = useQuery<Slip[]>({
     queryKey: ['/api/slips', 'all'],
     queryFn: () => apiRequest('GET', '/api/slips?status=all').then(r => r.json()),
   });
 
+  const autoSettleMut = useMutation({
+    mutationFn: () => apiRequest('POST', '/api/settle/auto', { league: 'MLB' }).then(r => r.json()),
+    onSuccess: (data: any) => {
+      qc.invalidateQueries({ queryKey: ['/api/slips'] });
+      setAutoSettleMsg(data.message ?? `Settled ${data.settled} legs`);
+      setTimeout(() => setAutoSettleMsg(null), 5000);
+    },
+    onError: () => {
+      setAutoSettleMsg('Auto-settle failed — check connection');
+      setTimeout(() => setAutoSettleMsg(null), 4000);
+    },
+  });
+
+  const pending = slips.filter(s => s.status === 'pending' || s.status === 'live');
   const settled = slips.filter(s => s.status === 'settled_win' || s.status === 'settled_loss');
   const wins    = settled.filter(s => s.status === 'settled_win').length;
 
@@ -505,10 +522,42 @@ export default function ResultsPage() {
               Analysis & Learning
             </div>
           </div>
-          <div style={{ fontFamily:'Space Mono,monospace', fontSize:'0.875rem', fontWeight:700, color:'hsl(var(--muted-foreground))' }}>
-            {wins}W–{settled.length - wins}L
+          <div style={{ display:'flex', alignItems:'center', gap:'0.5rem' }}>
+            <div style={{ fontFamily:'Space Mono,monospace', fontSize:'0.875rem', fontWeight:700, color:'hsl(var(--muted-foreground))' }}>
+              {wins}W–{settled.length - wins}L
+            </div>
+            {pending.length > 0 && (
+              <button
+                data-testid="btn-auto-settle"
+                onClick={() => autoSettleMut.mutate()}
+                disabled={autoSettleMut.isPending}
+                style={{
+                  display:'flex', alignItems:'center', gap:'0.3rem',
+                  padding:'0.3rem 0.65rem', borderRadius:6,
+                  background:'hsl(var(--accent))', color:'hsl(var(--accent-foreground))',
+                  border:'none', fontSize:'0.7rem', fontWeight:700,
+                  letterSpacing:'0.05em', textTransform:'uppercase', cursor:'pointer',
+                  opacity: autoSettleMut.isPending ? 0.6 : 1,
+                }}
+              >
+                <RefreshCw size={11} style={{ animation: autoSettleMut.isPending ? 'spin 1s linear infinite' : 'none' }} />
+                {autoSettleMut.isPending ? 'Settling...' : `Settle (${pending.length})`}
+              </button>
+            )}
           </div>
         </div>
+        {autoSettleMsg && (
+          <div style={{
+            marginTop:'0.4rem', fontSize:'0.7rem', fontWeight:600,
+            color: autoSettleMsg.includes('failed') ? 'hsl(var(--destructive))' : 'hsl(142 72% 50%)',
+            display:'flex', alignItems:'center', gap:'0.3rem',
+          }}>
+            {autoSettleMsg.includes('failed')
+              ? <AlertCircle size={11} />
+              : <CheckCircle size={11} />}
+            {autoSettleMsg}
+          </div>
+        )}
       </header>
 
       <div className="result-tabs">

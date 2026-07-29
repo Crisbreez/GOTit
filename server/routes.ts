@@ -725,6 +725,159 @@ export function registerRoutes(httpServer: Server, app: Express) {
     res.json({ ok: true, deleted: id });
   });
 
+  // ── Auto-Settle via MLB Stats API ─────────────────────────────────────────
+  // Fetches real box score data, matches pending MLB legs, settles them automatically.
+  // Updates player_performance for the learning loop.
+  app.post('/api/settle/auto', async (req, res) => {
+    const { league = 'MLB', slipIds } = req.body ?? {};
+
+    try {
+      // Fetch all pending/live slips (optionally filtered by slipIds)
+      const allSlips = await storage.getSlips();
+      const pendingSlips = allSlips.filter((s: any) =>
+        s.status === 'pending' || s.status === 'live'
+      );
+      const targetSlips = slipIds
+        ? pendingSlips.filter((s: any) => slipIds.includes(s.id))
+        : pendingSlips;
+
+      if (targetSlips.length === 0) {
+        return res.json({ ok: true, settled: 0, skipped: 0, errors: [], message: 'No pending slips' });
+      }
+
+      // Collect all pending MLB legs across target slips
+      const allLegs: any[] = [];
+      for (const slip of targetSlips) {
+        const legs = await storage.getLegsBySlip(slip.id);
+        for (const leg of legs) {
+          if ((leg.status === 'pending' || leg.status === 'live') &&
+              (leg.league ?? 'MLB').toUpperCase() === league.toUpperCase()) {
+            allLegs.push({ ...leg, slipId: slip.id });
+          }
+        }
+      }
+
+      if (allLegs.length === 0) {
+        return res.json({ ok: true, settled: 0, skipped: 0, errors: [], message: 'No pending MLB legs' });
+      }
+
+      // Call mlb_results.py with pending legs
+      const scriptPath = path.resolve(process.cwd(), 'python', 'mlb_results.py');
+      const payload = allLegs.map(leg => ({
+        legId:       leg.id,
+        playerName:  leg.playerName,
+        statType:    leg.statType,
+        lineScore:   leg.lineScore,
+        gameId:      leg.gameId ?? '',
+        gameDate:    leg.gameDate ?? leg.startTime ?? '',
+      }));
+
+      const settledResults: any[] = await new Promise((resolve) => {
+        const { spawn } = require('child_process');
+        const child = spawn('python3', [scriptPath], { cwd: process.cwd() });
+        let out = '', err = '';
+        child.stdin.write(JSON.stringify(payload));
+        child.stdin.end();
+        child.stdout.on('data', (d: Buffer) => { out += d.toString(); });
+        child.stderr.on('data', (d: Buffer) => { err += d.toString(); });
+        child.on('close', () => {
+          try { resolve(JSON.parse(out)); }
+          catch { resolve([]); }
+        });
+        child.on('error', () => resolve([]));
+      });
+
+      // Apply results
+      let settled = 0, skipped = 0;
+      const errors: any[] = [];
+
+      for (const r of settledResults) {
+        if (r.error || r.actualValue == null) {
+          skipped++;
+          if (r.error && r.error !== 'player_not_found') {
+            errors.push({ legId: r.legId, player: r.playerName, error: r.error });
+          }
+          continue;
+        }
+
+        const leg = allLegs.find(l => l.id === r.legId);
+        if (!leg) continue;
+
+        await storage.updateLegStatus(leg.id, r.hit ? 'hit' : 'miss', r.actualValue);
+        settled++;
+
+        // Learning loop: update player_performance
+        try {
+          await storage.updatePlayerPerformance(
+            r.playerName,
+            r.statType,
+            league,
+            r.hit ? 'hit' : 'miss',
+            r.actualValue,
+            r.lineScore,
+          );
+        } catch (e: any) {
+          console.warn('[auto-settle] player_performance update failed:', e.message);
+        }
+
+        // Update demon_log if it's a demon leg
+        if (leg.isDemon) {
+          try {
+            const supaUrl = process.env.SUPABASE_URL;
+            const supaKey = process.env.SUPABASE_ANON_KEY;
+            if (supaUrl && supaKey) {
+              await fetch(
+                `${supaUrl}/rest/v1/demon_log?slip_id=eq.${leg.slipId}&player_name=eq.${encodeURIComponent(r.playerName)}&stat_type=eq.${encodeURIComponent(r.statType)}`,
+                {
+                  method: 'PATCH',
+                  headers: {
+                    'apikey': supaKey,
+                    'Authorization': `Bearer ${supaKey}`,
+                    'Content-Type': 'application/json',
+                    'Prefer': 'return=minimal',
+                  },
+                  body: JSON.stringify({
+                    actual_value: r.actualValue,
+                    result: r.hit ? 'hit' : 'miss',
+                    settled_at: new Date().toISOString(),
+                  }),
+                }
+              );
+            }
+          } catch (e: any) {
+            console.warn('[auto-settle] demon_log patch failed:', e.message);
+          }
+        }
+      }
+
+      // Re-evaluate slip win/loss status for affected slips
+      for (const slip of targetSlips) {
+        const updatedLegs = await storage.getLegsBySlip(slip.id);
+        const activeLegs = updatedLegs.filter((l: any) => l.status !== 'pending' && l.status !== 'live' && l.status !== 'dnp');
+        if (activeLegs.length === 0) continue;
+        const stillPending = updatedLegs.some((l: any) => l.status === 'pending' || l.status === 'live');
+        if (stillPending) continue; // not all legs settled yet
+        const hits = activeLegs.filter((l: any) => l.status === 'hit').length;
+        const allHit = hits === activeLegs.length;
+        await storage.updateSlipStatus(slip.id, allHit ? 'settled_win' : 'settled_loss', {
+          settledAt: new Date().toISOString(),
+        });
+      }
+
+      res.json({
+        ok: true,
+        settled,
+        skipped,
+        errors,
+        total_legs: allLegs.length,
+        message: `Auto-settled ${settled}/${allLegs.length} legs via MLB Stats API`,
+      });
+    } catch (err: any) {
+      console.error('[auto-settle] error:', err.message);
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
   // ── Settle Slip ────────────────────────────────────────────────────────────
   app.post('/api/slips/:id/settle', async (req, res) => {
     const id = parseInt(req.params.id);
