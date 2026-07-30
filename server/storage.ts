@@ -150,34 +150,21 @@ export const storage: IStorage = {
 
     // ── Dedup pass 2: alt-line collapse (same player+stat+direction+game, different lines)
     // PP is an alt-line platform — each player+stat has 6-7 lines (0.5, 1.5 ... 7.5).
-    // Keep ONE line per player+stat+direction+game:
-    //   • The standard/goblin line is the canonical PP line — always preferred.
-    //   • If no standard/goblin exists, keep the demon line closest to the median
-    //     (middle of the range = most liquid alt-line).
+    // CRITICAL: demons and non-demons are SEPARATE products — never let a goblin/standard
+    // collapse a demon row. Use tier in the dedup key so each tier deduplicates independently.
+    //   • Standard/goblin: keep the lowest (most achievable) line.
+    //   • Demon: keep the lowest demon line across demon-only rows.
     const altMap = new Map<string, typeof rows[0]>();
     for (const r of Array.from(exactMap.values())) {
-      const key = `${r.playerName}|${r.statType}|${r.direction}|${r.gameId}`;
+      // Include tier in key so demon rows never compete with goblin/standard rows
+      const tier = r.isDemon ? 'demon' : r.isGoblin ? 'goblin' : 'standard';
+      const key = `${r.playerName}|${r.statType}|${r.direction}|${r.gameId}|${tier}`;
       const existing = altMap.get(key);
       if (!existing) {
         altMap.set(key, r);
       } else {
-        const isStandard = (p: typeof r) => !p.isDemon && !p.isGoblin;
-        const isGoblin   = (p: typeof r) => !!p.isGoblin;
-        // Tier priority: standard > goblin > demon
-        // Among same tier: standard/goblin keep lower line; demon keeps higher line
-        if (isStandard(r) && !isStandard(existing)) {
-          altMap.set(key, r);
-        } else if (isGoblin(r) && !isStandard(existing) && !isGoblin(existing)) {
-          altMap.set(key, r);
-        } else if (isStandard(r) && isStandard(existing)) {
-          if (r.lineScore < existing.lineScore) altMap.set(key, r);
-        } else if (isGoblin(r) && isGoblin(existing)) {
-          if (r.lineScore < existing.lineScore) altMap.set(key, r);
-        } else if (r.isDemon && existing.isDemon) {
-          // Keep the LOWEST demon line — most achievable.
-          // High demon lines (e.g. H+R+RBI 6.5) are near-impossible traps.
-          if (r.lineScore < existing.lineScore) altMap.set(key, r);
-        }
+        // Within the same tier, keep the lowest (most achievable) line
+        if (r.lineScore < existing.lineScore) altMap.set(key, r);
       }
     }
 
