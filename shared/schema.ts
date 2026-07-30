@@ -36,10 +36,15 @@ export const props = sqliteTable("props", {
   lastSeenAt: text("last_seen_at"),               // ISO timestamp of most recent pull
   lineMoveCount: integer("line_move_count").default(0), // how many times line changed
   // Sharp market signals (written by sharp_pull.py)
-  sharpFairLine: real("sharp_fair_line"),          // SGO fair line
-  sharpOverJuice: real("sharp_over_juice"),        // SGO juice on over side
-  sharpUnderJuice: real("sharp_under_juice"),      // SGO juice on under side
+  sharpFairLine: real("sharp_fair_line"),          // fair line from sharp books
+  sharpOverJuice: real("sharp_over_juice"),        // juice on over side
+  sharpUnderJuice: real("sharp_under_juice"),      // juice on under side
   ppShadeSignal: text("pp_shade_signal"),          // 'lean_over' | 'lean_under' | 'neutral' | 'no_data'
+  // Real projection model (written by mlb_projections.py via sharp_pull.py)
+  projMu: real("proj_mu"),                        // projected mean (expected value of stat)
+  projSigma: real("proj_sigma"),                  // projected std dev
+  projNGames: integer("proj_n_games"),            // sample size (games played / started)
+  projSource: text("proj_source"),                // 'mlb_stats_api+savant' | 'mlb_stats_api'
 });
 
 // ── Slips ────────────────────────────────────────────────────────────────────

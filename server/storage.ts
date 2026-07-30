@@ -47,6 +47,11 @@ function mapProp(r: any) {
       : null,
     lineMoveCount: r.line_move_count ?? 0,
     lineMove: r.line_move ?? null,
+    // Real projection model fields
+    projMu: r.proj_mu ?? null,
+    projSigma: r.proj_sigma ?? null,
+    projNGames: r.proj_n_games ?? null,
+    projSource: r.proj_source ?? null,
   };
 }
 
@@ -250,6 +255,11 @@ export const storage: IStorage = {
         sharp_over_juice: r.sharpOverJuice ?? null,
         sharp_under_juice:r.sharpUnderJuice?? null,
         pp_shade_signal:  ppShadeSignal,
+        // Real projection model
+        proj_mu:       r.projMu      ?? null,
+        proj_sigma:    r.projSigma   ?? null,
+        proj_n_games:  r.projNGames  ?? null,
+        proj_source:   r.projSource  ?? null,
       };
     });
 

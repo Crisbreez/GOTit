@@ -975,6 +975,20 @@ def run_system_for_game(
         sh  = sharps.get(player_id, [])
         ctx = context.get(player_id, {})
 
+        # Inject real projection mu/sigma from prop row (stamped by mlb_projections.py)
+        # This is the primary model signal when no external model dict is provided.
+        if m is None:
+            proj_mu    = row.get('projMu')    or row.get('proj_mu')
+            proj_sigma = row.get('projSigma') or row.get('proj_sigma')
+            proj_n     = row.get('projNGames')or row.get('proj_n_games')
+            if proj_mu is not None:
+                m = {
+                    'mu':     float(proj_mu),
+                    'sigma':  float(proj_sigma) if proj_sigma else float(proj_mu) * 0.45,
+                    'n':      int(proj_n) if proj_n else 0,
+                    'source': row.get('projSource') or 'mlb_projections',
+                }
+
         # Enrich ctx with PropContext 6-factor scores from the prop row
         if _HAVE_ENGINE_CTX:
             try:
@@ -1142,6 +1156,18 @@ def run_the_system(
         m   = models.get((player_id, stat_type))
         sh  = sharps.get(player_id, [])
         ctx = dict(context.get(player_id, {}))
+        # Inject real projection mu/sigma from prop row
+        if m is None:
+            proj_mu    = row.get('projMu')    or row.get('proj_mu')
+            proj_sigma = row.get('projSigma') or row.get('proj_sigma')
+            proj_n     = row.get('projNGames')or row.get('proj_n_games')
+            if proj_mu is not None:
+                m = {
+                    'mu':     float(proj_mu),
+                    'sigma':  float(proj_sigma) if proj_sigma else float(proj_mu) * 0.45,
+                    'n':      int(proj_n) if proj_n else 0,
+                    'source': row.get('projSource') or 'mlb_projections',
+                }
         # Enrich ctx with PropContext 6-factor scores from the prop row
         if _HAVE_ENGINE_CTX:
             try:

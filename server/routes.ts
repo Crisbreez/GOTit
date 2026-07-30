@@ -41,7 +41,7 @@ function spawnSharpPull(league: string, props: any[]): void {
       console.log(`[sharp] ${result.matched}/${result.total} props matched for ${result.league}`);
 
       // Stamp sharp signals onto props and re-upsert so DB has sharpFairLine + ppShadeSignal
-      const enrichments: Array<{id:string; sharpFairLine?:number; ppShadeSignal:string; marketDelta?:number}>
+      const enrichments: Array<{id:string; sharpFairLine?:number; ppShadeSignal:string; marketDelta?:number; projMu?:number; projSigma?:number; projNGames?:number; projSource?:string}>
         = result.enrichments || [];
       if (enrichments.length > 0) {
         const enrichMap = new Map(enrichments.map((e: any) => [e.id, e]));
@@ -53,11 +53,16 @@ function spawnSharpPull(league: string, props: any[]): void {
             sharpFairLine:  e.sharpFairLine  ?? null,
             ppShadeSignal:  e.ppShadeSignal  ?? 'no_data',
             marketDelta:    e.marketDelta    ?? null,
+            projMu:         e.projMu         ?? null,
+            projSigma:      e.projSigma      ?? null,
+            projNGames:     e.projNGames     ?? null,
+            projSource:     e.projSource     ?? null,
           };
         });
+        const projCount = enrichedProps.filter((p: any) => p.projMu != null).length;
         try {
           await storage.upsertProps(enrichedProps);
-          console.log(`[sharp] stamped sharp signals on ${enrichedProps.length} props`);
+          console.log(`[sharp] stamped sharp signals on ${enrichedProps.length} props (${projCount} with real projections)`);
         } catch (e: any) {
           console.error('[sharp] re-upsert failed:', e.message);
         }

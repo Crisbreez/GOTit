@@ -12,6 +12,7 @@ Express calls this with:
 import sys
 import json
 import logging
+import re
 from pathlib import Path
 
 logging.basicConfig(level=logging.WARNING)
@@ -19,6 +20,38 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from gotit.sharp_consensus import pull_sharp_consensus
 from gotit.sharp_consensus import PPProp, Tier
+from mlb_projections import run as build_mlb_projections, _normalize as _norm_name
+
+# Module-level projection cache (built once per process)
+_PROJ_CACHE: dict | None = None
+
+def _get_projections(league: str) -> dict:
+    """Lazy-load projection cache for the given league."""
+    global _PROJ_CACHE
+    if league.upper() != "MLB":
+        return {}  # Only MLB projections wired for now
+    if _PROJ_CACHE is None:
+        try:
+            _PROJ_CACHE = build_mlb_projections()
+            logging.info("Projection cache built: %d entries", len(_PROJ_CACHE))
+        except Exception as e:
+            logging.warning("Projection build failed: %s", e)
+            _PROJ_CACHE = {}
+    return _PROJ_CACHE
+
+
+def _lookup_projection(projections: dict, player_name: str, stat_type: str) -> dict | None:
+    """Look up a projection by player+stat, with fuzzy name matching."""
+    # Exact key first
+    key = f"{player_name}||{stat_type}"
+    if key in projections:
+        return projections[key]
+    # Fuzzy: normalize player name
+    norm = _norm_name(player_name)
+    for k, v in projections.items():
+        if v["stat_type"] == stat_type and _norm_name(v["player_name"]) == norm:
+            return v
+    return None
 
 
 def _make_pp_prop(d: dict):
@@ -68,6 +101,9 @@ def main():
         print(json.dumps({"ok": False, "error": "no valid PPProps"}))
         sys.exit(1)
 
+    # Build projections for MLB (lazy cache)
+    projections = _get_projections(league)
+
     # Pull sharp consensus from SGO, write to sharp_store.json
     try:
         consensus = pull_sharp_consensus(league, pp_props)
@@ -81,29 +117,44 @@ def main():
     )
 
     # Build per-prop sharp enrichment to send back to Express.
-    # Express will stamp sharpFairLine / ppShadeSignal on each prop before upsert.
+    # Express will stamp sharpFairLine / ppShadeSignal / projMu / projSigma on each prop.
     prop_enrichments = []
+    proj_matched = 0
     for d in props_data:
-        prop_id = d.get('id', '')
-        sc = consensus.get(prop_id)
+        prop_id   = d.get('id', '')
+        player    = str(d.get('playerName') or d.get('player_name') or '')
+        stat_type = str(d.get('statType')   or d.get('stat_type')   or '')
+        pp_line   = float(d.get('lineScore') or d.get('line_score') or 0)
+        sc        = consensus.get(prop_id)
+
+        enrichment: dict = {'id': prop_id}
+
+        # Sharp fair line
         if sc and sc.freshness_sec < 9999.0:
-            pp_line = float(d.get('lineScore') or 0)
             fair_line = sc.median
-            delta = pp_line - fair_line
+            delta     = pp_line - fair_line
             if delta > 0.3:
                 shade = 'lean_under'
             elif delta < -0.3:
                 shade = 'lean_over'
             else:
                 shade = 'neutral'
-            prop_enrichments.append({
-                'id': prop_id,
-                'sharpFairLine': round(fair_line, 3),
-                'ppShadeSignal': shade,
-                'marketDelta': round(delta, 3),
-            })
+            enrichment['sharpFairLine'] = round(fair_line, 3)
+            enrichment['ppShadeSignal'] = shade
+            enrichment['marketDelta']   = round(delta, 3)
         else:
-            prop_enrichments.append({'id': prop_id, 'ppShadeSignal': 'no_data'})
+            enrichment['ppShadeSignal'] = 'no_data'
+
+        # Real projection mu/sigma
+        proj = _lookup_projection(projections, player, stat_type)
+        if proj:
+            enrichment['projMu']    = proj['mu']
+            enrichment['projSigma'] = proj['sigma']
+            enrichment['projNGames']= proj['n_games']
+            enrichment['projSource']= proj['source']
+            proj_matched += 1
+
+        prop_enrichments.append(enrichment)
 
     print(json.dumps({
         "ok": True,
