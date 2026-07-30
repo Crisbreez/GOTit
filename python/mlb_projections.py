@@ -194,9 +194,9 @@ def fetch_mlb_season_stats(year: int = CURRENT_YEAR) -> Tuple[Dict, Dict]:
     hitting:  Dict[str, Dict] = {}
     pitching: Dict[str, Dict] = {}
 
-    # Hitting
+    # Hitting — playerPool=All gets every player with AB, not just qualified
     url = (f"{MLB_API}/stats?stats=season&group=hitting&gameType=R"
-           f"&season={year}&sportId=1&limit=1000&offset=0")
+           f"&season={year}&sportId=1&limit=2000&offset=0&playerPool=All")
     raw = _get(url)
     if raw:
         try:
@@ -211,9 +211,9 @@ def fetch_mlb_season_stats(year: int = CURRENT_YEAR) -> Tuple[Dict, Dict]:
         except Exception as e:
             log.warning("MLB hitting stats parse error: %s", e)
 
-    # Pitching
+    # Pitching — playerPool=All gets relievers + starters
     url = (f"{MLB_API}/stats?stats=season&group=pitching&gameType=R"
-           f"&season={year}&sportId=1&limit=1000&offset=0")
+           f"&season={year}&sportId=1&limit=2000&offset=0&playerPool=All")
     raw = _get(url)
     if raw:
         try:
