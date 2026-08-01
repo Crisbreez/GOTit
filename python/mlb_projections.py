@@ -19,6 +19,7 @@ import io
 import json
 import logging
 import math
+import os
 import re
 import sys
 import time
@@ -398,7 +399,33 @@ def build_projections(
     return projections
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Disk cache — avoids re-fetching MLB Stats API + Savant on every pull
+# Cache is valid for the calendar day (Central time). Stored in /tmp.
+# ─────────────────────────────────────────────────────────────────────────────
+
+import tempfile
+
+def _cache_path(year: int) -> str:
+    today = datetime.now(timezone(timedelta(hours=-5))).strftime("%Y%m%d")  # CDT approx
+    return os.path.join(tempfile.gettempdir(), f"gotit_proj_{year}_{today}.json")
+
+
 def run(year: int = CURRENT_YEAR) -> Dict[str, Dict]:
+    cache = _cache_path(year)
+    # Try disk cache first
+    try:
+        if os.path.exists(cache):
+            mtime = os.path.getmtime(cache)
+            age_hours = (time.time() - mtime) / 3600
+            if age_hours < 23:  # fresh enough
+                with open(cache) as f:
+                    proj = json.load(f)
+                log.info("Projection cache hit: %d entries (%.1fh old)", len(proj), age_hours)
+                return proj
+    except Exception as e:
+        log.warning("Cache read failed: %s", e)
+
     log.info("Fetching MLB season stats for %d...", year)
     hitting, pitching = fetch_mlb_season_stats(year)
 
@@ -406,7 +433,17 @@ def run(year: int = CURRENT_YEAR) -> Dict[str, Dict]:
     xstats = fetch_savant_xstats(year)
 
     log.info("Building projections...")
-    return build_projections(hitting, pitching, xstats)
+    proj = build_projections(hitting, pitching, xstats)
+
+    # Write to disk cache
+    try:
+        with open(cache, 'w') as f:
+            json.dump(proj, f)
+        log.info("Projection cache written: %s (%d entries)", cache, len(proj))
+    except Exception as e:
+        log.warning("Cache write failed: %s", e)
+
+    return proj
 
 
 if __name__ == "__main__":

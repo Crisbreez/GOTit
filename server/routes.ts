@@ -16,7 +16,7 @@ function spawnSharpPull(league: string, props: any[]): void {
 
   const child = spawn(python, [scriptPath], {
     cwd: process.cwd(),
-    timeout: 45_000,
+    timeout: 120_000,  // 2 min — projection build (MLB Stats API + Savant) can take 60-90s first call
   });
 
   let out = '';
