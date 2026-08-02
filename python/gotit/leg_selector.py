@@ -641,6 +641,9 @@ def score_prop(row: Dict, model: Optional[Dict], sharps: List[Dict],
 
     # ── Sample-size fields ──────────────────────────────────────────────────
     n_games, n_hr = _sample_fields(row)
+    # Also pull n_games from the injected model dict (projNGames stamped by mlb_projections.py)
+    if n_games == 0 and model:
+        n_games = int(model.get('n', 0) or 0)
     min_games        = cfg.get('min_games_played', 5)
     min_games_lean   = cfg.get('min_games_lean_only', 10)
     min_hr_n         = cfg.get('min_hit_rate_sample', 5)
