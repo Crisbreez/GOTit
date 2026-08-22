@@ -52,6 +52,10 @@ function mapProp(r: any) {
     projSigma: r.proj_sigma ?? null,
     projNGames: r.proj_n_games ?? null,
     projSource: r.proj_source ?? null,
+    // Script + lineup signals
+    scriptTag:  r.script_tag  ?? 'BLIND',
+    matchupTag: r.matchup_tag ?? 'NEUTRAL',
+    lineupOk:   r.lineup_ok   ?? true,
   };
 }
 
@@ -91,6 +95,7 @@ function mapLeg(r: any): SlipLeg {
     hitExplanation: r.hit_explanation,
     missExplanation: r.miss_explanation,
     propScore: r.prop_score,
+    missTag: r.miss_tag ?? null,
   } as SlipLeg;
 }
 
@@ -105,7 +110,7 @@ export interface IStorage {
   deleteSlip(id: number): Promise<void>;
   createLegs(legs: InsertLeg[]): Promise<void>;
   getLegsBySlip(slipId: number): Promise<SlipLeg[]>;
-  updateLegStatus(id: number, status: string, actualValue?: number): Promise<void>;
+  updateLegStatus(id: number, status: string, actualValue?: number, missTag?: string | null): Promise<void>;
   reconcileLeg(id: number, status: string, actualValue: number | null, lastCheckedAt: string, trackingError: boolean): Promise<void>;
   logPull(league: string, count: number, status?: string): Promise<void>;
   getLastPull(league: string): Promise<any>;
@@ -416,9 +421,10 @@ export const storage: IStorage = {
     return (data ?? []).map(mapLeg);
   },
 
-  async updateLegStatus(id, status, actualValue) {
+  async updateLegStatus(id, status, actualValue, missTag) {
     const updates: any = { status };
     if (actualValue != null) updates.actual_value = actualValue;
+    if (missTag != null) updates.miss_tag = missTag;
     const { error } = await db.from('slip_legs').eq('id', id).update(updates);
     if (error) throw new Error(`[storage] updateLegStatus failed: ${error}`);
   },

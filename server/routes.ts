@@ -41,7 +41,7 @@ function spawnSharpPull(league: string, props: any[]): void {
       console.log(`[sharp] ${result.matched}/${result.total} props matched for ${result.league}`);
 
       // Stamp sharp signals onto props and re-upsert so DB has sharpFairLine + ppShadeSignal
-      const enrichments: Array<{id:string; sharpFairLine?:number; ppShadeSignal:string; marketDelta?:number; projMu?:number; projSigma?:number; projNGames?:number; projSource?:string}>
+      const enrichments: Array<{id:string; sharpFairLine?:number; ppShadeSignal:string; marketDelta?:number; projMu?:number; projSigma?:number; projNGames?:number; projSource?:string; scriptTag?:string; matchupTag?:string; lineupOk?:boolean}>
         = result.enrichments || [];
       if (enrichments.length > 0) {
         const enrichMap = new Map(enrichments.map((e: any) => [e.id, e]));
@@ -57,6 +57,9 @@ function spawnSharpPull(league: string, props: any[]): void {
             projSigma:      e.projSigma      ?? null,
             projNGames:     e.projNGames     ?? null,
             projSource:     e.projSource     ?? null,
+            scriptTag:      e.scriptTag      ?? 'BLIND',
+            matchupTag:     e.matchupTag     ?? 'NEUTRAL',
+            lineupOk:       e.lineupOk       ?? true,
           };
         });
         const projCount = enrichedProps.filter((p: any) => p.projMu != null).length;
@@ -626,6 +629,33 @@ export function registerRoutes(httpServer: Server, app: Express) {
       return res.status(422).json({ error: 'No valid props found for selection' });
     }
 
+    // ── Slip rules enforcement ────────────────────────────────────────────────
+    // Rule 1: Max 2 demon legs per slip
+    const demonLegsSelected = selectedProps.filter((p: any) => p.isDemon);
+    if (demonLegsSelected.length > 2) {
+      return res.status(422).json({
+        error: `Too many demon legs (${demonLegsSelected.length}). Max 2 demons per slip.`,
+        code: 'DEMON_CAP_EXCEEDED',
+      });
+    }
+
+    // Rule 2: Min 2 total legs
+    if (selectedProps.length < 2) {
+      return res.status(422).json({
+        error: 'Slip requires at least 2 legs.',
+        code: 'MIN_LEGS_NOT_MET',
+      });
+    }
+
+    // Rule 3: If demons-only slip and ≥4 legs → require at least 1 standard/goblin
+    const nonDemonSelected = selectedProps.filter((p: any) => !p.isDemon);
+    if (selectedProps.length >= 4 && nonDemonSelected.length === 0) {
+      return res.status(422).json({
+        error: 'Slips with 4+ legs require at least 1 standard or goblin prop for floor.',
+        code: 'NO_STANDARD_FLOOR',
+      });
+    }
+
     const resolvedMatchup = matchup || (selectedProps[0] as any)?.gameMatchup || gameId || 'GOTit Slip';
     const resolvedStartTime = startTime || (selectedProps[0] as any)?.gameStartTime || null;
     const resolvedScript = scriptLabel || 'GOTit Script';
@@ -808,7 +838,34 @@ export function registerRoutes(httpServer: Server, app: Express) {
         const leg = allLegs.find(l => l.id === r.legId);
         if (!leg) continue;
 
-        await storage.updateLegStatus(leg.id, r.hit ? 'hit' : 'miss', r.actualValue);
+        // ── Script Audit miss tagging ─────────────────────────────────────
+        // Tags misses so Script Audit can grade process quality:
+        //   price_wrong  — sharp line was on losing side (PP line was correct)
+        //   script_wrong — we had signal but it didn't cash (model/script error)
+        //   variance     — signal was marginal (<5% edge), likely noise
+        let missTag: string | null = null;
+        if (!r.hit) {
+          const propRow = (await storage.getProps(league)).find(
+            (p: any) => p.playerName === r.playerName && p.statType === r.statType
+          );
+          const edge = propRow?.propScore ?? 0;
+          const hasSig = !!(propRow?.projMu || propRow?.sharpFairLine);
+          if (propRow?.sharpFairLine != null) {
+            // If sharp fair line was on the other side of PP line: price wrong
+            const sharpDelta = (propRow.sharpFairLine - propRow.lineScore);
+            const pickedOver = leg.direction === 'over';
+            if ((pickedOver && sharpDelta < -0.3) || (!pickedOver && sharpDelta > 0.3)) {
+              missTag = 'price_wrong';
+            }
+          }
+          if (!missTag && edge < 0.05 && hasSig) {
+            missTag = 'variance'; // weak signal, marginal edge
+          }
+          if (!missTag && hasSig) {
+            missTag = 'script_wrong'; // had signal, still lost
+          }
+        }
+        await storage.updateLegStatus(leg.id, r.hit ? 'hit' : 'miss', r.actualValue, missTag);
         settled++;
 
         // Learning loop: update player_performance

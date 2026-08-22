@@ -435,6 +435,32 @@ function ScriptAuditView({ slips }: { slips: Slip[] }) {
         </div>
       )}
 
+      {/* Script tag breakdown — SUPPORT vs BLIND miss analysis */}
+      {(() => {
+        const missLegs = allLegs.filter(l => l.status === 'miss');
+        const byTag: Record<string, {hit:number; miss:number}> = {};
+        for (const l of allLegs.filter(l => l.status !== 'dnp' && l.status !== 'void')) {
+          const tag = (l as any).missTag || ((l.status === 'hit') ? 'hit' : 'untagged');
+          const key = l.status === 'hit' ? 'hit' : tag;
+          if (!byTag[key]) byTag[key] = {hit:0, miss:0};
+          l.status === 'hit' ? byTag[key].hit++ : byTag[key].miss++;
+        }
+        const tagRows = Object.entries(byTag).filter(([k]) => k !== 'hit');
+        if (!tagRows.length) return null;
+        return (
+          <div style={{ marginBottom:14 }}>
+            <div style={{ fontWeight:700, fontSize:'0.65rem', letterSpacing:'0.07em', textTransform:'uppercase', color:'hsl(var(--muted-foreground))', marginBottom:6 }}>Miss Breakdown</div>
+            <div style={{ display:'flex', flexWrap:'wrap', gap:6 }}>
+              {tagRows.map(([tag, {miss}]) => {
+                const color = tag === 'price_wrong' ? 'hsl(35 90% 55%)' : tag === 'script_wrong' ? 'hsl(0 72% 60%)' : 'hsl(220 60% 65%)';
+                const label = tag === 'price_wrong' ? '⚡ Price Wrong' : tag === 'script_wrong' ? '✗ Script Wrong' : tag === 'variance' ? '〜 Variance' : tag;
+                return <span key={tag} style={{ fontSize:'0.68rem', fontWeight:700, color, background:'hsl(var(--card))', border:`1px solid ${color}`, padding:'2px 7px', borderRadius:4 }}>{label}: {miss}</span>;
+              })}
+            </div>
+          </div>
+        );
+      })()}
+
       {/* Per-slip breakdown */}
       <div style={{ fontWeight:700, fontSize:'0.7rem', letterSpacing:'0.07em', textTransform:'uppercase', color:'hsl(var(--muted-foreground))', marginBottom:8 }}>
         Slip Breakdown
@@ -473,8 +499,21 @@ function ScriptAuditView({ slips }: { slips: Slip[] }) {
             </div>
 
             {missL.length > 0 && (
-              <div style={{ fontSize:'0.68rem', color:'hsl(0 72% 65%)' }}>
-                Missed: {missL.map(l => `${l.playerName} (${l.statType}${l.actualValue != null ? ' · ' + l.actualValue : ''})`).join(' · ')}
+              <div style={{ fontSize:'0.68rem', color:'hsl(0 72% 65%)', marginTop:4 }}>
+                {missL.map(l => {
+                  const tag = (l as any).missTag;
+                  const tagColor = tag === 'price_wrong' ? 'hsl(35 90% 55%)'
+                                 : tag === 'script_wrong' ? 'hsl(0 72% 60%)'
+                                 : tag === 'variance'     ? 'hsl(220 60% 65%)'
+                                 : 'hsl(var(--muted-foreground))';
+                  const tagLabel = tag === 'price_wrong' ? '⚡ price' : tag === 'script_wrong' ? '✗ script' : tag === 'variance' ? '〜 variance' : null;
+                  return (
+                    <div key={l.id} style={{ display:'flex', alignItems:'center', gap:4, marginBottom:2 }}>
+                      <span>{l.playerName} {l.statType}{l.actualValue != null ? ` · ${l.actualValue}` : ''}</span>
+                      {tagLabel && <span style={{ fontSize:'0.6rem', fontWeight:700, color: tagColor, background:'hsl(var(--card))', padding:'1px 5px', borderRadius:3 }}>{tagLabel}</span>}
+                    </div>
+                  );
+                })}
               </div>
             )}
           </div>

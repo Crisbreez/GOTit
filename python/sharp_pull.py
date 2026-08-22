@@ -104,6 +104,16 @@ def main():
     # Build projections for MLB (lazy cache)
     projections = _get_projections(league)
 
+    # Fetch confirmed starters for lineup_ok stamping (MLB only)
+    confirmed_starters: set = set()
+    if league == 'MLB':
+        try:
+            from gotit.lineup_check import fetch_confirmed_starters
+            confirmed_starters = fetch_confirmed_starters()
+        except Exception as _le:
+            import logging
+            logging.getLogger(__name__).warning(f'[lineup_check] skipped: {_le}')
+
     # Pull sharp consensus from SGO, write to sharp_store.json
     try:
         consensus = pull_sharp_consensus(league, pp_props)
@@ -153,6 +163,27 @@ def main():
             enrichment['projNGames']= proj['n_games']
             enrichment['projSource']= proj['source']
             proj_matched += 1
+
+        # Script tag + matchup tag
+        try:
+            from gotit.script_tag import compute_script_tag, compute_matchup_tag
+            # Merge enrichment so far into prop dict for tag computation
+            merged = {**d, **enrichment}
+            enrichment['scriptTag']   = compute_script_tag(merged)
+            enrichment['matchupTag']  = compute_matchup_tag(merged)
+        except Exception:
+            enrichment['scriptTag']  = 'BLIND'
+            enrichment['matchupTag'] = 'NEUTRAL'
+
+        # Lineup ok — MLB only
+        if league == 'MLB':
+            try:
+                from gotit.lineup_check import is_lineup_ok
+                enrichment['lineupOk'] = is_lineup_ok(player, confirmed_starters)
+            except Exception:
+                enrichment['lineupOk'] = True
+        else:
+            enrichment['lineupOk'] = True
 
         prop_enrichments.append(enrichment)
 

@@ -949,11 +949,21 @@ def prop_to_raw_leg(prop: Dict[str, Any]) -> Optional[RawLeg]:
             except Exception:
                 pass
 
-        # Projection from mu/sigma
+        # Projection from mu/sigma — prefer projMu (mlb_projections) then mu
         proj_mean: Optional[float] = None
-        mu_raw = float(prop.get("mu", 0) or 0)
+        mu_raw = float(prop.get("projMu") or prop.get("proj_mu") or prop.get("mu") or 0)
         if mu_raw > 0:
             proj_mean = mu_raw
+
+        # lineup_ok kill — applied before scoring
+        lineup_ok = prop.get('lineupOk') if prop.get('lineupOk') is not None else True
+        if not lineup_ok:
+            # Will be set killed on RawLeg below
+            pass
+
+        # Script tag + matchup tag for Demontime boost/kill
+        script_tag  = prop.get('scriptTag')  or 'BLIND'
+        matchup_tag = prop.get('matchupTag') or 'NEUTRAL'
 
         # Correlation keys
         corr_keys = [f"game:{game_id}"]
@@ -964,7 +974,13 @@ def prop_to_raw_leg(prop: Dict[str, Any]) -> Optional[RawLeg]:
         pctx = prop_context_from_dict(prop)
         scores = score_prop_context(pctx)
 
-        return RawLeg(
+        # Demontime boost from script + matchup (additive on boost_score)
+        _script_boost = {'SUPPORT': 0.10, 'WEAK': 0.03, 'PASS': 0.0, 'BLIND': -0.15}.get(script_tag, 0.0)
+        _matchup_boost = {'PLUS': 0.05, 'NEUTRAL': 0.0, 'MINUS': -0.05}.get(matchup_tag, 0.0)
+        _base_boost = scores["boost_score"] if not is_demon else clamp(scores["boost_score"] + 0.10, 0.0, 1.0)
+        _final_boost = clamp(_base_boost + _script_boost + _matchup_boost, 0.0, 1.0)
+
+        leg = RawLeg(
             leg_id=prop_id, game_id=game_id, player_id=player_id,
             player_name=player, team=team, opponent=opponent,
             stat_type=stat_type, line=line, side="MORE",
@@ -972,8 +988,10 @@ def prop_to_raw_leg(prop: Dict[str, Any]) -> Optional[RawLeg]:
             proj_mean=proj_mean, market=market,
             role_score=scores["role_score"],
             ctx_score=scores["ctx_score"],
-            boost_score=scores["boost_score"] if not is_demon else clamp(scores["boost_score"] + 0.10, 0.0, 1.0),
+            boost_score=_final_boost,
             correlation_keys=corr_keys,
+            killed=not lineup_ok,
+            kill_reason='lineup_unconfirmed' if not lineup_ok else '',
             meta={
                 "league":           league,
                 "news_kill":        scores["news_kill"],
@@ -989,8 +1007,12 @@ def prop_to_raw_leg(prop: Dict[str, Any]) -> Optional[RawLeg]:
                 "sharp_edge":       scores["sharp_edge"],
                 "role_confirmed":   scores["role_confirmed"],
                 "is_callup":        scores["is_callup"],
+                "script_tag":       script_tag,
+                "matchup_tag":      matchup_tag,
+                "lineup_ok":        lineup_ok,
             },
         )
+        return leg
     except Exception:
         return None
 

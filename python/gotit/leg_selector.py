@@ -1011,6 +1011,30 @@ def run_system_for_game(
             p_hr = float(p_hr_raw) if p_hr_raw is not None else None
             if _has_real_signal(row, sh, m):
                 blended = _blend_p_true(p_mkt, leg.p_model, p_hr, cfg)
+
+                # ── Script tag + matchup boost ─────────────────────────────────
+                try:
+                    from gotit.script_tag import (
+                        compute_script_tag, script_tag_boost,
+                        compute_matchup_tag, matchup_boost,
+                    )
+                    s_tag  = row.get('scriptTag') or compute_script_tag(row)
+                    m_tag  = row.get('matchupTag') or compute_matchup_tag(row)
+                    blended = _clamp(
+                        blended + script_tag_boost(s_tag) + matchup_boost(m_tag),
+                        0.01, 0.99
+                    )
+                    leg.script_tag  = s_tag
+                    leg.matchup_tag = m_tag
+                except Exception:
+                    pass
+
+                # ── lineup_ok kill ─────────────────────────────────────────
+                lineup_ok = row.get('lineupOk') if row.get('lineupOk') is not None else True
+                if not lineup_ok:
+                    leg.kill_reasons.append('lineup_unconfirmed')
+                    leg.eligible = False
+
                 leg = ScoredLeg(
                     **{**leg.__dict__,
                        'p_true': blended,
