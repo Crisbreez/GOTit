@@ -933,8 +933,8 @@ def fair_p_market(row: Dict, side: str) -> Optional[float]:
 
 def _blend_p_true(p_mkt: Optional[float], p_mod: float, p_hr: Optional[float], cfg: Dict) -> float:
     """
+    Legacy weighted blend — kept as fallback when p_hit_formula can't run.
     Weighted blend: market 50%, model 30%, hit_rate 20%.
-    Falls back gracefully when signals are missing.
     """
     w_m = cfg.get('w_market', 0.50)
     w_p = cfg.get('w_model', 0.30)
@@ -959,6 +959,55 @@ def _blend_p_true(p_mkt: Optional[float], p_mod: float, p_hr: Optional[float], c
 
     blended = total_p / total_w
     return _clamp(blended - haircut, 0.01, 0.99)
+
+
+# Script tag → numeric score (0–1, 0.5 = neutral baseline)
+_SCRIPT_SCORE: Dict[str, float] = {
+    'SUPPORT': 0.80,
+    'WEAK':    0.60,
+    'PASS':    0.50,
+    'BLIND':   0.25,
+}
+
+
+def p_hit_formula(
+    sharp_edge:  Optional[float],   # fair_p_win_over - 0.5 (None if no book data)
+    script_tag:  str,               # SUPPORT | WEAK | PASS | BLIND
+    hit_rate:    Optional[float],   # historical hit rate (0–1) or None
+    sample_size: int,               # number of settled results (hitRateSample)
+) -> float:
+    """
+    GOTit canonical p_hit formula:
+
+        p_hit = 0.50
+              + 0.50 × (sharp_edge × 2.0)
+              + 0.25 × ((script_score − 0.5) × 0.30)
+              + 0.25 × ((hit_rate − 0.50) × 0.30 × shrink)
+
+        shrink = min(sample_size / 15, 1.0)
+
+    Rules:
+      - sharp_edge absent → sharp term = 0 (not invented)
+      - hit_rate absent / sample=0 → history term = 0 (not invented)
+      - script_tag always present (defaults PASS → no contribution)
+      - result clamped to [0.01, 0.99]
+    """
+    result = 0.50
+
+    # Sharp term — direct de-vigged edge from DK/FD
+    if sharp_edge is not None:
+        result += 0.50 * (sharp_edge * 2.0)
+
+    # Script term
+    script_score = _SCRIPT_SCORE.get(str(script_tag).upper(), 0.50)
+    result += 0.25 * ((script_score - 0.5) * 0.30)
+
+    # History term with shrinkage
+    if hit_rate is not None and sample_size > 0:
+        shrink = min(sample_size / 15.0, 1.0)
+        result += 0.25 * ((float(hit_rate) - 0.50) * 0.30 * shrink)
+
+    return _clamp(result, 0.01, 0.99)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1020,59 +1069,61 @@ def run_system_for_game(
         # Score both sides
         legs = score_prop(row, m, sh, ctx, cfg)
 
-        # Apply spec blend: replace p_true with fair blend
+        # Apply p_hit formula (The System canonical blend)
         for leg in legs:
-            p_mkt = fair_p_market(row, leg.side)   # direct de-vigged from DK/FD
-            p_hr_raw = row.get('hitRate') or row.get('hit_rate')
-            p_hr = float(p_hr_raw) if p_hr_raw is not None else None
-            if _has_real_signal(row, sh, m):
-                blended = _blend_p_true(p_mkt, leg.p_model, p_hr, cfg)
+            if not _has_real_signal(row, sh, m):
+                scored.append(leg)
+                continue
 
-                # ── Break-even gate ───────────────────────────────────────────────
-                # Only play legs where fair p_win from books >= slip break-even.
-                # Most conservative slip (6-flex) breaks even at ~59.6% per leg.
-                # Minimum floor: 5-flex at 54.3% — any leg below 0.543 after blend
-                # cannot contribute to a profitable slip regardless of type.
-                # We gate on the 5-flex floor here; the optimizer further filters
-                # per slip type. When no book p_mkt available, gate is skipped
-                # (model + history must carry the load via existing floor check).
-                BE_FLEX_5 = cfg.get('p_be', DEFAULT_CFG['p_be']).get('5_flex', 0.543)
-                if p_mkt is not None and blended < BE_FLEX_5:
-                    leg.kill_reasons.append(f'below_be_{blended:.3f}')
-                    leg.eligible = False
+            # resolve inputs
+            p_mkt = fair_p_market(row, leg.side)
+            sharp_edge_val = (p_mkt - 0.50) if p_mkt is not None else None
 
-                # ── Script tag + matchup boost ─────────────────────────────────
-                try:
-                    from gotit.script_tag import (
-                        compute_script_tag, script_tag_boost,
-                        compute_matchup_tag, matchup_boost,
-                    )
-                    s_tag  = row.get('scriptTag') or compute_script_tag(row)
-                    m_tag  = row.get('matchupTag') or compute_matchup_tag(row)
-                    blended = _clamp(
-                        blended + script_tag_boost(s_tag) + matchup_boost(m_tag),
-                        0.01, 0.99
-                    )
-                    leg.script_tag  = s_tag
-                    leg.matchup_tag = m_tag
-                except Exception:
-                    pass
+            try:
+                from gotit.script_tag import compute_script_tag, compute_matchup_tag, matchup_boost
+                s_tag = row.get('scriptTag') or compute_script_tag(row)
+                m_tag = row.get('matchupTag') or compute_matchup_tag(row)
+            except Exception:
+                s_tag = 'PASS'
+                m_tag = 'NEUTRAL'
 
-                # ── lineup_ok kill ─────────────────────────────────────────
-                lineup_ok = row.get('lineupOk') if row.get('lineupOk') is not None else True
-                if not lineup_ok:
-                    leg.kill_reasons.append('lineup_unconfirmed')
-                    leg.eligible = False
+            p_hr_raw    = row.get('hitRate') or row.get('hit_rate')
+            p_hr        = float(p_hr_raw) if p_hr_raw is not None else None
+            sample_size = int(row.get('hitRateSample') or row.get('hit_rate_sample') or 0)
 
-                leg = ScoredLeg(
-                    **{**leg.__dict__,
-                       'p_true': blended,
-                       'count': count(blended, leg.p_be_5flex)}
-                )
-                # Re-check floor with blended p
-                if blended < cfg.get('absolute_floor_p', 0.50):
-                    leg.kill_reasons.append('below_floor_blend')
-                    leg.eligible = False
+            # canonical p_hit formula
+            blended = p_hit_formula(sharp_edge_val, s_tag, p_hr, sample_size)
+
+            # matchup additive on top
+            try:
+                blended = _clamp(blended + matchup_boost(m_tag), 0.01, 0.99)
+            except Exception:
+                pass
+
+            # break-even gate
+            BE_FLEX_5 = cfg.get('p_be', DEFAULT_CFG['p_be']).get('5_flex', 0.543)
+            if p_mkt is not None and blended < BE_FLEX_5:
+                leg.kill_reasons.append(f'below_be_{blended:.3f}')
+                leg.eligible = False
+
+            # lineup_ok kill
+            lineup_ok = row.get('lineupOk') if row.get('lineupOk') is not None else True
+            if not lineup_ok:
+                leg.kill_reasons.append('lineup_unconfirmed')
+                leg.eligible = False
+
+            leg = ScoredLeg(
+                **{**leg.__dict__,
+                   'p_true':      blended,
+                   'count':       count(blended, leg.p_be_5flex),
+                   'script_tag':  s_tag,
+                   'matchup_tag': m_tag}
+            )
+
+            if blended < cfg.get('absolute_floor_p', 0.50):
+                leg.kill_reasons.append('below_floor_blend')
+                leg.eligible = False
+
             scored.append(leg)
 
     eligible = [s for s in scored if s.eligible]

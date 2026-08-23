@@ -361,6 +361,11 @@ def assign_tier(leg: RawLeg, p_edge: float, cfg: GotitConfig) -> Tier:
 
 def score_leg(leg: RawLeg, p_need: float, cfg: GotitConfig) -> ScoredLeg:
     p_true, p_m, p_p, flags = compute_p_true(leg, cfg)
+    # Use canonical p_hit_formula result when available (stored on meta by prop_to_raw_leg)
+    _p_hit_meta = leg.meta.get("p_hit") if leg.meta else None
+    if _p_hit_meta is not None:
+        p_true = clamp(float(_p_hit_meta), 0.01, 0.99)
+        flags.append(f"p_hit_formula={p_true:.3f}")
     if leg.killed:
         flags.append(f"killed:{leg.kill_reason or 'unknown'}")
 
@@ -974,11 +979,27 @@ def prop_to_raw_leg(prop: Dict[str, Any]) -> Optional[RawLeg]:
         pctx = prop_context_from_dict(prop)
         scores = score_prop_context(pctx)
 
-        # Demontime boost from script + matchup (additive on boost_score)
-        _script_boost = {'SUPPORT': 0.10, 'WEAK': 0.03, 'PASS': 0.0, 'BLIND': -0.15}.get(script_tag, 0.0)
-        _matchup_boost = {'PLUS': 0.05, 'NEUTRAL': 0.0, 'MINUS': -0.05}.get(matchup_tag, 0.0)
+        # Demontime p_hit formula — same canonical formula as The System
+        # sharp_edge = fair_p_win (book de-vigged) - 0.50
+        # Also keep boost_score for EV/mult estimation (unchanged pipeline)
+        _fair_p_win = prop.get('fairPWinOver') or prop.get('fair_p_win_over')
+        _sharp_edge_dt = (float(_fair_p_win) - 0.50) if _fair_p_win is not None else None
+
+        _hr_raw     = prop.get('hitRate') or prop.get('hit_rate')
+        _p_hr_dt    = float(_hr_raw) if _hr_raw is not None else None
+        _sample_dt  = int(prop.get('hitRateSample') or prop.get('hit_rate_sample') or 0)
+        _matchup_dt = {'PLUS': 0.015, 'NEUTRAL': 0.0, 'MINUS': -0.015}.get(matchup_tag, 0.0)
+
+        try:
+            from gotit.leg_selector import p_hit_formula
+            _p_hit_dt = p_hit_formula(_sharp_edge_dt, script_tag, _p_hr_dt, _sample_dt)
+            _p_hit_dt = clamp(_p_hit_dt + _matchup_dt, 0.01, 0.99)
+        except Exception:
+            _p_hit_dt = 0.50
+
+        # boost_score: legacy ranking proxy — anchored to p_hit so rankings are consistent
         _base_boost = scores["boost_score"] if not is_demon else clamp(scores["boost_score"] + 0.10, 0.0, 1.0)
-        _final_boost = clamp(_base_boost + _script_boost + _matchup_boost, 0.0, 1.0)
+        _final_boost = clamp(_base_boost, 0.0, 1.0)
 
         leg = RawLeg(
             leg_id=prop_id, game_id=game_id, player_id=player_id,
@@ -1010,6 +1031,7 @@ def prop_to_raw_leg(prop: Dict[str, Any]) -> Optional[RawLeg]:
                 "script_tag":       script_tag,
                 "matchup_tag":      matchup_tag,
                 "lineup_ok":        lineup_ok,
+                "p_hit":            round(_p_hit_dt, 4),
             },
         )
         return leg
