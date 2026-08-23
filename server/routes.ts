@@ -41,7 +41,7 @@ function spawnSharpPull(league: string, props: any[]): void {
       console.log(`[sharp] ${result.matched}/${result.total} props matched for ${result.league}`);
 
       // Stamp sharp signals onto props and re-upsert so DB has sharpFairLine + ppShadeSignal
-      const enrichments: Array<{id:string; sharpFairLine?:number; ppShadeSignal:string; marketDelta?:number; projMu?:number; projSigma?:number; projNGames?:number; projSource?:string; scriptTag?:string; matchupTag?:string; lineupOk?:boolean}>
+      const enrichments: Array<{id:string; sharpFairLine?:number; ppShadeSignal:string; marketDelta?:number; projMu?:number; projSigma?:number; projNGames?:number; projSource?:string; scriptTag?:string; matchupTag?:string; lineupOk?:boolean; fairPWinOver?:number; fairPWinUnder?:number}>
         = result.enrichments || [];
       if (enrichments.length > 0) {
         const enrichMap = new Map(enrichments.map((e: any) => [e.id, e]));
@@ -60,6 +60,8 @@ function spawnSharpPull(league: string, props: any[]): void {
             scriptTag:      e.scriptTag      ?? 'BLIND',
             matchupTag:     e.matchupTag     ?? 'NEUTRAL',
             lineupOk:       e.lineupOk       ?? true,
+            fairPWinOver:   e.fairPWinOver   ?? null,
+            fairPWinUnder:  e.fairPWinUnder  ?? null,
           };
         });
         const projCount = enrichedProps.filter((p: any) => p.projMu != null).length;

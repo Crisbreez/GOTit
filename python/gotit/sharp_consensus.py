@@ -65,12 +65,15 @@ class PPProp:
 
 @dataclass
 class SharpConsensus:
-    prop_id:       str
-    median:        float
-    shape_params:  dict
-    timestamp:     str
-    books_used:    list
-    freshness_sec: float = 9999.0
+    prop_id:          str
+    median:           float
+    shape_params:     dict
+    timestamp:        str
+    books_used:       list
+    freshness_sec:    float  = 9999.0
+    # Direct de-vigged probabilities from DK/FD (None = not available)
+    fair_p_win_over:  Optional[float] = None
+    fair_p_win_under: Optional[float] = None
 
 log = logging.getLogger("gotit.sharp_consensus")
 
@@ -568,19 +571,19 @@ def _match_props(
         use_best = best and (best_diff <= line_tol or (best_diff <= 8.0 and len(candidates) > 0))
         if use_best:
             # Real sharp data.
-            # median = fairOverUnder — the de-vigged consensus line from SGO.
-            # This anchors the CDF inside _calibrated_p_win / select_legs_for_slate.
-            # shape_params = {} — the CDF computes p_win from the distribution;
-            # we do NOT store raw American-odds-derived fair_p_win here because
-            # bypassing the CDF breaks the micro-line cap, Demon floor check,
-            # and stat-family variance scaling that select_legs_for_slate applies.
+            # fair_p_win_over/under: direct de-vigged probability from DK+FD books.
+            # This is the ground truth — use it directly in the blend instead of
+            # re-deriving via CDF. When the PP line != book line (alt-line demons)
+            # we still store the de-vigged p at the book's line as a directional signal.
             result[pp.prop_id] = SharpConsensus(
                 prop_id=pp.prop_id,
                 median=best["fair_line"],   # sharp consensus line → CDF anchor
-                shape_params={},             # CDF owns p_win, not odds
+                shape_params={},
                 timestamp=best["fetched_at"],
                 books_used=best["books_used"],
-                freshness_sec=0.0,           # real data — marks as fresh
+                freshness_sec=0.0,
+                fair_p_win_over=best.get("fair_p_win_over"),
+                fair_p_win_under=best.get("fair_p_win_under"),
             )
             log.debug(
                 f"[sharp] matched {pp.player_name} {pp.stat_type} "
@@ -617,12 +620,14 @@ def _save_store(store: Dict[str, dict]) -> None:
 
 def _sc_to_dict(sc: SharpConsensus) -> dict:
     return {
-        "prop_id":      sc.prop_id,
-        "median":       sc.median,
-        "shape_params": sc.shape_params,
-        "timestamp":    sc.timestamp,
-        "books_used":   sc.books_used,
-        "freshness_sec": sc.freshness_sec,
+        "prop_id":           sc.prop_id,
+        "median":            sc.median,
+        "shape_params":      sc.shape_params,
+        "timestamp":         sc.timestamp,
+        "books_used":        sc.books_used,
+        "freshness_sec":     sc.freshness_sec,
+        "fair_p_win_over":   sc.fair_p_win_over,
+        "fair_p_win_under":  sc.fair_p_win_under,
     }
 
 
@@ -634,6 +639,8 @@ def _sc_from_dict(d: dict) -> SharpConsensus:
         timestamp=d["timestamp"],
         books_used=d.get("books_used", []),
         freshness_sec=d.get("freshness_sec", FALLBACK_SEC),
+        fair_p_win_over=d.get("fair_p_win_over"),
+        fair_p_win_under=d.get("fair_p_win_under"),
     )
 
 

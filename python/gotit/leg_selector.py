@@ -897,10 +897,26 @@ def build_packages(eligible: List[ScoredLeg], cfg: Dict) -> Dict:
 
 def fair_p_market(row: Dict, side: str) -> Optional[float]:
     """
-    Use sharpFairLine from MoneyLine (DK/FD) as the market fair probability.
-    Converts fair line → P(More) via CDF estimate.
-    Returns None if no sharp data.
+    Returns the de-vigged fair probability from DK/FD books for the given side.
+
+    Priority:
+      1. fairPWinOver / fairPWinUnder — direct de-vigged p from books (exact)
+      2. sharpFairLine — CDF-derived estimate (fallback when books only gave a line)
+
+    Returns None if no sharp data available.
     """
+    # ── 1. Direct de-vigged probability (preferred) ──────────────────────────
+    p_over_direct  = row.get('fairPWinOver')  or row.get('fair_p_win_over')
+    p_under_direct = row.get('fairPWinUnder') or row.get('fair_p_win_under')
+    if p_over_direct is not None:
+        try:
+            p_over  = float(p_over_direct)
+            p_under = float(p_under_direct) if p_under_direct is not None else 1.0 - p_over
+            return p_over if side == 'more' else p_under
+        except (ValueError, TypeError):
+            pass
+
+    # ── 2. CDF fallback from sharpFairLine ────────────────────────────────
     sharp_fair = row.get('sharpFairLine') or row.get('sharp_fair_line')
     if sharp_fair is None:
         return None
@@ -1006,11 +1022,24 @@ def run_system_for_game(
 
         # Apply spec blend: replace p_true with fair blend
         for leg in legs:
-            p_mkt = fair_p_market(row, leg.side)
+            p_mkt = fair_p_market(row, leg.side)   # direct de-vigged from DK/FD
             p_hr_raw = row.get('hitRate') or row.get('hit_rate')
             p_hr = float(p_hr_raw) if p_hr_raw is not None else None
             if _has_real_signal(row, sh, m):
                 blended = _blend_p_true(p_mkt, leg.p_model, p_hr, cfg)
+
+                # ── Break-even gate ───────────────────────────────────────────────
+                # Only play legs where fair p_win from books >= slip break-even.
+                # Most conservative slip (6-flex) breaks even at ~59.6% per leg.
+                # Minimum floor: 5-flex at 54.3% — any leg below 0.543 after blend
+                # cannot contribute to a profitable slip regardless of type.
+                # We gate on the 5-flex floor here; the optimizer further filters
+                # per slip type. When no book p_mkt available, gate is skipped
+                # (model + history must carry the load via existing floor check).
+                BE_FLEX_5 = cfg.get('p_be', DEFAULT_CFG['p_be']).get('5_flex', 0.543)
+                if p_mkt is not None and blended < BE_FLEX_5:
+                    leg.kill_reasons.append(f'below_be_{blended:.3f}')
+                    leg.eligible = False
 
                 # ── Script tag + matchup boost ─────────────────────────────────
                 try:

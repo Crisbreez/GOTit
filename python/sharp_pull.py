@@ -139,7 +139,7 @@ def main():
 
         enrichment: dict = {'id': prop_id}
 
-        # Sharp fair line
+        # Sharp fair line + direct de-vigged probabilities from DK/FD
         if sc and sc.freshness_sec < 9999.0:
             fair_line = sc.median
             delta     = pp_line - fair_line
@@ -149,9 +149,13 @@ def main():
                 shade = 'lean_over'
             else:
                 shade = 'neutral'
-            enrichment['sharpFairLine'] = round(fair_line, 3)
-            enrichment['ppShadeSignal'] = shade
-            enrichment['marketDelta']   = round(delta, 3)
+            enrichment['sharpFairLine']   = round(fair_line, 3)
+            enrichment['ppShadeSignal']   = shade
+            enrichment['marketDelta']     = round(delta, 3)
+            # Store direct de-vigged p_win from books (the real thing, no CDF re-derivation)
+            if sc.fair_p_win_over is not None:
+                enrichment['fairPWinOver']  = sc.fair_p_win_over
+                enrichment['fairPWinUnder'] = sc.fair_p_win_under
         else:
             enrichment['ppShadeSignal'] = 'no_data'
 
