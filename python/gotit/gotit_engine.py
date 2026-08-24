@@ -938,7 +938,6 @@ def prop_to_raw_leg(prop: Dict[str, Any]) -> Optional[RawLeg]:
         if is_synth or direction == "under":
             return None
 
-        # Market from sharpFairLine (MoneyLine DK/FD)
         market: Optional[MarketQuote] = None
         sharp_fair = prop.get("sharpFairLine") or prop.get("sharp_fair_line")
         if sharp_fair is not None:
@@ -950,7 +949,7 @@ def prop_to_raw_leg(prop: Dict[str, Any]) -> Optional[RawLeg]:
                 p_est = clamp(0.50 + bias, 0.10, 0.90)
                 over_am  = int(-100 * p_est / (1 - p_est)) if p_est > 0.5 else int(100 * (1 - p_est) / p_est)
                 under_am = int(-100 * (1 - p_est) / p_est) if p_est < 0.5 else int(100 * p_est / (1 - p_est))
-                market = MarketQuote(line=sf, over_american=over_am, under_american=under_am, book="moneyline_sharp")
+                market = MarketQuote(line=sf, over_american=over_am, under_american=under_am, book="sgo_sharp")
             except Exception:
                 pass
 

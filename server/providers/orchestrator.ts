@@ -15,13 +15,12 @@
  *   PP after 403:        60 min backoff
  *   PP after 3+ failures: 4 hours
  *   SGO after 429:       30 min backoff
- *   MoneyLine after 429: 30 min backoff
  *   Hard minimum (any):  5 min between force-refresh attempts
  *
  * Updated priority chain:
  *   1. Cache (immediate)
  *   2. PrizePicks
- *   3. MoneyLine (PP lines preferred within ML feed)
+ *   3. Cache → demo seed
  *   4. SGO (legacy, no player props on free tier)
  *   5. Cache fallback
  *   6. Demo (empty DB only)
@@ -29,7 +28,6 @@
 
 import { pullPrizePicks } from './prizepicks';
 import { pullSGO } from './sportsgameodds';
-import { pullMoneyLine } from './moneyline';
 import type { RawCanonicalProp, DataSource } from './canonical';
 import { storage } from '../storage';
 
@@ -55,7 +53,6 @@ interface ProviderCooldown {
 interface LeagueState {
   pp: ProviderCooldown;
   sgo: ProviderCooldown;
-  ml: ProviderCooldown;
   currentProvider: DataSource | null;
   lastSuccessAt: number | null;
   fallbackUsed: boolean;
@@ -69,7 +66,7 @@ function makeCD(): ProviderCooldown {
 
 function getState(league: string): LeagueState {
   if (!leagueState.has(league)) {
-    leagueState.set(league, { pp: makeCD(), sgo: makeCD(), ml: makeCD(), currentProvider: null, lastSuccessAt: null, fallbackUsed: false });
+    leagueState.set(league, { pp: makeCD(), sgo: makeCD(), currentProvider: null, lastSuccessAt: null, fallbackUsed: false });
   }
   return leagueState.get(league)!;
 }
@@ -90,7 +87,8 @@ function sgoCooldownMs(cd: ProviderCooldown): number {
   return 0;
 }
 
-function mlCooldownMs(cd: ProviderCooldown): number {
+// mlCooldownMs removed
+function _unused_mlCooldownMs(cd: ProviderCooldown): number {
   if (cd.consecutiveFailures >= 2) return 60 * 60 * 1000; // 1h
   if (cd.consecutiveFailures >= 1) return 30 * 60 * 1000; // 30min
   return 0;
@@ -167,11 +165,8 @@ export async function orchestratePull(league: string, forceRefresh = false): Pro
   const SGO_LEAGUES = new Set(['MLB', 'NBA', 'NFL']);
   const sgoAvailable = SGO_LEAGUES.has(league) && !!process.env.SGO_API_KEY;
 
-  // ── If PP is cooling AND MoneyLine is also cooling AND we have cache → serve cache immediately
-  // Do NOT short-circuit if MoneyLine is available — always let ML attempt before falling back to cache.
-  const mlAvailableEarly = !!process.env.ML_API_KEY;
-  const mlCoolingEarly = isCoolingDown(state.ml, mlCooldownMs);
-  if (!shouldTryPP && (sgoCooling || !sgoAvailable) && (mlCoolingEarly || !mlAvailableEarly) && hasCachedData) {
+  // ── If PP is cooling AND we have cache → serve cache immediately
+  if (!shouldTryPP && (sgoCooling || !sgoAvailable) && hasCachedData) {
     const cdLeft = remainingMs(state.pp, ppCooldownMs);
     console.log(`[Orchestrator] ${league}: all providers cooling — serving cache (${cachedRows.length} props)`);
     return {
@@ -292,34 +287,6 @@ export async function orchestratePull(league: string, forceRefresh = false): Pro
     }
   }
 
-  // ── Attempt MoneyLine (real player props, PP lines when available) ────────
-  const mlAvailable = mlAvailableEarly;
-  const mlCooling = isCoolingDown(state.ml, mlCooldownMs);
-  if (mlAvailable && !mlCooling) {
-    state.ml.lastAttemptAt = now;
-    try {
-      console.log(`[Orchestrator] ${league}: PP unavailable — trying MoneyLine`);
-      const mlProps = await pullMoneyLine(league);
-      if (mlProps.length > 0) {
-        state.ml.consecutiveFailures = 0;
-        state.ml.rateLimited = false;
-        state.ml.lastError = null;
-        state.lastSuccessAt = now;
-        state.currentProvider = 'sportsgameodds'; // reuse existing DataSource type
-        state.fallbackUsed = true;
-        console.log(`[Orchestrator] ${league}: MoneyLine success — ${mlProps.length} props`);
-        return { props: mlProps, providerUsed: 'sportsgameodds', isFallback: true, fallbackReason: ppError, pulledAt: nowIso, propCount: mlProps.length, fromCache: false, cooldownMs: null, rateLimited: false };
-      }
-      state.ml.consecutiveFailures++;
-    } catch (err: any) {
-      const mlErr = err.message ?? 'MoneyLine failed';
-      const is429 = mlErr.includes('429') || mlErr.includes('rate limit') || mlErr.includes('Rate limit');
-      state.ml.consecutiveFailures++;
-      state.ml.rateLimited = is429;
-      state.ml.lastError = mlErr;
-      console.warn(`[Orchestrator] ${league}: MoneyLine failed: ${mlErr}`);
-    }
-  }
 
   // ── Both providers failed — serve cache ─────────────────────────────────
   if (hasCachedData) {

@@ -892,7 +892,7 @@ def build_packages(eligible: List[ScoredLeg], cfg: Dict) -> Dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ─────────────────────────────────────────────────────────────────────────────
-# fair_p_market — extract fair P from sharpFairLine (MoneyLine DK/FD)
+# fair_p_market — extract fair P from de-vigged SGO odds
 # ─────────────────────────────────────────────────────────────────────────────
 
 def fair_p_market(row: Dict, side: str) -> Optional[float]:

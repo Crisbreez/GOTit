@@ -6,7 +6,7 @@
 
 export type PropTier = 'demon' | 'goblin' | 'standard';
 export type PropSide = 'over' | 'under';
-export type DataSource = 'prizepicks' | 'sportsgameodds' | 'moneyline' | 'cache' | 'demo';
+export type DataSource = 'prizepicks' | 'sportsgameodds' | 'cache' | 'demo';
 
 export interface CanonicalProp {
   // Identity
