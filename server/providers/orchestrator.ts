@@ -201,6 +201,8 @@ export async function orchestratePull(league: string, forceRefresh = false): Pro
         'Home Runs', 'Doubles', 'RBIs', 'Singles', 'Walks',
         'Triples', 'Stolen Bases', 'Hitter Strikeouts',
         'Plate Appearances', 'Pitcher Fantasy Score', 'Runs', 'Batters Seen',
+        'Pitches Thrown', 'Strikes Thrown', 'Balls Thrown', 'Batters Faced',
+        'Pitches Seen', 'Pitches Thrown 95+ MPH',
       ]);
 
       // Mirrors _STANDARD_LINE_FLOOR in leg_selector.py. Demons/goblins exempted

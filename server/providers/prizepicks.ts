@@ -280,6 +280,8 @@ export async function pullPrizePicks(league: string): Promise<RawCanonicalProp[]
     // MLB — near-certain unders or meaningless
     'Home Runs', 'Triples', 'Stolen Bases', 'Plate Appearances',
     'Singles', 'Runs', 'RBIs', 'Walks', 'Hitter Strikeouts', 'Batters Seen',
+    'Pitches Thrown', 'Strikes Thrown', 'Balls Thrown', 'Batters Faced',
+    'Pitches Seen', 'Pitches Thrown 95+ MPH',
     // MMA
     'Knockdowns', 'Submission Attempts',
   ]);

@@ -285,6 +285,8 @@ export const storage: IStorage = {
       'Home Runs', 'Doubles', 'RBIs', 'Singles', 'Walks',
       'Triples', 'Stolen Bases', 'Hitter Strikeouts',
       'Plate Appearances', 'Pitcher Fantasy Score', 'Runs', 'Batters Seen',
+      'Pitches Thrown', 'Strikes Thrown', 'Balls Thrown', 'Batters Faced',
+      'Pitches Seen', 'Pitches Thrown 95+ MPH',
     ]);
     const PAGE = 1000;
     let all: any[] = [];
