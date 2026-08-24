@@ -656,11 +656,11 @@ def pull_sharp_consensus(league: str, pp_props: List[PPProp]) -> Dict[str, Sharp
     """
     log.info(f"[sharp] pulling SGO for {league} ({len(pp_props)} PP props)")
 
-    # Use MoneyLine (DraftKings + FanDuel) as sharp source — SGO subscription lapsed
-    ml_props = _fetch_ml_props(league)
+    # Source priority: SportsGameOdds (Pinnacle/Bovada) primary → MoneyLine fallback
+    ml_props = _fetch_sgo_props(league)
     if not ml_props:
-        log.warning(f"[sharp] MoneyLine returned no props for {league} — falling back to SGO")
-        ml_props = _fetch_sgo_props(league)
+        log.warning(f"[sharp] SGO returned no props for {league} — falling back to MoneyLine")
+        ml_props = _fetch_ml_props(league)
     consensus = _match_props(pp_props, ml_props)
 
     # Merge into persistent store

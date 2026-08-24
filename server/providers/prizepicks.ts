@@ -279,7 +279,7 @@ export async function pullPrizePicks(league: string): Promise<RawCanonicalProp[]
   const UNDER_EXCLUDED_STATS = new Set([
     // MLB — near-certain unders or meaningless
     'Home Runs', 'Triples', 'Stolen Bases', 'Plate Appearances',
-    'Singles', 'Runs', 'RBIs', 'Walks', 'Hitter Strikeouts',
+    'Singles', 'Runs', 'RBIs', 'Walks', 'Hitter Strikeouts', 'Batters Seen',
     // MMA
     'Knockdowns', 'Submission Attempts',
   ]);
