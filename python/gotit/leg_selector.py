@@ -970,11 +970,19 @@ _SCRIPT_SCORE: Dict[str, float] = {
 }
 
 
+# w4 — matchup fit weight. Independently adjustable/killable: set to 0.0 to
+# disable the matchup term without touching w1/w2/w3. Start small (unvalidated
+# input); revisit after 200–300 picks logged with matchup_fit_score.
+W4_MATCHUP = 0.12
+
+
 def p_hit_formula(
     sharp_edge:  Optional[float],   # fair_p_win_over - 0.5 (None if no book data)
     script_tag:  str,               # SUPPORT | WEAK | PASS | BLIND
     hit_rate:    Optional[float],   # historical hit rate (0–1) or None
     sample_size: int,               # number of settled results (hitRateSample)
+    matchup_fit: Optional[float] = None,  # shrunk platoon fit score or None
+    w4: float = W4_MATCHUP,         # matchup weight — independent, killable
 ) -> float:
     """
     GOTit canonical p_hit formula:
@@ -1006,6 +1014,11 @@ def p_hit_formula(
     if hit_rate is not None and sample_size > 0:
         shrink = min(sample_size / 15.0, 1.0)
         result += 0.25 * ((float(hit_rate) - 0.50) * 0.30 * shrink)
+
+    # Matchup fit term (w4) — fourth independent component.
+    # Absent → term = 0 (not invented). Never blended into script_tag.
+    if matchup_fit is not None:
+        result += w4 * float(matchup_fit)
 
     return _clamp(result, 0.01, 0.99)
 
@@ -1091,8 +1104,14 @@ def run_system_for_game(
             p_hr        = float(p_hr_raw) if p_hr_raw is not None else None
             sample_size = int(row.get('hitRateSample') or row.get('hit_rate_sample') or 0)
 
-            # canonical p_hit formula
-            blended = p_hit_formula(sharp_edge_val, s_tag, p_hr, sample_size)
+            # matchup fit (w4 term) — stamped by sharp_pull / matchup_fit.py
+            mf_raw      = row.get('matchupFitScore')
+            if mf_raw is None:
+                mf_raw  = row.get('matchup_fit_score')
+            m_fit       = float(mf_raw) if mf_raw is not None else None
+
+            # canonical p_hit formula (4 independent terms)
+            blended = p_hit_formula(sharp_edge_val, s_tag, p_hr, sample_size, m_fit)
 
             # matchup additive on top
             try:

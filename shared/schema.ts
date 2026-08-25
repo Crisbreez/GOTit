@@ -84,6 +84,14 @@ export const slipLegs = sqliteTable("slip_legs", {
   hitExplanation: text("hit_explanation"),
   missExplanation: text("miss_explanation"),
   propScore: real("prop_score"),
+  missTag: text("miss_tag"),
+  // p_hit component log — w1 sharp_edge | w2 script_tag | w3 hit_rate | w4 matchup_fit
+  sharpEdge: real("sharp_edge"),
+  scriptTag: text("script_tag"),
+  hitRate: real("hit_rate"),
+  hitRateSample: integer("hit_rate_sample"),
+  matchupFitScore: real("matchup_fit_score"),
+  w4: real("w4"),
 });
 
 export const insertLegSchema = createInsertSchema(slipLegs).omit({ id: true });

@@ -989,9 +989,15 @@ def prop_to_raw_leg(prop: Dict[str, Any]) -> Optional[RawLeg]:
         _sample_dt  = int(prop.get('hitRateSample') or prop.get('hit_rate_sample') or 0)
         _matchup_dt = {'PLUS': 0.015, 'NEUTRAL': 0.0, 'MINUS': -0.015}.get(matchup_tag, 0.0)
 
+        # matchup fit (w4 term) — platoon split vs tonight's starter
+        _mf_raw = prop.get('matchupFitScore')
+        if _mf_raw is None:
+            _mf_raw = prop.get('matchup_fit_score')
+        _m_fit  = float(_mf_raw) if _mf_raw is not None else None
+
         try:
             from gotit.leg_selector import p_hit_formula
-            _p_hit_dt = p_hit_formula(_sharp_edge_dt, script_tag, _p_hr_dt, _sample_dt)
+            _p_hit_dt = p_hit_formula(_sharp_edge_dt, script_tag, _p_hr_dt, _sample_dt, _m_fit)
             _p_hit_dt = clamp(_p_hit_dt + _matchup_dt, 0.01, 0.99)
         except Exception:
             _p_hit_dt = 0.50
@@ -1031,6 +1037,7 @@ def prop_to_raw_leg(prop: Dict[str, Any]) -> Optional[RawLeg]:
                 "matchup_tag":      matchup_tag,
                 "lineup_ok":        lineup_ok,
                 "p_hit":            round(_p_hit_dt, 4),
+                "matchup_fit_score": _m_fit,
             },
         )
         return leg

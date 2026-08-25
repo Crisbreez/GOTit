@@ -121,6 +121,16 @@ def main():
         print(json.dumps({"ok": False, "error": str(e)}))
         sys.exit(1)
 
+    # Matchup fit layer — platoon splits vs tonight's probable pitcher (MLB only).
+    # Runs pre-scoring so p_hit_formula's w4 term has data.
+    matchup_fits: dict = {}
+    if league == 'MLB':
+        try:
+            from gotit.matchup_fit import pull_matchup_fits, _normalize as _mf_norm
+            matchup_fits = pull_matchup_fits(props_data, league)
+        except Exception as _mfe:
+            logging.getLogger(__name__).warning(f'[matchup_fit] skipped: {_mfe}')
+
     matched = sum(
         1 for sc in consensus.values()
         if sc.freshness_sec < 9999.0
@@ -178,6 +188,12 @@ def main():
         except Exception:
             enrichment['scriptTag']  = 'BLIND'
             enrichment['matchupTag'] = 'NEUTRAL'
+
+        # Matchup fit score — platoon split vs tonight's starter
+        if matchup_fits:
+            _fit = matchup_fits.get(_mf_norm(player))
+            if _fit and _fit.get('matchup_fit_score') is not None:
+                enrichment['matchupFitScore'] = _fit['matchup_fit_score']
 
         # Lineup ok — MLB only
         if league == 'MLB':

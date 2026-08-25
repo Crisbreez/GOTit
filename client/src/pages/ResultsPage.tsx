@@ -153,6 +153,13 @@ function HistoryView({ slips }: { slips: Slip[] }) {
                           {leg.isGoblin && <span style={{ marginLeft:4, fontSize:'0.6rem', color:'hsl(270 60% 70%)', fontWeight:800 }}>GOBLIN</span>}
                         </div>
                         <div style={{ fontSize:'0.7rem', color:'hsl(var(--muted-foreground))' }}>{leg.statType}</div>
+                        {(leg as any).matchupFitScore != null && (
+                          <div data-testid={`text-matchup-fit-${leg.id}`} style={{ fontSize:'0.62rem', fontFamily:'Space Mono,monospace', marginTop:2,
+                            color: (leg as any).matchupFitScore > 0 ? 'hsl(142 72% 46%)' : (leg as any).matchupFitScore < 0 ? 'hsl(0 72% 60%)' : 'hsl(var(--muted-foreground))' }}>
+                            FIT {(leg as any).matchupFitScore > 0 ? '+' : ''}{((leg as any).matchupFitScore * 100).toFixed(1)}%
+                            {(leg as any).w4 != null && <span style={{ color:'hsl(var(--muted-foreground))' }}> · w4 {(leg as any).w4}</span>}
+                          </div>
+                        )}
                       </div>
                       <div style={{ textAlign:'right', flexShrink:0 }}>
                         <div style={{ fontSize:'0.8rem', fontWeight:700, color: isHit ? 'hsl(var(--g-green))' : isMiss ? 'hsl(0 72% 60%)' : 'hsl(var(--muted-foreground))' }}>

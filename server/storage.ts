@@ -56,6 +56,10 @@ function mapProp(r: any) {
     scriptTag:  r.script_tag  ?? 'BLIND',
     matchupTag: r.matchup_tag ?? 'NEUTRAL',
     lineupOk:   r.lineup_ok   ?? true,
+    // De-vigged book probabilities + matchup fit (written by sharp_pull)
+    fairPWinOver:    r.fair_p_win_over   ?? null,
+    fairPWinUnder:   r.fair_p_win_under  ?? null,
+    matchupFitScore: r.matchup_fit_score ?? null,
   };
 }
 
@@ -96,6 +100,13 @@ function mapLeg(r: any): SlipLeg {
     missExplanation: r.miss_explanation,
     propScore: r.prop_score,
     missTag: r.miss_tag ?? null,
+    // p_hit component log — w1 sharp_edge | w2 script_tag | w3 hit_rate | w4 matchup_fit
+    sharpEdge: r.sharp_edge ?? null,
+    scriptTag: r.script_tag ?? null,
+    hitRate: r.hit_rate ?? null,
+    hitRateSample: r.hit_rate_sample ?? null,
+    matchupFitScore: r.matchup_fit_score ?? null,
+    w4: r.w4 ?? null,
   } as SlipLeg;
 }
 
@@ -252,6 +263,14 @@ export const storage: IStorage = {
         proj_sigma:    r.projSigma   ?? null,
         proj_n_games:  r.projNGames  ?? null,
         proj_source:   r.projSource  ?? null,
+        // Script/lineup enrichment + de-vig + matchup fit — persisted so
+        // scoring and pick-record logging read real values, not defaults
+        script_tag:        r.scriptTag       ?? null,
+        matchup_tag:       r.matchupTag      ?? null,
+        lineup_ok:         r.lineupOk        ?? null,
+        fair_p_win_over:   r.fairPWinOver    ?? null,
+        fair_p_win_under:  r.fairPWinUnder   ?? null,
+        matchup_fit_score: r.matchupFitScore ?? null,
       };
     });
 
@@ -412,6 +431,13 @@ export const storage: IStorage = {
       hit_explanation: l.hitExplanation ?? null,
       miss_explanation: l.missExplanation ?? null,
       prop_score: l.propScore ?? null,
+      // p_hit component log
+      sharp_edge: (l as any).sharpEdge ?? null,
+      script_tag: (l as any).scriptTag ?? null,
+      hit_rate: (l as any).hitRate ?? null,
+      hit_rate_sample: (l as any).hitRateSample ?? null,
+      matchup_fit_score: (l as any).matchupFitScore ?? null,
+      w4: (l as any).w4 ?? null,
     }));
     const { error } = await db.from('slip_legs').insert(dbRows);
     if (error) throw new Error(`[storage] createLegs failed: ${error}`);

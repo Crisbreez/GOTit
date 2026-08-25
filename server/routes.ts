@@ -41,7 +41,7 @@ function spawnSharpPull(league: string, props: any[]): void {
       console.log(`[sharp] ${result.matched}/${result.total} props matched for ${result.league}`);
 
       // Stamp sharp signals onto props and re-upsert so DB has sharpFairLine + ppShadeSignal
-      const enrichments: Array<{id:string; sharpFairLine?:number; ppShadeSignal:string; marketDelta?:number; projMu?:number; projSigma?:number; projNGames?:number; projSource?:string; scriptTag?:string; matchupTag?:string; lineupOk?:boolean; fairPWinOver?:number; fairPWinUnder?:number}>
+      const enrichments: Array<{id:string; sharpFairLine?:number; ppShadeSignal:string; marketDelta?:number; projMu?:number; projSigma?:number; projNGames?:number; projSource?:string; scriptTag?:string; matchupTag?:string; lineupOk?:boolean; fairPWinOver?:number; fairPWinUnder?:number; matchupFitScore?:number}>
         = result.enrichments || [];
       if (enrichments.length > 0) {
         const enrichMap = new Map(enrichments.map((e: any) => [e.id, e]));
@@ -62,6 +62,7 @@ function spawnSharpPull(league: string, props: any[]): void {
             lineupOk:       e.lineupOk       ?? true,
             fairPWinOver:   e.fairPWinOver   ?? null,
             fairPWinUnder:  e.fairPWinUnder  ?? null,
+            matchupFitScore: e.matchupFitScore ?? null,
           };
         });
         const projCount = enrichedProps.filter((p: any) => p.projMu != null).length;
@@ -673,21 +674,45 @@ export function registerRoutes(httpServer: Server, app: Express) {
       createdAt: new Date().toISOString(),
     });
 
-    const legs = selectedProps.map((p: any) => ({
-      slipId: slip.id,
-      propId: p.id,
-      playerName: p.playerName,
-      teamAbbr: p.teamAbbr || '',
-      statType: p.statType,
-      lineScore: p.lineScore,
-      direction: p.direction || 'over',
-      isDemon: p.isDemon || false,
-      isGoblin: p.isGoblin || false,
-      gameMatchup: p.gameMatchup || resolvedMatchup || null,
-      gameStartTime: p.gameStartTime || startTime,
-      status: 'pending',
-      propScore: p.propScore || 0,
-    }));
+    // Performance lookup for hit_rate component logging
+    let perfMap = new Map<string, any>();
+    try {
+      const allPerf = await storage.getAllPerformance();
+      for (const row of (allPerf || [])) perfMap.set(`${row.playerName}||${row.statType}`, row);
+    } catch { /* non-critical */ }
+
+    const W4 = 0.12; // matchup fit weight — keep in sync with leg_selector.W4_MATCHUP
+    const legs = selectedProps.map((p: any) => {
+      const dir = p.direction || 'over';
+      // p_hit components — logged on every pick record, separately queryable
+      const fairP = dir === 'under' ? p.fairPWinUnder : p.fairPWinOver;
+      const sharpEdge = fairP != null ? Number((fairP - 0.5).toFixed(4)) : null;
+      const perf = perfMap.get(`${p.playerName}||${p.statType}`);
+      const perfTotal = perf ? (perf.hitCount ?? 0) + (perf.missCount ?? 0) : 0;
+      const hitRate = perfTotal > 0 ? Number((perf.hitCount / perfTotal).toFixed(4)) : null;
+      return {
+        slipId: slip.id,
+        propId: p.id,
+        playerName: p.playerName,
+        teamAbbr: p.teamAbbr || '',
+        statType: p.statType,
+        lineScore: p.lineScore,
+        direction: dir,
+        isDemon: p.isDemon || false,
+        isGoblin: p.isGoblin || false,
+        gameMatchup: p.gameMatchup || resolvedMatchup || null,
+        gameStartTime: p.gameStartTime || startTime,
+        status: 'pending',
+        propScore: p.propScore || 0,
+        // Component log: w1 sharp_edge | w2 script_tag | w3 hit_rate | w4 matchup_fit
+        sharpEdge,
+        scriptTag: p.scriptTag ?? null,
+        hitRate,
+        hitRateSample: perfTotal || null,
+        matchupFitScore: p.matchupFitScore ?? null,
+        w4: W4,
+      };
+    });
 
     await storage.createLegs(legs);
     const createdLegs = await storage.getLegsBySlip(slip.id);
