@@ -32,7 +32,7 @@ MLB_API = "https://statsapi.mlb.com/api/v1"
 CURRENT_YEAR = datetime.now(timezone.utc).year
 
 # Shrinkage constant (PA needed before split is ~50% trusted). Tune later: 60–100.
-SHRINK_K = 80
+SHRINK_K = 75
 
 SUPABASE_URL = os.environ.get('SUPABASE_URL', 'https://iikjgxnjmyzlivaukabc.supabase.co')
 SUPABASE_KEY = os.environ.get('SUPABASE_ANON_KEY', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imlpa2pneG5qbXl6bGl2YXVrYWJjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODM1NDg1NjgsImV4cCI6MjA5OTEyNDU2OH0.IFY9ocTpySWvyGXyUt615bkpwDs634T1wRUu97WbyTg')
@@ -215,21 +215,25 @@ def pull_matchup_fits(props: List[dict], league: str = "MLB") -> Dict[str, dict]
     if league.upper() != "MLB":
         return {}
 
-    # Disk cache (6h TTL) — avoids re-hitting statsapi on every manual pull
-    try:
-        if _CACHE_FILE.exists():
-            cached = json.loads(_CACHE_FILE.read_text())
-            if time.time() - cached.get("_ts", 0) < _CACHE_TTL_SEC:
-                log.info("[matchup_fit] using cached fits (%d players)", len(cached.get("fits", {})))
-                return cached.get("fits", {})
-    except Exception:
-        pass
-
     batter_names = sorted({
         _normalize(str(p.get('playerName') or p.get('player_name') or ''))
         for p in props
         if (p.get('playerName') or p.get('player_name'))
     })
+
+    # Disk cache (6h TTL) — avoids re-hitting statsapi on every manual pull.
+    # Only valid if the cached pull covered every player in this request
+    # (a small test pull must not satisfy a full-slate pull).
+    try:
+        if _CACHE_FILE.exists():
+            cached = json.loads(_CACHE_FILE.read_text())
+            fresh = time.time() - cached.get("_ts", 0) < _CACHE_TTL_SEC
+            covered = set(batter_names) <= set(cached.get("requested", []))
+            if fresh and covered:
+                log.info("[matchup_fit] using cached fits (%d players)", len(cached.get("fits", {})))
+                return cached.get("fits", {})
+    except Exception:
+        pass
     teams_by_player: Dict[str, str] = {}
     for p in props:
         nm = _normalize(str(p.get('playerName') or p.get('player_name') or ''))
@@ -307,7 +311,7 @@ def pull_matchup_fits(props: List[dict], league: str = "MLB") -> Dict[str, dict]
     _upsert_rows(rows)
 
     try:
-        _CACHE_FILE.write_text(json.dumps({"_ts": time.time(), "fits": fits}))
+        _CACHE_FILE.write_text(json.dumps({"_ts": time.time(), "requested": batter_names, "fits": fits}))
     except Exception:
         pass
 

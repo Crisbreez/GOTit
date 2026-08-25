@@ -4,6 +4,47 @@ import type { Request } from 'express';
 import { registerRoutes } from "./routes";
 import { serveStatic } from "./static";
 import { createServer } from "node:http";
+import { spawn } from "node:child_process";
+import path from "node:path";
+
+// ── Daily matchup fit pull ───────────────────────────────────────────────
+// Runs python/run_matchup_fit.py once per day at ~8:30am ET: pulls platoon
+// splits (vs-L/vs-R) for every batter with active props vs tonight's
+// probable pitcher, writes matchup_fit_scores rows, and stamps
+// matchup_fit_score onto props. This is NOT a props refresh — props are
+// still only pulled via the manual pull button.
+let lastFitPullDate = "";
+function runMatchupFitPull(reason: string): void {
+  const scriptPath = path.resolve(process.cwd(), "python", "run_matchup_fit.py");
+  const python = process.env.PYTHON_BIN || "python3";
+  console.log(`[matchup_fit] daily pull starting (${reason})`);
+  const child = spawn(python, [scriptPath], { cwd: process.cwd(), timeout: 300_000 });
+  let out = "";
+  let err = "";
+  child.stdout.on("data", (d: Buffer) => { out += d.toString(); });
+  child.stderr.on("data", (d: Buffer) => { err += d.toString(); });
+  child.on("close", (code: number | null) => {
+    if (code === 0) {
+      console.log(`[matchup_fit] daily pull done: ${out.trim().slice(0, 200)}`);
+    } else {
+      console.error(`[matchup_fit] daily pull exited ${code}: ${err.slice(0, 300)}`);
+    }
+  });
+  child.on("error", (e: any) => console.error("[matchup_fit] spawn error:", e.message));
+}
+
+function scheduleMatchupFitPull(): void {
+  // Check every 5 minutes; fire once per day inside the 8:00-9:00am ET window.
+  setInterval(() => {
+    const now = new Date();
+    const et = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
+    const dateKey = `${et.getFullYear()}-${et.getMonth() + 1}-${et.getDate()}`;
+    if (et.getHours() === 8 && et.getMinutes() >= 30 && lastFitPullDate !== dateKey) {
+      lastFitPullDate = dateKey;
+      runMatchupFitPull("scheduled 8:30am ET");
+    }
+  }, 5 * 60 * 1000);
+}
 
 // Prevent EPIPE / broken-pipe socket errors from crashing the server.
 // These occur when Render's egress drops a connection mid-stream.
@@ -116,6 +157,7 @@ app.use((req, res, next) => {
     },
     () => {
       log(`serving on port ${port}`);
+      scheduleMatchupFitPull();
     },
   );
 })();
