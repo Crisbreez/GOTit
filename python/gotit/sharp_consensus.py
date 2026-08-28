@@ -87,6 +87,284 @@ SGO_KEY  = "cdcc1cf23a44326b7e4d190616787462"
 # ─────────────────────────────────────────────────────────────────────────────
 # Match PP props → SGO props
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+# ── SGO fetch ──────────
+SGO_LEAGUE: Dict[str, str] = {
+    "MLB": "MLB",
+    "NBA": "NBA",
+    "NFL": "NFL",
+    "MMA": "MMA",
+}
+
+SGO_TO_PP: Dict[str, str] = {
+    # ── MLB batting ────────────────────────────────────────────────────────────
+    "batting_hits":            "Hits",
+    "batting_homeRuns":        "Home Runs",
+    "batting_totalBases":      "Total Bases",
+    "batting_hits+runs+rbi":   "Hits+Runs+RBIs",
+    "batting_RBI":             "RBIs",
+    "batting_basesOnBalls":    "Walks",
+    "batting_stolenBases":     "Stolen Bases",
+    "batting_runs":            "Runs",
+    # PP uses "Hitter Strikeouts" (not "Strikeouts") for batter Ks
+    # and "Pitcher Strikeouts" for pitcher Ks — mapped below.
+    # We still keep "Strikeouts" as aliases for backward compat.
+    "batting_strikeouts":      "Hitter Strikeouts",
+    # MLB pitching
+    "pitching_strikeouts":     "Pitcher Strikeouts",
+    "pitching_outs":           "Pitching Outs",
+    "pitching_basesOnBalls":   "Walks Allowed",
+    "pitching_earnedRuns":     "Earned Runs Allowed",
+    "pitching_hits":           "Hits Allowed",
+    # ── NBA / multi-sport ──────────────────────────────────────────────────────
+    "points":                  "Points",
+    "rebounds":                "Rebounds",
+    "assists":                 "Assists",
+    "threePointersMade":       "3-PT Made",
+    "steals":                  "Steals",
+    "blocks":                  "Blocks",
+    "turnovers":               "Turnovers",
+    # SGO "fantasyScore" = generic fantasy score.
+    # PP uses "Hitter Fantasy Score" for batters and "Pitcher Fantasy Score" for pitchers.
+    # Lines differ by scale (×2): SGO ~5.5, PP ~10.5. Widen tolerance for these.
+    "fantasyScore":            "Hitter Fantasy Score",   # primary mapping
+    "hitterFantasyScore":      "Hitter Fantasy Score",   # explicit hitter score if SGO adds it
+    "pitcherFantasyScore":     "Pitcher Fantasy Score",  # pitcher fantasy if SGO adds it
+    "points+rebounds+assists": "Pts+Reb+Ast",
+    "receptions":              "Receptions",
+    # ── NFL ────────────────────────────────────────────────────────────────────
+    "passingYards":            "Passing Yards",
+    "rushingYards":            "Rushing Yards",
+    "receivingYards":          "Receiving Yards",
+    "passingTouchdowns":       "Passing TDs",
+    "rushingAttempts":         "Rush Attempts",
+    "receptions_nfl":          "Receptions",
+}
+
+def _get_json(url: str, params: dict, headers: Optional[dict] = None) -> Optional[dict]:
+    """Simple sync HTTP GET → JSON. Uses requests or httpx."""
+    headers = {"User-Agent": "GOTit/2.0", **(headers or {})}
+    if _HAS_REQUESTS:
+        try:
+            r = _requests.get(url, params=params, headers=headers, timeout=15)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            log.warning(f"requests GET failed: {e}")
+            return None
+    if _HAS_HTTPX:
+        try:
+            import httpx as _hx
+            with _hx.Client(timeout=15) as c:
+                r = c.get(url, params=params, headers=headers)
+                r.raise_for_status()
+                return r.json()
+        except Exception as e:
+            log.warning(f"httpx GET failed: {e}")
+            return None
+    log.error("No HTTP library available (install requests or httpx)")
+    return None
+
+def _fetch_sgo_props(league: str) -> List[dict]:
+    """
+    Fetch all player prop odds for a league from SGO.
+    Returns a flat list of prop dicts with fields:
+        player_name, stat_type_pp, fair_line, fair_p_win_over,
+        fair_p_win_under, books_used, fetched_at
+    """
+    sgo_league = SGO_LEAGUE.get(league.upper(), league.upper())
+    page = 1
+    all_events = []
+
+    while True:
+        data = _get_json(
+            f"{SGO_BASE}/events",
+            {
+                "apiKey":         SGO_KEY,
+                "leagueID":       sgo_league,
+                "oddsAvailable":  "true",
+                "limit":          100,
+                "page":           page,
+            },
+        )
+        if not data:
+            break
+        events = data.get("data", [])
+        if not events:
+            break
+        all_events.extend(events)
+        # Only 1 page needed for today's slate
+        break
+
+    props_out: List[dict] = []
+    fetched_at = datetime.now(timezone.utc).isoformat()
+
+    for ev in all_events:
+        players_map: Dict[str, str] = {}
+        for pid, pdata in ev.get("players", {}).items():
+            name = pdata.get("name", "")
+            if name:
+                players_map[pid] = name
+
+        odds = ev.get("odds", {})
+        # Only OVER odds — we pair with UNDER by opposingOddID
+        for odd_id, odd in odds.items():
+            if odd.get("sideID") != "over":
+                continue
+            if odd.get("betTypeID") != "ou":
+                continue
+
+            stat_id    = odd.get("statID", "")
+            player_id  = odd.get("playerID", "")
+            pp_stat    = SGO_TO_PP.get(stat_id)
+            if not pp_stat:
+                continue  # stat type not in our map
+
+            # Skip team-level odds
+            if player_id in ("all", "home", "away", ""):
+                continue
+
+            player_name = players_map.get(player_id, "")
+            if not player_name:
+                # Try parsing from player_id: "BRYCE_ELDER_1_MLB" → "Bryce Elder"
+                parts = player_id.split("_")
+                # Drop last two tokens (number + league)
+                if len(parts) > 2:
+                    parts = parts[:-2]
+                player_name = " ".join(p.capitalize() for p in parts)
+
+            fair_line_str  = odd.get("fairOverUnder") or odd.get("bookOverUnder") or ""
+            fair_odds_over = odd.get("fairOdds") or odd.get("bookOdds") or ""
+
+            # Get UNDER fair odds from opposing odd
+            opp_id = odd.get("opposingOddID", "")
+            opp    = odds.get(opp_id, {})
+            fair_odds_under = opp.get("fairOdds") or opp.get("bookOdds") or ""
+
+            try:
+                fair_line = float(fair_line_str)
+            except (ValueError, TypeError):
+                continue
+
+            p_over  = _american_to_prob(fair_odds_over)
+            p_under = _american_to_prob(fair_odds_under)
+
+            if p_over is None and p_under is None:
+                continue
+
+            # If only one side available, derive the other
+            if p_over is None and p_under is not None:
+                p_over = 1.0 - p_under
+            if p_under is None and p_over is not None:
+                p_under = 1.0 - p_over
+
+            books_used = list(odd.get("byBookmaker", {}).keys())
+
+            props_out.append({
+                "player_name":    player_name,
+                "player_id_sgo":  player_id,
+                "stat_type_pp":   pp_stat,
+                "stat_id_sgo":    stat_id,
+                "fair_line":      fair_line,
+                "fair_p_win_over":  round(p_over,  4),
+                "fair_p_win_under": round(p_under, 4),
+                "books_used":     books_used,
+                "fetched_at":     fetched_at,
+            })
+
+    # Stat coverage report (debug)
+    stat_counts: Dict[str, int] = {}
+    for p in props_out:
+        stat_counts[p["stat_type_pp"]] = stat_counts.get(p["stat_type_pp"], 0) + 1
+    log.info(f"[sharp] fetched {len(props_out)} SGO props for {league}: {stat_counts}")
+    return props_out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Match PP props → SGO props
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+
+
+# ── Match helpers ──────────
+STORE_PATH = Path(__file__).parent.parent / "config" / "sharp_store.json"
+
+_FANTASY_SCORE_LINE_TOL = 6.0   # allow up to 6 units difference for fantasy score stats
+
+_FANTASY_SCORE_STATS = {"Hitter Fantasy Score", "Pitcher Fantasy Score", "Fantasy Score"}
+
+_PITCHER_KS_LINE_MIN = 3.0   # kept for backward compat, no longer used in matching
+
+def _american_to_prob(american: str) -> Optional[float]:
+    """
+    Convert American odds string to implied probability.
+    Already de-vigged by SGO, so this IS the fair p_win.
+    Returns None if parsing fails.
+    """
+    try:
+        v = float(american.replace("+", "").strip())
+        if v >= 0:
+            # +113 → prob = 100 / (100 + 113) = 0.469
+            return 100.0 / (100.0 + v)
+        else:
+            # -131 → prob = 131 / (131 + 100) = 0.567
+            return abs(v) / (abs(v) + 100.0)
+    except (ValueError, AttributeError):
+        return None
+
+def _fallback_sc(prop_id: str, line: float, tier: Tier, stat_type: str) -> SharpConsensus:
+    """
+    Tier-aware fallback when no SGO match is found.
+    Uses calibration delta for a synthetic median shift.
+    """
+    cal_path = Path(__file__).parent.parent / "config" / "calibration_latest.json"
+    delta_demon = {}
+    delta_goblin = {}
+    if cal_path.exists():
+        try:
+            with open(cal_path) as f:
+                cal = json.load(f)
+            delta_demon  = cal.get("delta_demon", {})
+            delta_goblin = cal.get("delta_goblin", {})
+        except Exception:
+            pass
+
+    if tier == Tier.DEMON:
+        delta = delta_demon.get(stat_type, delta_demon.get("default", 0.0))
+        median = line - delta
+    elif tier == Tier.GOBLIN:
+        delta = delta_goblin.get(stat_type, delta_goblin.get("default", 0.0))
+        median = line + delta
+    else:
+        median = line
+
+    return SharpConsensus(
+        prop_id=prop_id,
+        median=median,
+        shape_params={},
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        books_used=[],
+        freshness_sec=FALLBACK_SEC,
+    )
+
+def _normalize_name(name: str) -> str:
+    """Lowercase, strip accents, remove non-alpha, collapse spaces."""
+    n = unicodedata.normalize("NFD", name)
+    n = "".join(c for c in n if unicodedata.category(c) != "Mn")
+    n = re.sub(r"[^a-z ]", "", n.lower())
+    return " ".join(n.split())
+
+
+
+_DEFAULT_LINE_TOL       = 1.5   # all other stats
+
+
+
+FALLBACK_SEC  = 9999.0
+
+
 def _match_props(
     pp_props: List[PPProp],
     sgo_props: List[dict],
